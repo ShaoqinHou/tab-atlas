@@ -1,0 +1,7 @@
+interface:
+  display_name: "TabAtlas"
+  short_description: "Capture and organize Chrome and Edge tabs"
+  default_prompt: "Use $tab-atlas to capture my browser tabs, organize them, and generate the local report."
+
+policy:
+  allow_implicit_invocation: false

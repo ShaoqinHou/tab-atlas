@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TabAtlas Capture</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="mark" aria-hidden="true">TA</div>
+    <div>
+      <h1>TabAtlas Capture</h1>
+      <p id="browser">Checking browser...</p>
+    </div>
+    <label class="switch" title="Turn passive capture polling on or off">
+      <input id="mode" type="checkbox" role="switch" aria-label="Capture mode">
+      <span></span>
+    </label>
+  </header>
+
+  <main>
+    <section class="status" aria-live="polite">
+      <div><span>Mode</span><strong id="modeLabel">OFF</strong></div>
+      <div><span>Pairing</span><strong id="pairing">Unpaired</strong></div>
+      <div><span>Last capture</span><strong id="lastCapture">Never</strong></div>
+    </section>
+
+    <section id="pairPanel" class="pair-panel">
+      <label for="code">One-time pairing code</label>
+      <div class="pair-row">
+        <input id="code" type="text" maxlength="8" autocomplete="off" spellcheck="false" placeholder="XXXXXXXX">
+        <button id="pair" type="button">Pair</button>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="capture" type="button">Capture now</button>
+    </div>
+    <p id="message" class="message" aria-live="polite"></p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

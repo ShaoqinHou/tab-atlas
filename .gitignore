@@ -1,0 +1,5 @@
+/legacy/
+/tab-atlas/state/
+/tab-atlas/report/
+**/__pycache__/
+*.pyc

@@ -1,0 +1,101 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", Arial, sans-serif;
+  color: #1d2939;
+  background: #f7f8fa;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  width: 340px;
+  margin: 0;
+  background: #f7f8fa;
+}
+
+header {
+  display: grid;
+  grid-template-columns: 36px 1fr 44px;
+  gap: 10px;
+  align-items: center;
+  padding: 14px 16px;
+  color: #fff;
+  background: #1f3a4d;
+}
+
+.mark {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid #71c5a5;
+  border-radius: 6px;
+  color: #b8f0db;
+  font-weight: 700;
+  font-size: 12px;
+}
+
+h1 { margin: 0; font-size: 15px; font-weight: 650; }
+header p { margin: 2px 0 0; color: #c8d4dc; font-size: 11px; }
+
+main { padding: 14px 16px 16px; }
+
+.status {
+  border-block: 1px solid #d0d5dd;
+  padding: 7px 0;
+}
+
+.status div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 5px 0;
+  font-size: 12px;
+}
+
+.status span { color: #667085; }
+.status strong { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.pair-panel { margin-top: 14px; }
+label { display: block; margin-bottom: 6px; color: #475467; font-size: 12px; }
+.pair-row { display: grid; grid-template-columns: 1fr 64px; gap: 8px; }
+
+input[type="text"] {
+  min-width: 0;
+  height: 34px;
+  border: 1px solid #98a2b3;
+  border-radius: 5px;
+  padding: 0 10px;
+  background: #fff;
+  color: #101828;
+  font: 600 13px Consolas, monospace;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+button {
+  min-height: 34px;
+  border: 1px solid #1f6f5b;
+  border-radius: 5px;
+  padding: 0 11px;
+  color: #fff;
+  background: #1f6f5b;
+  font: 600 12px "Segoe UI", Arial, sans-serif;
+  cursor: pointer;
+}
+
+button:disabled { opacity: .48; cursor: default; }
+.actions { margin-top: 14px; }
+.actions button { width: 100%; }
+.message { min-height: 16px; margin: 10px 0 0; color: #475467; font-size: 11px; }
+.message.error { color: #b42318; }
+
+.switch { position: relative; margin: 0; width: 42px; height: 24px; }
+.switch input { position: absolute; opacity: 0; }
+.switch span { display: block; width: 42px; height: 24px; border-radius: 12px; background: #667085; transition: background .15s ease; }
+.switch span::after { content: ""; display: block; width: 18px; height: 18px; margin: 3px; border-radius: 50%; background: #fff; transition: transform .15s ease; }
+.switch input:checked + span { background: #24a37a; }
+.switch input:checked + span::after { transform: translateX(18px); }
+.switch input:focus-visible + span { outline: 2px solid #fff; outline-offset: 2px; }
+
+[hidden] { display: none !important; }

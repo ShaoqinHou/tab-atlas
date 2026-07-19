@@ -78,6 +78,16 @@ Use concise, concrete fields:
 
 Prefer a small stable collection set. A resource may belong to more than one collection when that improves retrieval.
 
+Treat categorization as separate dimensions rather than adding more tags:
+
+- collections answer **what subject or project is this for**;
+- browser groups preserve the user's existing working context;
+- source and format answer **what kind of thing is it**;
+- intent and next action answer **what would I do with it**;
+- decision queues answer **what needs attention first**.
+
+Use captured metadata and deterministic URL structure for every resource before requesting more data. Use Codex to enrich `brief`, `detail`, `whyKept`, and `nextAction` only when those fields change a real keep/revisit/close decision. Never invent page content from a title.
+
 ## Present And Query
 
 Generate the local read-only report:
@@ -86,7 +96,16 @@ Generate the local read-only report:
 python scripts/tab_atlas.py report
 ```
 
-Open `report/index.html` for overview, collection, group, resource-detail, and task views. Regenerate after applying annotations.
+Open `report/index.html` for decision queues, independent browser groups, topic collections, global search, and progressive resource detail. Regenerate after applying annotations.
+
+The report's Keep, Later, and Close candidate controls are local proposals. They do not mutate tabs. If the user exports `tabatlas-decisions.json`, inspect it and apply accepted statuses with:
+
+```powershell
+python scripts/tab_atlas.py apply path\to\tabatlas-decisions.json
+python scripts/tab_atlas.py report
+```
+
+Remote source previews are opt-in per resource. Do not trigger them automatically during report generation or acceptance testing.
 
 Use `python scripts/tab_atlas.py query --text "..."` for conversational retrieval. Summarize the result for the user instead of dumping raw database rows.
 

@@ -25,6 +25,8 @@ from tab_atlas_core import (  # noqa: E402
     normalize_snapshot_document,
     pairing_secret,
     protocol_proof,
+    report_payload,
+    resource_presentation,
     revoke_pairing,
     save_pairing,
     store_snapshot,
@@ -207,6 +209,126 @@ class CatalogTests(unittest.TestCase):
             connection.close()
 
             self.assertEqual(totals["unclassifiedResources"], 1)
+
+    def test_presentation_exposes_decision_signals_without_loading_remote_media(self) -> None:
+        presentation = resource_presentation(
+            {
+                "openUrl": "https://www.youtube.com/watch?v=abc123XYZ00&utm_source=test",
+                "canonicalUrl": "https://www.youtube.com/watch?v=abc123XYZ00",
+                "host": "www.youtube.com",
+                "kind": "youtube",
+                "title": "Example video",
+                "brief": "A useful example.",
+                "whyKept": "",
+                "nextAction": "watch or listen",
+                "status": "open",
+                "collections": [],
+                "tasks": [],
+                "tabs": [
+                    {"groupTitle": "", "browser": "chrome"},
+                    {"groupTitle": "", "browser": "edge"},
+                ],
+            }
+        )
+
+        self.assertEqual(presentation["format"], "Video")
+        self.assertEqual(presentation["intent"], "Watch")
+        self.assertEqual(presentation["queue"], "needs_context")
+        self.assertTrue(presentation["preview"]["requiresUserLoad"])
+        self.assertEqual(
+            presentation["preview"]["remoteImage"],
+            "https://i.ytimg.com/vi/abc123XYZ00/mqdefault.jpg",
+        )
+
+    def test_report_keeps_duplicate_group_titles_as_distinct_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-19T00:00:00Z",
+                    "groups": [
+                        {"id": 7, "windowId": 1, "title": "Research", "color": "orange"},
+                        {"id": 8, "windowId": 1, "title": "Research", "color": "cyan"},
+                    ],
+                    "tabs": [
+                        {"id": 10, "windowId": 1, "index": 0, "groupId": 7, "title": "A", "url": "https://example.com/a"},
+                        {"id": 11, "windowId": 1, "index": 1, "groupId": 8, "title": "B", "url": "https://example.com/b"},
+                    ],
+                },
+                "test",
+            )
+
+            groups = report_payload(connection)["groups"]
+            connection.close()
+
+            self.assertEqual(len(groups), 2)
+            self.assertEqual(len({group["id"] for group in groups}), 2)
+            self.assertEqual({group["resourceCount"] for group in groups}, {1})
+            self.assertEqual(
+                {group["displayTitle"] for group in groups},
+                {"Research (orange)", "Research (cyan)"},
+            )
+
+    def test_group_summary_preserves_browser_tab_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "edge",
+                    "capturedAt": "2026-07-19T00:00:00Z",
+                    "groups": [{"id": 4, "windowId": 1, "title": "Ordered", "color": "blue"}],
+                    "tabs": [
+                        {"id": 10, "windowId": 1, "index": 0, "groupId": 4, "title": "Z first", "url": "https://example.com/z"},
+                        {"id": 11, "windowId": 1, "index": 1, "groupId": 4, "title": "A second", "url": "https://example.com/a"},
+                    ],
+                },
+                "test",
+            )
+
+            payload = report_payload(connection)
+            connection.close()
+            resources_by_id = {item["resourceId"]: item for item in payload["resources"]}
+            ordered_titles = [resources_by_id[resource_id]["title"] for resource_id in payload["groups"][0]["resourceIds"]]
+
+            self.assertEqual(ordered_titles, ["Z first", "A second"])
+
+    def test_exported_report_decision_is_annotation_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            stored = store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-19T00:00:00Z",
+                    "tabs": [{"title": "Decision", "url": "https://example.com/decision"}],
+                },
+                "test",
+            )
+            resource_id = connection.execute(
+                "SELECT resource_id FROM tab_instances WHERE capture_id=?",
+                (stored["id"],),
+            ).fetchone()["resource_id"]
+
+            apply_annotations(
+                connection,
+                {
+                    "schemaVersion": 1,
+                    "resources": [{"resourceId": resource_id, "status": "close_candidate"}],
+                },
+            )
+            resource = current_resources(connection)[0]
+            connection.close()
+
+            self.assertEqual(resource["status"], "close_candidate")
 
 
 class ReceiverIntegrationTests(unittest.TestCase):

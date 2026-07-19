@@ -26,15 +26,19 @@ captured content tab. Both one-shot receivers exited after capture.
 The replacement capture protocol now authenticates both extension and receiver
 with nonce-bound HMAC proofs. No reusable pairing key crosses loopback, OFF
 aborts in-flight network work and prevents submission, and signed revocation
-turns the extension fully off. Ten focused Python tests and one independent
+turns the extension fully off. Fourteen focused Python tests and one independent
 Node protocol test pass.
 
 A bounded discovery and assignment pass covers all 609 current resources. Every
 resource has a cautious scan-level brief, a 12-collection vocabulary is frozen,
-and 137 low-context resources remain unclassified instead of being guessed. All
+and 134 low-context resources remain unclassified instead of being guessed. All
 generated memberships remain suggestions until accepted. The regenerated local
-report passed desktop and 390-pixel responsive checks, search, collection
-filtering, and a clean browser-console check.
+report has been rebuilt as a decision surface rather than a flat inventory. It
+now separates Overview, Decide, Groups, Collections, and Resources; preserves
+browser order within 18 independently working groups; derives source, format,
+intent, and decision cues locally; keeps remote previews opt-in; and exports
+local decision proposals without mutating tabs. Desktop and 390-pixel browser
+acceptance passed with no horizontal overflow or console warnings.
 
 ## Frozen Decisions
 
@@ -62,10 +66,11 @@ Everything under `legacy/` is quarantined evidence. Active `AGENTS.md`, `.agents
 
 ## Next Actions
 
-1. Use the generated report with the user and record concrete retrieval or presentation problems.
-2. Review the 137 deliberately unclassified resources only when their value justifies deeper context.
-3. Add selective enrichment only when report use exposes a concrete information gap.
-4. Keep all browser-tab mutation out of scope until the user authorizes a separate, explicit workflow.
+1. Use the decision queues and largest real browser groups with the user; record only concrete decision failures.
+2. Review the 134 deliberately unclassified resources selectively, starting with resources the user is considering closing.
+3. Apply exported Keep, Later, or Close candidate decisions through Codex after review; do not mutate tabs from the report.
+4. Add page inspection or LLM enrichment only when local metadata and the current brief cannot support a real decision.
+5. Keep browser-tab mutation out of scope until the user authorizes a separate, explicit workflow.
 
 ## Current Constraint
 

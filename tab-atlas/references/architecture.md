@@ -66,6 +66,25 @@ separate review promotes them.
 
 Generate a self-contained, read-only HTML report. It must support scanning first and detail on demand. Do not require a long-running app server, build chain, or account.
 
+The default view is a decision overview, not a complete resource list. Browser
+groups and topic collections are first-class scopes with stable resource IDs and
+summaries. A group selection replaces the previous scope; it never silently
+intersects with stale browser or collection filters. Preserve browser tab order
+inside group detail.
+
+Presentation metadata has three layers:
+
+1. Deterministic local signals for source, format, intent, duplicates, groups,
+   and safe generated previews.
+2. Codex annotations for concise descriptions, decision context, and next steps.
+3. Selective source inspection only when the first two layers cannot support a
+   concrete decision.
+
+Never load remote thumbnails or fetch page metadata for the whole catalog. A
+known public preview may be exposed as an opt-in action for one resource. Local
+decision controls store only resource IDs and proposed statuses and export an
+annotation-compatible JSON file; they do not mutate browser state.
+
 ## Deferred Boundary
 
 Closed-browser recovery is not ordinary capture. The production fallback is the

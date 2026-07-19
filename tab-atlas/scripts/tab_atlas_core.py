@@ -8,7 +8,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -1064,15 +1064,385 @@ def display_url(url: str) -> str:
     return url[:240]
 
 
+def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
+    url = str(resource.get("openUrl") or resource.get("canonicalUrl") or "")
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        parts = urlsplit("")
+    host = str(resource.get("host") or parts.hostname or "").casefold()
+    kind = str(resource.get("kind") or "web_page")
+    title = str(resource.get("title") or "")
+    source = _source_label(host, kind, parts.scheme)
+    format_label = _format_label(host, kind, title, parts.path, parts.scheme)
+    intent = _intent_label(str(resource.get("nextAction") or ""), format_label)
+    collections = resource.get("collections") or []
+    tabs = resource.get("tabs") or []
+    tasks = resource.get("tasks") or []
+    group_titles = sorted({str(tab.get("groupTitle") or "") for tab in tabs if tab.get("groupTitle")})
+    duplicate_count = max(0, len(tabs) - 1)
+    status = str(resource.get("status") or "open")
+
+    if status == "close_candidate":
+        queue = "close_candidate"
+        decision_label = "Close candidate"
+        decision_tone = "close"
+    elif status == "saved":
+        queue = "kept"
+        decision_label = "Kept"
+        decision_tone = "keep"
+    elif any(str(task.get("status") or "") == "open" for task in tasks):
+        queue = "task"
+        decision_label = "Task attached"
+        decision_tone = "action"
+    elif not collections:
+        queue = "needs_context"
+        decision_label = "Needs context"
+        decision_tone = "review"
+    elif duplicate_count:
+        queue = "duplicate"
+        decision_label = "Consolidate"
+        decision_tone = "duplicate"
+    elif group_titles:
+        queue = "grouped"
+        decision_label = "In a group"
+        decision_tone = "grouped"
+    else:
+        queue = "reference"
+        decision_label = "Reference"
+        decision_tone = "reference"
+
+    next_action = str(resource.get("nextAction") or "").strip()
+    if next_action and next_action.casefold() != "none":
+        decision_cue = _sentence(next_action)
+    elif duplicate_count:
+        decision_cue = f"Consolidate {len(tabs)} open copies."
+    elif not collections:
+        decision_cue = "Decide whether this still matters."
+    else:
+        decision_cue = "Keep as a reference."
+
+    why_kept = str(resource.get("whyKept") or "").strip()
+    if why_kept:
+        context_cue = _sentence(why_kept)
+    elif group_titles:
+        context_cue = f"Browser group context: {group_titles[0]}."
+    elif collections:
+        context_cue = f"Reference for {collections[0]['name']}."
+    elif duplicate_count:
+        context_cue = f"Open in {len(tabs)} tab instances."
+    else:
+        context_cue = "No durable context recorded yet."
+
+    video_id = _youtube_video_id(url)
+    preview_label = {
+        "YouTube": "YT",
+        "GitHub": "GH",
+        "ChatGPT": "AI",
+        "Claude": "AI",
+        "Kimi": "AI",
+        "PDF": "PDF",
+        "Browser": "BR",
+        "Local file": "FILE",
+    }.get(source, _initials(source))
+    accent = {
+        "YouTube": "red",
+        "GitHub": "charcoal",
+        "ChatGPT": "green",
+        "Claude": "coral",
+        "Kimi": "blue",
+        "PDF": "amber",
+        "Browser": "grey",
+        "Local file": "grey",
+    }.get(source, "teal")
+    preview_url = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg" if video_id else ""
+
+    return {
+        "source": source,
+        "format": format_label,
+        "intent": intent,
+        "queue": queue,
+        "decisionLabel": decision_label,
+        "decisionTone": decision_tone,
+        "decisionCue": decision_cue,
+        "contextCue": context_cue,
+        "groupTitles": group_titles,
+        "preview": {
+            "label": preview_label,
+            "accent": accent,
+            "remoteImage": preview_url,
+            "requiresUserLoad": bool(preview_url),
+        },
+    }
+
+
+def report_group_summaries(resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    resources_by_id = {item["resourceId"]: item for item in resources}
+    for resource in resources:
+        for tab in resource["tabs"]:
+            if tab["groupId"] in {None, "", "-1"}:
+                continue
+            identifier = _group_identifier(tab)
+            group = groups.setdefault(
+                identifier,
+                {
+                    "id": identifier,
+                    "browser": tab["browser"],
+                    "windowId": str(tab.get("windowId") or ""),
+                    "groupId": str(tab.get("groupId") or ""),
+                    "title": tab.get("groupTitle") or f"Unnamed group {tab.get('groupId')}",
+                    "color": tab.get("groupColor") or "grey",
+                    "collapsed": bool(tab.get("groupCollapsed")),
+                    "tabCount": 0,
+                    "resourceIds": [],
+                },
+            )
+            group["tabCount"] += 1
+            if resource["resourceId"] not in group["resourceIds"]:
+                group["resourceIds"].append(resource["resourceId"])
+
+    title_counts = Counter(
+        (group["browser"], group["windowId"], str(group["title"]).casefold())
+        for group in groups.values()
+    )
+    result = []
+    for group in groups.values():
+        def group_position(resource_id: str) -> tuple[int, str]:
+            resource = resources_by_id[resource_id]
+            positions = [
+                int(tab["position"])
+                for tab in resource["tabs"]
+                if _group_identifier(tab) == group["id"] and tab.get("position") is not None
+            ]
+            return (min(positions) if positions else 1_000_000_000, resource["title"].casefold())
+
+        group["resourceIds"].sort(key=group_position)
+        members = [resources_by_id[resource_id] for resource_id in group["resourceIds"]]
+        collection_counts = Counter(
+            collection["name"]
+            for item in members
+            for collection in item["collections"]
+        )
+        format_counts = Counter(item["presentation"]["format"] for item in members)
+        intent_counts = Counter(item["presentation"]["intent"] for item in members)
+        queue_counts = Counter(item["presentation"]["queue"] for item in members)
+        duplicate_resources = sum(1 for item in members if len(item["tabs"]) > 1)
+        top_collections = [name for name, _count in collection_counts.most_common(3)]
+        top_formats = [{"name": name, "count": count} for name, count in format_counts.most_common(3)]
+        top_intents = [{"name": name, "count": count} for name, count in intent_counts.most_common(3)]
+        display_title = group["title"]
+        title_key = (group["browser"], group["windowId"], str(group["title"]).casefold())
+        if title_counts[title_key] > 1:
+            display_title = f"{display_title} ({group['color']})"
+        summary_bits = []
+        if top_collections:
+            summary_bits.append(f"Mostly {top_collections[0]}.")
+        elif top_formats:
+            summary_bits.append(f"Mostly {top_formats[0]['name'].casefold()} resources.")
+        review_count = queue_counts.get("needs_context", 0)
+        if review_count:
+            verb = "needs" if review_count == 1 else "need"
+            summary_bits.append(f"{review_count} {verb} context.")
+        if duplicate_resources:
+            verb = "has" if duplicate_resources == 1 else "have"
+            summary_bits.append(f"{duplicate_resources} {verb} multiple open copies.")
+        group.update(
+            {
+                "displayTitle": display_title,
+                "resourceCount": len(members),
+                "summary": " ".join(summary_bits) or "A captured browser group.",
+                "topCollections": top_collections,
+                "topFormats": top_formats,
+                "topIntents": top_intents,
+                "queueCounts": dict(queue_counts),
+                "duplicateResources": duplicate_resources,
+            }
+        )
+        result.append(group)
+    return sorted(result, key=lambda item: (-item["resourceCount"], item["browser"], item["displayTitle"].casefold()))
+
+
+def report_collection_summaries(
+    resources: list[dict[str, Any]],
+    collections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    result = []
+    for collection in collections:
+        members = [
+            item
+            for item in resources
+            if any(value["id"] == collection["id"] for value in item["collections"])
+        ]
+        format_counts = Counter(item["presentation"]["format"] for item in members)
+        intent_counts = Counter(item["presentation"]["intent"] for item in members)
+        queue_counts = Counter(item["presentation"]["queue"] for item in members)
+        top_formats = [{"name": name, "count": count} for name, count in format_counts.most_common(3)]
+        top_intents = [{"name": name, "count": count} for name, count in intent_counts.most_common(3)]
+        description = str(collection.get("description") or "").strip()
+        if not description and top_formats:
+            description = f"Mostly {top_formats[0]['name'].casefold()} resources"
+            if top_intents:
+                description += f" for {top_intents[0]['name'].casefold()} decisions"
+            description += "."
+        result.append(
+            {
+                "id": collection["id"],
+                "name": collection["name"],
+                "description": description or "No resources assigned yet.",
+                "resourceCount": len(members),
+                "resourceIds": [item["resourceId"] for item in members],
+                "topFormats": top_formats,
+                "topIntents": top_intents,
+                "queueCounts": dict(queue_counts),
+            }
+        )
+    return sorted(result, key=lambda item: (-item["resourceCount"], item["name"].casefold()))
+
+
+def _source_label(host: str, kind: str, scheme: str) -> str:
+    if scheme == "file":
+        return "Local file"
+    if kind == "pdf":
+        return "PDF"
+    if kind == "browser_internal":
+        return "Browser"
+    rules = (
+        (("youtube.com", "youtu.be"), "YouTube"),
+        (("github.com",), "GitHub"),
+        (("chatgpt.com", "chat.openai.com"), "ChatGPT"),
+        (("claude.ai",), "Claude"),
+        (("kimi.com", "moonshot.cn"), "Kimi"),
+        (("reddit.com",), "Reddit"),
+        (("google.com", "google.co."), "Google"),
+        (("bing.com",), "Bing"),
+    )
+    for suffixes, label in rules:
+        if any(suffix in host for suffix in suffixes):
+            return label
+    return host.removeprefix("www.") or "Unknown source"
+
+
+def _format_label(host: str, kind: str, title: str, path: str, scheme: str) -> str:
+    if kind == "youtube_short":
+        return "Short video"
+    if kind == "youtube":
+        return "Video"
+    if kind == "pdf" or path.casefold().endswith(".pdf"):
+        return "PDF"
+    if kind == "github":
+        return "Repository"
+    if kind == "docs":
+        return "Documentation"
+    if kind == "search":
+        return "Search"
+    if kind == "browser_internal":
+        return "Browser page"
+    if scheme == "file":
+        return "Local file"
+    if any(value in host for value in ("chatgpt.com", "chat.openai.com", "claude.ai", "kimi.com")):
+        return "Conversation"
+    lower_title = title.casefold()
+    if any(value in lower_title for value in ("pricing", "membership", "subscription", "upgrade")):
+        return "Pricing"
+    if re.search(r"\.(?:png|jpe?g|gif|webp|avif)$", path, re.IGNORECASE):
+        return "Image"
+    return "Web page"
+
+
+def _intent_label(next_action: str, format_label: str) -> str:
+    value = next_action.casefold().strip()
+    rules = (
+        (("needs context", "review context"), "Review"),
+        (("watch", "listen"), "Watch"),
+        (("read", "skim", "paper", "document"), "Read"),
+        (("compare", "choose", "buy", "subscription", "plan"), "Decide"),
+        (("continue", "resume", "revisit"), "Continue"),
+        (("try", "test", "build", "install", "use", "run", "explore"), "Try"),
+        (("close", "discard"), "Close"),
+    )
+    for needles, label in rules:
+        if any(needle in value for needle in needles):
+            return label
+    return {
+        "Video": "Watch",
+        "Short video": "Watch",
+        "PDF": "Read",
+        "Documentation": "Read",
+        "Repository": "Try",
+        "Conversation": "Continue",
+        "Pricing": "Decide",
+        "Search": "Review",
+    }.get(format_label, "Reference")
+
+
+def _youtube_video_id(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").casefold()
+    segments = [segment for segment in parts.path.split("/") if segment]
+    candidate = ""
+    if host.endswith("youtu.be") and segments:
+        candidate = segments[0]
+    elif "youtube.com" in host:
+        if parts.path.rstrip("/") == "/watch":
+            candidate = dict(parse_qsl(parts.query)).get("v", "")
+        elif len(segments) >= 2 and segments[0] in {"shorts", "embed", "live"}:
+            candidate = segments[1]
+    return candidate if re.fullmatch(r"[A-Za-z0-9_-]{6,32}", candidate) else ""
+
+
+def _group_identifier(tab: dict[str, Any]) -> str:
+    seed = "|".join(
+        (
+            str(tab.get("browser") or ""),
+            str(tab.get("windowId") or ""),
+            str(tab.get("groupId") or ""),
+        )
+    )
+    return "group_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20]
+
+
+def _sentence(value: str) -> str:
+    text = value.strip()[:180]
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text
+
+
+def _initials(value: str) -> str:
+    parts = [part for part in re.split(r"[.\-_\s]+", value) if part]
+    return "".join(part[0] for part in parts[:2]).upper() or "?"
+
+
 def report_payload(connection: sqlite3.Connection) -> dict[str, Any]:
-    resources = current_resources(connection)
+    raw_resources = current_resources(connection)
+    resources = []
+    for item in raw_resources:
+        resource = dict(item)
+        resource["presentation"] = resource_presentation(resource)
+        resources.append(resource)
     collections = [dict(row) for row in connection.execute("SELECT * FROM collections ORDER BY name")]
     tasks = [dict(row) for row in connection.execute("SELECT * FROM tasks ORDER BY status, created_at")]
+    groups = report_group_summaries(resources)
+    collection_summaries = report_collection_summaries(resources, collections)
+    format_counts = Counter(item["presentation"]["format"] for item in resources)
+    intent_counts = Counter(item["presentation"]["intent"] for item in resources)
+    queue_counts = Counter(item["presentation"]["queue"] for item in resources)
     return {
         "generatedAt": utc_now(),
         "inventory": inventory(connection),
         "resources": resources,
+        "groups": groups,
         "collections": collections,
+        "collectionSummaries": collection_summaries,
+        "facets": {
+            "formats": [{"name": name, "count": count} for name, count in format_counts.most_common()],
+            "intents": [{"name": name, "count": count} for name, count in intent_counts.most_common()],
+            "queues": dict(queue_counts),
+        },
         "tasks": tasks,
     }
 

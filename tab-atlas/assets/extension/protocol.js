@@ -65,6 +65,26 @@ export function duplicateTargetReason(plan, tab, keeper, targetUrlHash, keeperUr
   return "";
 }
 
+export function archiveTargetReason(plan, tab, targetUrlHash) {
+  if (!tab) return "tab_missing";
+  if (targetUrlHash !== String(plan?.expectedUrlHash || "")) return "url_changed";
+  if (
+    String(tab.windowId) !== String(plan?.windowId)
+    || String(tab.groupId) !== String(plan?.groupId)
+  ) {
+    return "context_changed";
+  }
+  return "";
+}
+
+export function archiveControlReason(plan, tab, targetUrlHash) {
+  if (!tab) return "control_tab_missing";
+  if (targetUrlHash !== String(plan?.expectedUrlHash || "")) return "control_url_changed";
+  if (Number(tab.id) !== Number(plan?.controlTabId)) return "control_tab_changed";
+  if (Number(tab.windowId) !== Number(plan?.controlWindowId)) return "control_window_changed";
+  return "";
+}
+
 function hexToBytes(value) {
   const text = String(value || "");
   if (!/^[a-f0-9]+$/.test(text) || text.length % 2 !== 0) {

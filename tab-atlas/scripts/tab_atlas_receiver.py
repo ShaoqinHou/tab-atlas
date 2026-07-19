@@ -21,6 +21,7 @@ from tab_atlas_core import (
     protocol_proof,
     save_pairing,
     store_snapshot,
+    TABATLAS_EXTENSION_ID,
     token_hash,
 )
 
@@ -28,7 +29,7 @@ from tab_atlas_core import (
 HOST = "127.0.0.1"
 PORT = 9786
 MAX_BODY_BYTES = 10 * 1024 * 1024
-EXPECTED_EXTENSION_ID = "ohgpplkophdikjnbefigdhikdooehmkh"
+EXPECTED_EXTENSION_ID = TABATLAS_EXTENSION_ID
 PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
@@ -43,6 +44,7 @@ class ReceiverSession:
     captured: dict[str, dict[str, Any]] = field(default_factory=dict)
     mutation_plan: dict[str, Any] | None = None
     mutated: dict[str, dict[str, Any]] = field(default_factory=dict)
+    cleaned: dict[str, dict[str, Any]] = field(default_factory=dict)
     paired_browser: str | None = None
     done: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -125,7 +127,17 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
                     action = "idle"
                     request_id = ""
                 else:
-                    action = "close_exact_duplicates"
+                    action = str(session.mutation_plan.get("action") or "close_exact_duplicates")
+                    request_id = str(session.mutation_plan["requestId"])
+                    targets = browser_plan["targets"]
+                    targets_hash = browser_plan["targetsHash"]
+            elif session.mode == "cleanup" and session.mutation_plan:
+                browser_plan = session.mutation_plan.get("browsers", {}).get(browser)
+                if browser not in session.expected_browsers or browser in session.cleaned or not browser_plan:
+                    action = "idle"
+                    request_id = ""
+                else:
+                    action = "close_archive_control"
                     request_id = str(session.mutation_plan["requestId"])
                     targets = browser_plan["targets"]
                     targets_hash = browser_plan["targetsHash"]
@@ -164,6 +176,9 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/mutation":
             self._mutation()
+            return
+        if path == "/v1/cleanup":
+            self._cleanup()
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
 
@@ -254,7 +269,13 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             connection = connect(session.database_path)
             try:
                 mark_pairing_seen(connection, browser)
-                result = store_snapshot(connection, session.state_dir, body, "extension_live")
+                result = store_snapshot(
+                    connection,
+                    session.state_dir,
+                    body,
+                    "extension_live",
+                    new_resource_state="candidate",
+                )
             finally:
                 connection.close()
         except (ValueError, TypeError, json.JSONDecodeError) as error:
@@ -269,6 +290,8 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             "captureId": result["id"],
             "browser": browser,
             "tabs": result["tab_count"],
+            "newResources": result.get("new_resource_count", 0),
+            "pendingResources": result.get("candidate_resource_count", 0),
             "serverProof": protocol_proof(
                 pairing["secret"],
                 "accepted",
@@ -330,6 +353,13 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
                 normalized_results.append({"tabId": tab_id, "status": status, "reason": reason})
             if seen_ids != expected_ids:
                 raise ValueError("mutation results are incomplete")
+            control_tab_id = None
+            control_window_id = None
+            if session.mutation_plan.get("action") == "archive_captured_tabs":
+                control_tab_id = int(body.get("controlTabId"))
+                control_window_id = int(body.get("controlWindowId"))
+                if control_tab_id < 0 or control_window_id < 0:
+                    raise ValueError("archive control tab is invalid")
         except (ValueError, TypeError, json.JSONDecodeError) as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)[:240]})
             return
@@ -343,6 +373,9 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             "skippedCount": skipped_count,
             "results": normalized_results,
         }
+        if control_tab_id is not None and control_window_id is not None:
+            result["controlTabId"] = control_tab_id
+            result["controlWindowId"] = control_window_id
         with session.lock:
             session.mutated[browser] = result
             complete = session.expected_browsers.issubset(session.mutated.keys())
@@ -361,6 +394,83 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
                 targets_hash,
                 str(closed_count),
                 str(skipped_count),
+            ),
+        })
+        if complete:
+            session.done.set()
+
+    def _cleanup(self) -> None:
+        session = self.server.session
+        if session.mode != "cleanup" or not session.mutation_plan:
+            self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "cleanup is not active"})
+            return
+        try:
+            raw_body = self._read_body(64 * 1024)
+            body = json.loads(raw_body.decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("request body must be an object")
+            request_id = str(body.get("requestId") or "")
+            targets_hash = str(body.get("targetsHash") or "")
+            body_hash = hashlib.sha256(raw_body).hexdigest()
+            pairing = self._authenticate_signed("cleanup", request_id, targets_hash, body_hash)
+            if not pairing or not pairing["enabled"]:
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                return
+            browser = normalize_browser(body.get("browser"))
+            extension_id = str(body.get("extensionId") or "")
+            control_tab_id = int(body.get("controlTabId"))
+            control_window_id = int(body.get("controlWindowId"))
+            status = str(body.get("status") or "")
+            reason = str(body.get("reason") or "")[:160]
+            if browser != pairing["browser"] or browser not in session.expected_browsers:
+                raise ValueError("browser does not match cleanup plan")
+            if extension_id != pairing["extension_id"] or extension_id != EXPECTED_EXTENSION_ID:
+                raise ValueError("extension does not match pairing")
+            if request_id != str(session.mutation_plan["requestId"]):
+                raise ValueError("cleanup request does not match receiver run")
+            browser_plan = session.mutation_plan["browsers"].get(browser)
+            if not browser_plan or targets_hash != browser_plan["targetsHash"]:
+                raise ValueError("cleanup target does not match receiver plan")
+            expected = browser_plan["targets"]
+            if len(expected) != 1:
+                raise ValueError("cleanup plan must contain one control tab")
+            if (
+                control_tab_id != int(expected[0]["controlTabId"])
+                or control_window_id != int(expected[0]["controlWindowId"])
+            ):
+                raise ValueError("cleanup control tab does not match plan")
+            if status not in {"closed", "skipped"}:
+                raise ValueError("cleanup result status is invalid")
+        except (ValueError, TypeError, json.JSONDecodeError) as error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)[:240]})
+            return
+
+        result = {
+            "requestId": request_id,
+            "controlTabId": control_tab_id,
+            "controlWindowId": control_window_id,
+            "accepted": True,
+            "status": status,
+            "reason": reason,
+        }
+        with session.lock:
+            session.cleaned[browser] = result
+            complete = session.expected_browsers.issubset(session.cleaned.keys())
+        self._send_json(HTTPStatus.OK, {
+            "ok": True,
+            "browser": browser,
+            "serverProof": protocol_proof(
+                pairing["secret"],
+                "cleanup-accepted",
+                browser,
+                pairing["extension_id"],
+                pairing["nonce"],
+                request_id,
+                targets_hash,
+                str(control_tab_id),
+                str(control_window_id),
+                status,
+                reason,
             ),
         })
         if complete:
@@ -529,6 +639,31 @@ def run_mutation(
     )
     completed = _run(session, timeout_seconds)
     return completed, session.mutated
+
+
+def run_archive_cleanup(
+    database_path: Path,
+    state_dir: Path,
+    plan: dict[str, Any],
+    timeout_seconds: int,
+) -> tuple[bool, dict[str, dict[str, Any]]]:
+    expected = {
+        browser
+        for browser, browser_plan in plan.get("browsers", {}).items()
+        if browser_plan.get("targets")
+    }
+    if not expected:
+        return True, {}
+    session = ReceiverSession(
+        mode="cleanup",
+        database_path=database_path,
+        state_dir=state_dir,
+        expected_browsers=expected,
+        request_id=str(plan["requestId"]),
+        mutation_plan=plan,
+    )
+    completed = _run(session, timeout_seconds)
+    return completed, session.cleaned
 
 
 def _run(

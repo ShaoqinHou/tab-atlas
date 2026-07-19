@@ -33,6 +33,8 @@ elements.capture.addEventListener("click", () => run(async () => {
   if (!result.ok && !result.idle) throw new Error(result.error || "Capture failed.");
   if (result.captured) say(`Captured ${result.tabCount} tabs.`);
   else if (result.mutated) say(`Closed ${result.closedCount} verified duplicate tabs.`);
+  else if (result.archived) say(`Archived and closed ${result.closedCount} captured tabs.`);
+  else if (result.cleaned) say("Archive verification finished.");
   else say("No receiver is waiting.");
   render(await status());
 }));

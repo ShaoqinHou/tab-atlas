@@ -24,19 +24,21 @@ const TARGETS = {
 };
 
 const requested = process.argv[2] || "all";
+const operation = process.argv[3] || "dedupe";
 const browsers = requested === "all" ? ["chromium", "edge"] : [requested];
 if (!browsers.every(browser => Object.hasOwn(TARGETS, browser))) {
-  throw new Error("Usage: node tests/live_extension_e2e.mjs [all|chromium|chrome|edge]");
+  throw new Error("Usage: node tests/live_extension_e2e.mjs [all|chromium|chrome|edge] [dedupe|archive]");
 }
+if (!["dedupe", "archive"].includes(operation)) throw new Error("Operation must be dedupe or archive.");
 if (!fs.existsSync(path.join(EXTENSION, "manifest.json"))) {
   throw new Error(`Prepared extension is missing: ${EXTENSION}`);
 }
 
 const summaries = [];
-for (const browser of browsers) summaries.push(await exerciseBrowser(browser));
-process.stdout.write(`${JSON.stringify({ complete: true, browsers: summaries }, null, 2)}\n`);
+for (const browser of browsers) summaries.push(await exerciseBrowser(browser, operation));
+process.stdout.write(`${JSON.stringify({ complete: true, operation, browsers: summaries }, null, 2)}\n`);
 
-async function exerciseBrowser(browser) {
+async function exerciseBrowser(browser, selectedOperation) {
   const { executablePath, protocolBrowser } = TARGETS[browser];
   if (!fs.existsSync(executablePath)) throw new Error(`${browser} executable is missing`);
   const isolatedRoot = path.join(ROOT, "state", "isolated-e2e", browser);
@@ -76,12 +78,21 @@ async function exerciseBrowser(browser) {
     await popup.locator("#pair").click();
     await popup.locator("#pairing").filter({ hasText: "Paired" }).waitFor({ timeout: 20_000 });
     await pairing.completed();
-    await startCli(stateDir, [
-      "dedupe-approval",
-      "grant",
-      "--scope",
-      "Isolated E2E: close exact HTTPS duplicates in this disposable profile only."
-    ]).completed();
+    if (selectedOperation === "archive") {
+      await startCli(stateDir, [
+        "archive-approval",
+        "grant",
+        "--scope",
+        "Isolated E2E: archive and close every freshly captured tab in this disposable profile only."
+      ]).completed();
+    } else {
+      await startCli(stateDir, [
+        "dedupe-approval",
+        "grant",
+        "--scope",
+        "Isolated E2E: close exact HTTPS duplicates in this disposable profile only."
+      ]).completed();
+    }
 
     const duplicateUrl = "https://example.com/?tabatlas-e2e=duplicate";
     const uniqueUrl = "https://example.com/?tabatlas-e2e=unique";
@@ -94,42 +105,62 @@ async function exerciseBrowser(browser) {
     const unique = await context.newPage();
     await unique.goto(uniqueUrl, { waitUntil: "domcontentloaded" });
 
-    const capture = startCli(stateDir, ["capture", "--browser", protocolBrowser, "--timeout", "60"]);
-    await pollReceiverFromPopup(popup, capture, 90_000);
-    const captureResult = parseTrailingJson(await capture.completed());
-    assert.equal(captureResult.complete, true);
+    if (selectedOperation === "archive") {
+      const discoveryCapture = startCli(stateDir, [
+        "capture", "--browser", protocolBrowser, "--timeout", "60"
+      ]);
+      await pollReceiverFromPopup(popup, discoveryCapture, 120_000);
+      const captureResult = parseTrailingJson(await discoveryCapture.completed());
+      assert.equal(captureResult.complete, true);
+      const discoveryResult = parseTrailingJson(await startCli(stateDir, [
+        "discoveries", "--limit", "100"
+      ]).completed());
+      assert.ok(discoveryResult.total >= 2);
+      const acceptanceResult = parseTrailingJson(await startCli(stateDir, [
+        "accept", "--all"
+      ]).completed());
+      assert.ok(acceptanceResult.updated >= discoveryResult.total);
+      assert.equal(acceptanceResult.inventory.pendingDiscoveries, 0);
+    }
 
-    const dedupe = startCli(stateDir, [
-      "dedupe",
-      "--browser",
-      protocolBrowser,
-      "--execute",
-      "--timeout",
-      "60"
-    ]);
-    await pollReceiverFromPopup(popup, dedupe, 180_000);
-    const dedupeResult = parseTrailingJson(await dedupe.completed());
-    assert.equal(dedupeResult.complete, true);
-    assert.equal(dedupeResult.closed, 2);
-    assert.equal(dedupeResult.skipped, 0);
-    assert.equal(dedupeResult.postVerifiedBrowsers, 1);
+    const command = selectedOperation === "archive"
+      ? ["archive-tabs", "--browser", protocolBrowser, "--execute", "--timeout", "90"]
+      : ["dedupe", "--browser", protocolBrowser, "--execute", "--timeout", "60"];
+    const operationProcess = startCli(stateDir, command);
+    await pollReceiverFromPopup(popup, operationProcess, 240_000);
+    const operationResult = parseTrailingJson(await operationProcess.completed());
+    assert.equal(operationResult.complete, true);
+    assert.equal(operationResult.skipped, 0);
+    assert.equal(operationResult.postVerifiedBrowsers, 1);
 
     const livePages = context.pages().filter(page => !page.isClosed());
-    assert.equal(livePages.filter(page => page.url() === duplicateUrl).length, 1);
-    assert.equal(livePages.filter(page => page.url() === uniqueUrl).length, 1);
-    const audit = fs.readFileSync(dedupeResult.auditPath, "utf8");
+    if (selectedOperation === "archive") {
+      assert.ok(operationResult.closed >= 4);
+      assert.equal(operationResult.archiveVerified, true);
+      assert.equal(operationResult.controlCleanupComplete, true);
+      assert.equal(livePages.filter(page => /^https?:/i.test(page.url())).length, 0);
+      assert.equal(livePages.filter(page => page.url().endsWith("archive_complete.html")).length, 0);
+    } else {
+      assert.equal(operationResult.closed, 2);
+      assert.equal(livePages.filter(page => page.url() === duplicateUrl).length, 1);
+      assert.equal(livePages.filter(page => page.url() === uniqueUrl).length, 1);
+    }
+    const audit = fs.readFileSync(operationResult.auditPath, "utf8");
     assert.equal(audit.includes("example.com"), false);
     assert.equal(audit.includes(duplicateUrl), false);
 
     return {
       browser,
       protocolBrowser,
+      operation: selectedOperation,
       extensionId: EXTENSION_ID,
-      capturedTabs: captureResult.captured[protocolBrowser].tabs,
-      plannedClosures: dedupeResult.summary.plannedClosures,
-      closed: dedupeResult.closed,
-      skipped: dedupeResult.skipped,
-      postCaptureVerified: dedupeResult.postVerifiedBrowsers === 1
+      plannedClosures: operationResult.summary.plannedClosures,
+      closed: operationResult.closed,
+      skipped: operationResult.skipped,
+      postCaptureVerified: operationResult.postVerifiedBrowsers === 1,
+      controlCleanupComplete: selectedOperation === "archive"
+        ? operationResult.controlCleanupComplete
+        : undefined
     };
   } finally {
     await context.close();

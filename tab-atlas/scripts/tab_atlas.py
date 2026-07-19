@@ -11,23 +11,31 @@ from typing import Any
 from tab_atlas_core import (
     annotation_batch,
     apply_annotations,
+    build_archive_cleanup_plan,
+    build_archive_plan,
     build_exact_duplicate_plan,
     cache_public_previews,
     connect,
     copy_extension,
-    current_resources,
+    discovery_batch,
     generate_report,
     import_file,
+    finalize_archive_plan,
     inventory,
+    library_resources,
     finalize_mutation_plan,
     pairing_status,
     query_resources,
+    record_archive_cleanup_result,
+    record_archive_plan,
     record_mutation_plan,
     revoke_pairing,
+    set_discovery_state,
     utc_now,
 )
 from tab_atlas_receiver import (
     EXPECTED_EXTENSION_ID,
+    run_archive_cleanup,
     run_capture,
     run_mutation,
     run_pairing,
@@ -72,7 +80,43 @@ def build_parser() -> argparse.ArgumentParser:
     capture_parser.add_argument("--browser", choices=["all", "chrome", "edge"], default="all")
     capture_parser.add_argument("--timeout", type=int, default=50)
 
+    refresh_parser = subparsers.add_parser(
+        "refresh",
+        help="Capture open tabs, stage new discoveries, and regenerate the report",
+    )
+    refresh_parser.add_argument("--browser", choices=["all", "chrome", "edge"], default="all")
+    refresh_parser.add_argument("--timeout", type=int, default=50)
+    refresh_parser.add_argument("--output", type=Path, default=DEFAULT_REPORT)
+
     subparsers.add_parser("inventory", help="Show aggregate current-library metrics")
+
+    discoveries_parser = subparsers.add_parser(
+        "discoveries",
+        help="List newly observed resources awaiting a library decision",
+    )
+    discoveries_parser.add_argument("--limit", type=int, default=50)
+    discoveries_parser.add_argument("--offset", type=int, default=0)
+    discoveries_parser.add_argument(
+        "--state",
+        dest="discovery_state",
+        choices=["pending", "dismissed"],
+        default="pending",
+        help="List pending discoveries or previously dismissed resources",
+    )
+
+    accept_parser = subparsers.add_parser(
+        "accept",
+        help="Accept selected or all pending discoveries into the durable library",
+    )
+    accept_parser.add_argument("--all", action="store_true", dest="all_discoveries")
+    accept_parser.add_argument("--resource-id", action="append", default=[])
+
+    dismiss_parser = subparsers.add_parser(
+        "dismiss",
+        help="Dismiss selected or all pending discoveries without adding them to the library",
+    )
+    dismiss_parser.add_argument("--all", action="store_true", dest="all_discoveries")
+    dismiss_parser.add_argument("--resource-id", action="append", default=[])
 
     batch_parser = subparsers.add_parser("batch", help="Emit a bounded resource batch for Codex")
     batch_parser.add_argument(
@@ -109,6 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     dedupe_parser.add_argument("--browser", choices=["all", "chrome", "edge"], default="all")
     dedupe_parser.add_argument("--execute", action="store_true")
     dedupe_parser.add_argument("--approval", default="")
+    dedupe_parser.add_argument("--resource-id", action="append", default=[])
     dedupe_parser.add_argument("--timeout", type=int, default=70)
 
     approval_parser = subparsers.add_parser(
@@ -117,6 +162,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     approval_parser.add_argument("action", choices=["status", "grant", "revoke"])
     approval_parser.add_argument("--scope", default="")
+
+    archive_parser = subparsers.add_parser(
+        "archive-tabs",
+        help="Preview or execute verified capture-to-library closure for every captured tab",
+    )
+    archive_parser.add_argument("--browser", choices=["all", "chrome", "edge"], default="all")
+    archive_parser.add_argument("--execute", action="store_true")
+    archive_parser.add_argument("--approval", default="")
+    archive_parser.add_argument("--timeout", type=int, default=240)
+
+    archive_approval_parser = subparsers.add_parser(
+        "archive-approval",
+        help="Inspect, grant, or revoke the private standing captured-tab archive approval",
+    )
+    archive_approval_parser.add_argument("action", choices=["status", "grant", "revoke"])
+    archive_approval_parser.add_argument("--scope", default="")
     return parser
 
 
@@ -176,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             output({"paired": True, "browser": paired_browser})
             return 0
 
-        if args.command == "capture":
+        if args.command in {"capture", "refresh"}:
             targets = {"chrome", "edge"} if args.browser == "all" else {args.browser}
             paired = {item["browser"] for item in pairing_status(connection) if item["enabled"]}
             missing = sorted(targets - paired)
@@ -193,8 +254,7 @@ def main(argv: list[str] | None = None) -> int:
                 targets,
                 _bounded_timeout(args.timeout),
             )
-            output(
-                {
+            capture_output = {
                     "complete": completed,
                     "requestedBrowsers": sorted(targets),
                     "captured": {
@@ -204,12 +264,27 @@ def main(argv: list[str] | None = None) -> int:
                             "resources": result["resource_count"],
                             "windows": result["window_count"],
                             "groups": result["group_count"],
+                            "newResources": result.get("new_resource_count", 0),
+                            "pendingResources": result.get("candidate_resource_count", 0),
                         }
                         for browser, result in captures.items()
                     },
                     "missingBrowsers": sorted(targets - captures.keys()),
                 }
-            )
+            if args.command == "refresh" and completed:
+                connection = connect(database_path)
+                report_path = generate_report(
+                    connection,
+                    args.output.resolve(),
+                    REPORT_ASSETS,
+                    state_dir,
+                )
+                capture_output["report"] = str(report_path)
+                capture_output["inventory"] = inventory(connection)
+                capture_output["reviewRequired"] = bool(
+                    capture_output["inventory"]["pendingDiscoveries"]
+                )
+            output(capture_output)
             return 0 if completed else 1
 
         if args.command == "revoke":
@@ -236,6 +311,32 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "inventory":
             output(inventory(connection))
+            return 0
+
+        if args.command == "discoveries":
+            output(
+                discovery_batch(
+                    connection,
+                    max(1, min(100, args.limit)),
+                    max(0, args.offset),
+                    "candidate" if args.discovery_state == "pending" else "dismissed",
+                )
+            )
+            return 0
+
+        if args.command in {"accept", "dismiss"}:
+            resource_ids = {
+                str(value).strip() for value in args.resource_id if str(value).strip()
+            }
+            if args.all_discoveries == bool(resource_ids):
+                raise ValueError("Choose exactly one of --all or --resource-id")
+            result = set_discovery_state(
+                connection,
+                "accepted" if args.command == "accept" else "dismissed",
+                None if args.all_discoveries else resource_ids,
+            )
+            result["inventory"] = inventory(connection)
+            output(result)
             return 0
 
         if args.command == "batch":
@@ -278,8 +379,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "dedupe":
             targets = {"chrome", "edge"} if args.browser == "all" else {args.browser}
+            resource_ids = {str(value).strip() for value in args.resource_id if str(value).strip()}
             if not args.execute:
-                plan = build_exact_duplicate_plan(connection, targets)
+                plan = build_exact_duplicate_plan(connection, targets, resource_ids or None)
                 output(_dedupe_output(plan))
                 return 0
             approval_scope = args.approval.strip() or _load_standing_approval(state_dir)
@@ -293,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(f"Pair the following browser(s) first: {', '.join(missing)}")
 
             connection.close()
-            pre_complete, _pre_captures = run_capture(
+            pre_complete, pre_captures = run_capture(
                 database_path,
                 state_dir,
                 targets,
@@ -304,7 +406,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
             connection = connect(database_path)
-            plan = build_exact_duplicate_plan(connection, targets)
+            plan = build_exact_duplicate_plan(
+                connection,
+                targets,
+                resource_ids or None,
+                {browser: result["id"] for browser, result in pre_captures.items()},
+            )
             if not plan["summary"]["plannedClosures"]:
                 output({**_dedupe_output(plan), "complete": True, "executed": False})
                 return 0
@@ -387,10 +494,179 @@ def main(argv: list[str] | None = None) -> int:
             })
             return 0
 
+        if args.command == "archive-tabs":
+            targets = {"chrome", "edge"} if args.browser == "all" else {args.browser}
+            if not args.execute:
+                plan = build_archive_plan(connection, targets)
+                output(_archive_output(plan))
+                return 0
+            approval_scope = args.approval.strip() or _load_archive_approval(state_dir)
+            if not approval_scope:
+                raise ValueError(
+                    "--execute requires --approval or an active private archive-approval"
+                )
+            paired = {item["browser"] for item in pairing_status(connection) if item["enabled"]}
+            missing = sorted(targets - paired)
+            if missing:
+                raise ValueError(f"Pair the following browser(s) first: {', '.join(missing)}")
+
+            connection.close()
+            pre_complete, pre_captures = run_capture(
+                database_path,
+                state_dir,
+                targets,
+                _bounded_timeout(args.timeout),
+            )
+            if not pre_complete:
+                output({"complete": False, "phase": "fresh_capture", "browsers": sorted(targets)})
+                return 1
+
+            connection = connect(database_path)
+            plan = build_archive_plan(
+                connection,
+                targets,
+                {browser: result["id"] for browser, result in pre_captures.items()},
+            )
+            if plan["summary"]["pendingDiscoveryCount"]:
+                output({
+                    **_archive_output(plan),
+                    "complete": False,
+                    "executed": False,
+                    "phase": "discovery_review",
+                    "nextCommand": "tab-atlas discoveries",
+                })
+                return 1
+            if plan["summary"]["dismissedOpenResourceCount"]:
+                output({
+                    **_archive_output(plan),
+                    "complete": False,
+                    "executed": False,
+                    "phase": "dismissed_tabs_open",
+                })
+                return 1
+            if not plan["summary"]["plannedClosures"]:
+                output({**_archive_output(plan), "complete": True, "executed": False})
+                return 0
+            evidence_path = record_archive_plan(
+                connection,
+                state_dir,
+                plan,
+                approval_scope,
+            )
+            connection.close()
+
+            mutation_complete, results = run_mutation(
+                database_path,
+                state_dir,
+                plan,
+                _bounded_timeout(args.timeout),
+            )
+            affected = {
+                browser
+                for browser, browser_plan in plan["browsers"].items()
+                if browser_plan["targets"]
+            }
+            post_complete = False
+            post_captures: dict[str, dict[str, Any]] = {}
+            if mutation_complete:
+                post_complete, post_captures = run_capture(
+                    database_path,
+                    state_dir,
+                    affected,
+                    _bounded_timeout(args.timeout),
+                )
+            error = ""
+            if not mutation_complete:
+                error = "archive receiver timed out before every browser returned results"
+            elif not post_complete:
+                error = "post-archive capture did not complete"
+            connection = connect(database_path)
+            totals = finalize_archive_plan(
+                connection,
+                state_dir,
+                plan,
+                results,
+                post_captures,
+                error,
+            )
+            archive_complete = (
+                mutation_complete
+                and post_complete
+                and totals["skipped"] == 0
+                and totals["verifiedBrowsers"] == totals["expectedBrowsers"]
+                and totals["allControlsReported"]
+            )
+            cleanup_complete = False
+            cleanup_results: dict[str, dict[str, Any]] = {}
+            cleanup_plan: dict[str, Any] | None = None
+            if totals["controls"]:
+                cleanup_plan = build_archive_cleanup_plan(plan, totals["controls"])
+                connection.close()
+                cleanup_received, cleanup_results = run_archive_cleanup(
+                    database_path,
+                    state_dir,
+                    cleanup_plan,
+                    _bounded_timeout(args.timeout),
+                )
+                cleanup_complete = (
+                    cleanup_received
+                    and set(cleanup_results) == set(totals["controls"])
+                    and all(
+                        result.get("status") == "closed"
+                        for result in cleanup_results.values()
+                    )
+                )
+                record_archive_cleanup_result(
+                    evidence_path,
+                    cleanup_plan,
+                    cleanup_complete,
+                    cleanup_results,
+                )
+                connection = connect(database_path)
+            complete = archive_complete and cleanup_complete
+            output({
+                **_archive_output(plan),
+                "complete": complete,
+                "archiveVerified": archive_complete,
+                "controlCleanupComplete": cleanup_complete,
+                "executed": True,
+                "closed": totals["closed"],
+                "skipped": totals["skipped"],
+                "archivedResources": totals["archivedResources"],
+                "postVerifiedBrowsers": totals["verifiedBrowsers"],
+                "postCaptureComplete": post_complete,
+                "auditPath": str(evidence_path),
+                "error": error,
+            })
+            return 0 if complete else 1
+
+        if args.command == "archive-approval":
+            if args.action == "grant":
+                scope = args.scope.strip()
+                if not scope:
+                    raise ValueError("grant requires a bounded --scope")
+                path = _write_archive_approval(state_dir, scope, True)
+                output({"active": True, "action": "archive_captured_tabs", "path": str(path)})
+                return 0
+            if args.action == "revoke":
+                path = _write_archive_approval(
+                    state_dir,
+                    "Standing captured-tab archive approval revoked by the user or operator.",
+                    False,
+                )
+                output({"active": False, "action": "archive_captured_tabs", "path": str(path)})
+                return 0
+            output({
+                "active": bool(_load_archive_approval(state_dir)),
+                "action": "archive_captured_tabs",
+                "path": str(_archive_approval_path(state_dir)),
+            })
+            return 0
+
         if args.command == "report":
             output_dir = args.output.resolve()
             report_path = generate_report(connection, output_dir, REPORT_ASSETS, state_dir)
-            output({"report": str(report_path), "resources": len(current_resources(connection))})
+            output({"report": str(report_path), "resources": len(library_resources(connection))})
             if args.open_report:
                 webbrowser.open(report_path.as_uri())
             return 0
@@ -436,6 +712,22 @@ def _dedupe_output(plan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _archive_output(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "policy": plan["policy"],
+        "planHash": plan["planHash"],
+        "summary": plan["summary"],
+        "browsers": {
+            browser: {
+                "beforeCaptureId": browser_plan["beforeCaptureId"],
+                "plannedClosures": len(browser_plan["targets"]),
+                "targetsHash": browser_plan["targetsHash"],
+            }
+            for browser, browser_plan in plan["browsers"].items()
+        },
+    }
+
+
 def _standing_approval_path(state_dir: Path) -> Path:
     return state_dir / "approvals" / "exact-duplicate.json"
 
@@ -465,6 +757,49 @@ def _write_standing_approval(state_dir: Path, scope: str, active: bool) -> Path:
     document = {
         "schemaVersion": 1,
         "action": "close_exact_duplicates",
+        "policyVersion": 1,
+        "active": bool(active),
+        "scope": scope.strip()[:1000],
+        "recordedAt": utc_now(),
+    }
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return path
+
+
+def _archive_approval_path(state_dir: Path) -> Path:
+    return state_dir / "approvals" / "archive-captured-tabs.json"
+
+
+def _load_archive_approval(state_dir: Path) -> str:
+    path = _archive_approval_path(state_dir)
+    if not path.is_file():
+        return ""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if (
+        not isinstance(document, dict)
+        or document.get("schemaVersion") != 1
+        or document.get("action") != "archive_captured_tabs"
+        or document.get("policyVersion") != 1
+        or document.get("active") is not True
+    ):
+        return ""
+    return str(document.get("scope") or "").strip()[:1000]
+
+
+def _write_archive_approval(state_dir: Path, scope: str, active: bool) -> Path:
+    path = _archive_approval_path(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = {
+        "schemaVersion": 1,
+        "action": "archive_captured_tabs",
         "policyVersion": 1,
         "active": bool(active),
         "scope": scope.strip()[:1000],

@@ -1,40 +1,41 @@
 const data = window.__TAB_ATLAS__ || {
   inventory: {},
   resources: [],
+  discoveries: [],
   groups: [],
   collectionSummaries: [],
   spaceSummaries: [],
   topicSummaries: [],
+  focusSummaries: [],
   projectSummaries: [],
   facets: {}
 };
 
-const STORAGE_KEY = "tabatlas.decisions.v1";
 const PAGE_SIZE = 30;
-const DECISIONS = [
-  ["open", "Keep open"],
-  ["saved", "Save + close"],
-  ["close_candidate", "Dismiss + close"]
-];
+const REQUEST_SAFETY_TEXT = "Downloads a request only. Codex verifies a fresh capture, a recoverable backup, and the post-close state before execution.";
 const hasSpaceContract = Object.prototype.hasOwnProperty.call(data, "spaceSummaries");
 const resources = Array.isArray(data.resources) ? data.resources : [];
-const resourceById = new Map(resources.map(resource => [resource.resourceId, resource]));
-const validResourceIds = new Set(resourceById.keys());
+const discoveries = Array.isArray(data.discoveries) ? data.discoveries : [];
+const allResources = [...discoveries, ...resources];
+const resourceById = new Map(allResources.map(resource => [resource.resourceId, resource]));
 const spaceSummaries = hasSpaceContract
   ? (data.spaceSummaries || [])
   : (data.collectionSummaries || []);
 const projectSummaries = data.projectSummaries || [];
+const galleryLoaders = new WeakMap();
+const galleryObservers = new Set();
+const galleryLoadTimers = new Set();
 
 const state = {
   view: "home",
   search: "",
   scope: null,
   topic: "all",
-  reviewMode: "inbox",
+  focus: "all",
+  reviewMode: discoveries.length ? "discoveries" : "inbox",
   filters: defaultFilters(),
   visibleLimit: PAGE_SIZE,
   selectedResource: null,
-  decisions: loadDecisions(),
   lastFocus: null
 };
 
@@ -53,10 +54,11 @@ app.innerHTML = `
   <nav id="primaryNav" class="primary-nav" aria-label="Primary views" role="tablist">
     <button type="button" role="tab" data-view="home">Home</button>
     <button type="button" role="tab" data-view="spaces">Spaces</button>
-    <button type="button" role="tab" data-view="review">Review <span id="navDecisionCount" class="nav-count" hidden>0</span></button>
+    <button type="button" role="tab" data-view="review">Review <span id="navLiveCount" class="nav-count" hidden>0</span></button>
   </nav>
   <main id="screen" class="screen"></main>
-  <div id="drawerHost"></div>`;
+  <div id="drawerHost"></div>
+  <div id="actionStatus" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>`;
 
 const elements = {
   topbar: document.querySelector(".topbar"),
@@ -64,9 +66,10 @@ const elements = {
   freshness: document.getElementById("freshness"),
   search: document.getElementById("search"),
   primaryNav: document.getElementById("primaryNav"),
-  navDecisionCount: document.getElementById("navDecisionCount"),
+  navLiveCount: document.getElementById("navLiveCount"),
   screen: document.getElementById("screen"),
-  drawerHost: document.getElementById("drawerHost")
+  drawerHost: document.getElementById("drawerHost"),
+  actionStatus: document.getElementById("actionStatus")
 };
 
 elements.homeBrand.addEventListener("click", () => setView("home"));
@@ -90,12 +93,52 @@ renderFreshness();
 render();
 
 function render() {
+  disconnectGalleryObservers();
   updateNavigation();
   if (state.search) renderSearch();
   else if (state.view === "spaces") renderSpaces();
   else if (state.view === "review") renderReview();
   else renderHome();
   renderDrawer();
+  connectGalleryObservers();
+}
+
+function disconnectGalleryObservers() {
+  for (const observer of galleryObservers) observer.disconnect();
+  galleryObservers.clear();
+  for (const timer of galleryLoadTimers) window.clearTimeout(timer);
+  galleryLoadTimers.clear();
+}
+
+function connectGalleryObservers() {
+  if (typeof window.IntersectionObserver !== "function") return;
+  for (const sentinel of elements.screen.querySelectorAll("[data-gallery-sentinel]")) {
+    const loadNextBatch = galleryLoaders.get(sentinel);
+    if (!loadNextBatch) continue;
+    const observer = new IntersectionObserver(entries => {
+      if (!entries.some(entry => entry.isIntersecting)) return;
+      observer.unobserve(sentinel);
+      sentinel.classList.add("is-loading");
+      sentinel.setAttribute("aria-busy", "true");
+      const status = sentinel.querySelector(".gallery-sentinel-status");
+      const batchSize = Number(sentinel.dataset.nextBatchSize) || PAGE_SIZE;
+      if (status) status.textContent = `Loading ${formatNumber(batchSize)} more resources`;
+
+      const timer = window.setTimeout(() => {
+        galleryLoadTimers.delete(timer);
+        if (!galleryObservers.has(observer) || !sentinel.isConnected) return;
+        if (loadNextBatch()) {
+          observer.observe(sentinel);
+        } else {
+          observer.disconnect();
+          galleryObservers.delete(observer);
+        }
+      }, 0);
+      galleryLoadTimers.add(timer);
+    }, { root: null, rootMargin: "720px 0px", threshold: 0 });
+    galleryObservers.add(observer);
+    observer.observe(sentinel);
+  }
 }
 
 function renderFreshness() {
@@ -111,35 +154,41 @@ function updateNavigation() {
     button.classList.toggle("active", selected);
     button.setAttribute("aria-selected", String(selected));
   }
-  const queued = Object.keys(state.decisions).length;
-  elements.navDecisionCount.textContent = String(queued);
-  elements.navDecisionCount.hidden = queued === 0;
+  const attentionCount = pendingDiscoveryCount() || currentTabCount();
+  elements.navLiveCount.textContent = String(attentionCount);
+  elements.navLiveCount.hidden = attentionCount === 0;
 }
 
 function renderHome() {
   const fragment = document.createDocumentFragment();
   const inbox = inboxResources();
   const safeDuplicates = safeDuplicateCount();
-  const queued = queuedResources();
+  const openTabs = currentTabCount();
+  const pendingDiscoveries = pendingDiscoveryCount();
+  const liveResources = currentResourceCount();
+  const libraryResources = libraryResourceCount();
   const purposeSpaces = spaceSummaries.slice(0, 6);
 
   const intro = node("section", "home-head");
   const introCopy = node("div", "home-copy");
   introCopy.append(
-    node("p", "eyebrow", "Current library"),
-    node("h2", "", "Choose a space or clear the next decision queue"),
-    node("p", "scope-summary", `${formatNumber(data.inventory?.currentResources || resources.length)} resources from ${formatNumber(data.inventory?.currentTabs || totalTabCount())} open tabs.`)
+    node("p", "eyebrow", "Durable library"),
+    node("h2", "", "Browse what was captured, then clear the browser"),
+    node("p", "scope-summary", openTabs
+      ? `${formatNumber(libraryResources)} library resources; ${formatNumber(liveResources)} are represented by ${formatNumber(openTabs)} open tabs.`
+      : `${formatNumber(libraryResources)} library resources. No captured tabs are currently open.`)
   );
-  intro.append(introCopy, continueButton(inbox.length, safeDuplicates, queued.length));
+  intro.append(introCopy, continueButton(pendingDiscoveries, inbox.length, safeDuplicates, openTabs));
   fragment.append(intro);
 
   const attention = node("section", "attention-section");
-  attention.append(sectionHeading("Needs attention", "Small queues that can reduce uncertainty or open copies."));
+  attention.append(sectionHeading("Library status", "Organize uncertain resources or clear browser state already retained here."));
   const attentionRow = node("div", "attention-row");
   attentionRow.append(
+    attentionButton("New discoveries", pendingDiscoveries, "Awaiting library review", () => openReview("discoveries")),
     attentionButton("Inbox", inbox.length, "No purpose space", () => openReview("inbox")),
-    attentionButton("Safe exact duplicates", safeDuplicates, "Closeable copies", () => openReview("duplicates")),
-    attentionButton("Queued decisions", queued.length, "Ready to export", () => openReview("queued"))
+    attentionButton("Safe exact duplicates", safeDuplicates, "Closeable extras", () => openReview("duplicates")),
+    attentionButton("Open tabs", openTabs, `${formatNumber(liveResources)} live resources`, () => openReview("open"))
   );
   attention.append(attentionRow);
   fragment.append(attention);
@@ -173,27 +222,29 @@ function renderHome() {
   elements.screen.replaceChildren(fragment);
 }
 
-function continueButton(inboxCount, duplicateCount, queuedCount) {
+function continueButton(discoveryCount, inboxCount, duplicateCount, openTabCount) {
   const button = node("button", "continue-action");
   button.type = "button";
-  let count = queuedCount;
-  let label = "Review queued decisions";
-  let detail = "Confirm the actions already marked in this report.";
-  let onClick = () => openReview("queued");
-  if (!queuedCount && inboxCount) {
+  let count = openTabCount;
+  let label = "Review open tabs";
+  let detail = duplicateCount
+    ? `${formatNumber(duplicateCount)} safe exact extras can be removed first, or request the full archive.`
+    : "Captured resources remain in the library after their browser tabs close.";
+  let onClick = () => openReview("open");
+  if (discoveryCount) {
+    count = discoveryCount;
+    label = "Review new discoveries";
+    detail = "Accept selected resources or add the complete batch to the durable library.";
+    onClick = () => openReview("discoveries");
+  } else if (!openTabCount && inboxCount) {
     count = inboxCount;
     label = "Work through Inbox";
-    detail = "Give unplaced resources a purpose or a closing decision.";
+    detail = "Give unplaced library resources a useful purpose space.";
     onClick = () => openReview("inbox");
-  } else if (!queuedCount && !inboxCount && duplicateCount) {
-    count = duplicateCount;
-    label = "Review exact duplicates";
-    detail = "Inspect copies that can be closed without losing a unique URL.";
-    onClick = () => openReview("duplicates");
-  } else if (!queuedCount && !inboxCount && !duplicateCount) {
-    count = data.inventory?.currentResources || resources.length;
+  } else if (!openTabCount && !inboxCount) {
+    count = libraryResourceCount();
     label = "Open purpose spaces";
-    detail = "Browse the library by the work each resource supports.";
+    detail = "Browse the retained library by the work each resource supports.";
     onClick = () => setView("spaces");
   }
   button.append(
@@ -238,7 +289,12 @@ function renderScopeDetail(summary) {
   const members = resourcesForSummary(summary);
   const topics = scopeTopics(summary, members);
   const returnsHome = state.scope.kind === "project";
-  if (state.topic !== "all" && !topics.includes(state.topic)) state.topic = "all";
+  if (state.topic !== "all" && !topics.includes(state.topic)) {
+    state.topic = "all";
+    state.focus = "all";
+  }
+  const focuses = scopeFocuses(members, state.topic);
+  if (state.focus !== "all" && !focuses.includes(state.focus)) state.focus = "all";
 
   const page = node("section", "scope-page");
   const head = node("header", "scope-head");
@@ -249,6 +305,7 @@ function renderScopeDetail(summary) {
     if (returnsHome) state.view = "home";
     state.scope = null;
     state.topic = "all";
+    state.focus = "all";
     state.filters = defaultFilters();
     state.visibleLimit = PAGE_SIZE;
     state.selectedResource = null;
@@ -263,20 +320,22 @@ function renderScopeDetail(summary) {
   const facts = node("div", "scope-facts");
   facts.append(
     factChip(`${formatNumber(members.length)} resources`),
-    factChip(`${formatNumber(members.filter(resource => !state.decisions[resource.resourceId]).length)} unqueued`)
+    factChip(`${formatNumber(members.filter(resource => liveTabs(resource).length).length)} currently open`)
   );
   head.append(copy, facts);
   page.append(head);
 
   if (topics.length) page.append(topicControl(topics));
+  if (focuses.length) page.append(focusControl(focuses));
   page.append(filterPanel(members));
 
   const filtered = filterResources(members).filter(resource =>
-    state.topic === "all" || resourceTopics(resource).includes(state.topic)
+    (state.topic === "all" || resourceTopics(resource).includes(state.topic))
+    && (state.focus === "all" || resourceFocuses(resource, state.topic === "all" ? "" : state.topic).includes(state.focus))
   );
   page.append(resourceGallery(filtered, {
-    label: state.topic === "all" ? "All resources" : state.topic,
-    empty: "No resources match these topic and filter choices.",
+    label: state.focus !== "all" ? state.focus : (state.topic === "all" ? "All resources" : state.topic),
+    empty: "No resources match these hierarchy and filter choices.",
     hideSpace: state.scope.kind === "space"
   }));
   elements.screen.replaceChildren(page);
@@ -291,6 +350,25 @@ function topicControl(topics) {
     button.setAttribute("aria-pressed", String(state.topic === topic));
     button.addEventListener("click", () => {
       state.topic = topic;
+      state.focus = "all";
+      state.visibleLimit = PAGE_SIZE;
+      state.selectedResource = null;
+      renderAtTop();
+    });
+    wrapper.append(button);
+  }
+  return wrapper;
+}
+
+function focusControl(focuses) {
+  const wrapper = node("div", "topic-control focus-control");
+  wrapper.setAttribute("aria-label", "Focus filter");
+  for (const focus of ["all", ...focuses]) {
+    const button = node("button", state.focus === focus ? "active" : "", focus === "all" ? "All focus areas" : focus);
+    button.type = "button";
+    button.setAttribute("aria-pressed", String(state.focus === focus));
+    button.addEventListener("click", () => {
+      state.focus = focus;
       state.visibleLimit = PAGE_SIZE;
       state.selectedResource = null;
       renderAtTop();
@@ -310,8 +388,8 @@ function filterPanel(members) {
 
   const controls = node("div", "filter-controls");
   const formats = unique(members.map(resource => resource.presentation?.format).filter(Boolean));
-  const browsers = unique(members.flatMap(resource => resource.tabs || []).map(tab => tab.browser).filter(Boolean));
-  const groups = unique(members.flatMap(resource => resource.presentation?.groupTitles || []));
+  const browsers = unique(members.flatMap(resourceContexts).map(context => context.browser).filter(Boolean));
+  const groups = unique(members.flatMap(contextGroupTitles));
   controls.append(
     selectControl("Format", ["all", ...formats], state.filters.format, value => updateFilter("format", value)),
     selectControl("Browser", ["all", ...browsers], state.filters.browser, value => updateFilter("browser", value)),
@@ -331,27 +409,24 @@ function filterPanel(members) {
 }
 
 function renderReview() {
+  const openResources = openTabResources();
   const modes = [
+    ["discoveries", "New discoveries", discoveries.length],
     ["inbox", "Inbox", inboxResources().length],
     ["duplicates", "Exact duplicates", exactDuplicateResources().length],
-    ["queued", "Queued", queuedResources().length]
+    ["open", "Open tabs", currentTabCount()]
   ];
   const page = node("section", "review-page");
   const head = node("header", "review-head");
   const copy = node("div");
   copy.append(
-    node("p", "eyebrow", "Decision review"),
+    node("p", "eyebrow", "Library review"),
     node("h2", "", modes.find(item => item[0] === state.reviewMode)?.[1] || "Review"),
     node("p", "scope-summary", reviewDescription(state.reviewMode))
   );
   head.append(copy);
-  if (state.reviewMode === "queued") {
-    const exportButton = node("button", "primary-command", "Export queued decisions");
-    exportButton.type = "button";
-    exportButton.disabled = !queuedResources().length;
-    exportButton.addEventListener("click", exportDecisions);
-    head.append(exportButton);
-  }
+  const requestPanel = reviewActionPanel(state.reviewMode);
+  if (requestPanel) head.append(requestPanel);
   page.append(head);
 
   const control = node("div", "review-modes");
@@ -371,20 +446,74 @@ function renderReview() {
   }
   page.append(control);
 
-  let reviewResources = inboxResources();
+  let reviewResources = state.reviewMode === "discoveries" ? discoveries : inboxResources();
   if (state.reviewMode === "duplicates") reviewResources = exactDuplicateResources();
-  if (state.reviewMode === "queued") reviewResources = queuedResources();
+  if (state.reviewMode === "open") reviewResources = openResources;
+  let galleryLabel = `${formatNumber(reviewResources.length)} resource${reviewResources.length === 1 ? "" : "s"}`;
+  if (state.reviewMode === "discoveries") {
+    galleryLabel = `${formatNumber(reviewResources.length)} awaiting approval`;
+  } else if (state.reviewMode === "duplicates") {
+    galleryLabel = `${formatNumber(safeDuplicateCount())} safe close candidate${safeDuplicateCount() === 1 ? "" : "s"}`;
+  } else if (state.reviewMode === "open") {
+    galleryLabel = `${formatNumber(currentTabCount())} open tab${currentTabCount() === 1 ? "" : "s"} across ${formatNumber(openResources.length)} resources`;
+  }
   page.append(resourceGallery(reviewResources, {
-    label: state.reviewMode === "duplicates"
-      ? `${formatNumber(safeDuplicateCount())} safe close candidate${safeDuplicateCount() === 1 ? "" : "s"}`
-      : `${formatNumber(reviewResources.length)} resource${reviewResources.length === 1 ? "" : "s"}`,
+    label: galleryLabel,
     empty: reviewEmptyMessage(state.reviewMode)
   }));
   elements.screen.replaceChildren(page);
 }
 
+function reviewActionPanel(mode) {
+  if (!["discoveries", "duplicates", "open"].includes(mode)) return null;
+  const duplicateCount = safeDuplicateCount();
+  const openTabs = currentTabCount();
+  const pending = pendingDiscoveryCount();
+  const dismissedOpen = inventoryCount("currentDismissedResources", 0);
+  const panel = node("div", "review-action");
+  let label = openTabs ? "Close all captured tabs" : "All captured tabs closed";
+  let disabled = openTabs === 0;
+  if (mode === "discoveries") {
+    label = pending ? "Accept all new discoveries" : "No new discoveries";
+    disabled = pending === 0;
+  } else if (mode === "duplicates") {
+    label = duplicateCount ? "Close all duplicates" : "No safe duplicates";
+    disabled = duplicateCount === 0;
+  } else if (pending) {
+    label = `Review ${formatNumber(pending)} new first`;
+    disabled = true;
+  } else if (dismissedOpen) {
+    label = `Resolve ${formatNumber(dismissedOpen)} dismissed first`;
+    disabled = true;
+  }
+  const button = node(
+    "button",
+    `primary-command ${mode === "discoveries" ? "accept-command" : "close-command"}`,
+    label
+  );
+  const note = node(
+    "p",
+    "action-safety-note",
+    mode === "discoveries"
+      ? "Downloads a request to add this reviewed batch. Browser tabs are unchanged."
+      : REQUEST_SAFETY_TEXT
+  );
+  note.id = "reviewActionSafety";
+  button.type = "button";
+  button.disabled = disabled;
+  button.title = "Downloads a privacy-safe action request; it does not close tabs directly.";
+  button.setAttribute("aria-describedby", note.id);
+  button.addEventListener("click", () => {
+    if (mode === "discoveries") requestDiscoveryAcceptance();
+    else if (mode === "duplicates") requestDuplicateClose();
+    else requestCapturedTabArchive();
+  });
+  panel.append(button, note);
+  return panel;
+}
+
 function renderSearch() {
-  const matches = resources.filter(matchesSearch).sort(resourceSort);
+  const matches = allResources.filter(matchesSearch).sort(resourceSort);
   const page = node("section", "search-page");
   const head = node("header", "search-head");
   const copy = node("div");
@@ -407,9 +536,11 @@ function renderSearch() {
 function resourceGallery(items, options = {}) {
   const section = node("section", "gallery-section");
   const heading = node("header", "gallery-head");
+  const visibleCount = Math.min(items.length, state.visibleLimit);
+  const count = node("span", "gallery-count", `${formatNumber(visibleCount)} of ${formatNumber(items.length)}`);
   heading.append(
     node("h3", "", options.label || "Resources"),
-    node("span", "gallery-count", `${formatNumber(Math.min(items.length, state.visibleLimit))} of ${formatNumber(items.length)}`)
+    count
   );
   section.append(heading);
   if (!items.length) {
@@ -418,18 +549,51 @@ function resourceGallery(items, options = {}) {
   }
 
   const grid = node("div", "resource-grid");
-  for (const resource of items.slice(0, state.visibleLimit)) {
+  for (const resource of items.slice(0, visibleCount)) {
     grid.append(resourceCard(resource, options));
   }
   section.append(grid);
-  if (state.visibleLimit < items.length) {
-    const more = node("button", "show-more", `Show ${formatNumber(Math.min(PAGE_SIZE, items.length - state.visibleLimit))} more`);
-    more.type = "button";
-    more.addEventListener("click", () => {
-      state.visibleLimit += PAGE_SIZE;
-      render();
+  if (visibleCount < items.length) {
+    let renderedCount = visibleCount;
+    const sentinel = node("div", "gallery-sentinel");
+    const status = node("span", "gallery-sentinel-status");
+    sentinel.dataset.gallerySentinel = "";
+    sentinel.setAttribute("role", "status");
+    sentinel.setAttribute("aria-live", "polite");
+    sentinel.setAttribute("aria-atomic", "true");
+    sentinel.setAttribute("aria-busy", "false");
+
+    const updateSentinel = () => {
+      const remaining = items.length - renderedCount;
+      const nextBatchSize = Math.min(PAGE_SIZE, remaining);
+      sentinel.dataset.nextBatchSize = String(nextBatchSize);
+      status.textContent = `${formatNumber(remaining)} more resource${remaining === 1 ? "" : "s"} available`;
+    };
+    updateSentinel();
+    sentinel.append(status);
+    section.append(sentinel);
+
+    galleryLoaders.set(sentinel, () => {
+      const nextCount = Math.min(renderedCount + PAGE_SIZE, items.length);
+      const fragment = document.createDocumentFragment();
+      for (const resource of items.slice(renderedCount, nextCount)) {
+        fragment.append(resourceCard(resource, options));
+      }
+      grid.append(fragment);
+      renderedCount = nextCount;
+      state.visibleLimit = Math.max(state.visibleLimit, renderedCount);
+      count.textContent = `${formatNumber(renderedCount)} of ${formatNumber(items.length)}`;
+      sentinel.classList.remove("is-loading");
+      sentinel.setAttribute("aria-busy", "false");
+      if (renderedCount >= items.length) {
+        sentinel.classList.add("is-complete");
+        sentinel.removeAttribute("data-next-batch-size");
+        status.textContent = `All ${formatNumber(items.length)} resources loaded`;
+        return false;
+      }
+      updateSentinel();
+      return true;
     });
-    section.append(more);
   }
   return section;
 }
@@ -462,7 +626,7 @@ function resourceCard(resource, options = {}) {
 
   const chips = resourceChips(resource, options.hideSpace);
   if (chips.childElementCount) body.append(chips);
-  article.append(body, decisionActions(resource, "card-actions"));
+  article.append(body, resourceFooter(resource, "card"));
   return article;
 }
 
@@ -526,33 +690,61 @@ function resourceChips(resource, hideSpace = false) {
   const chips = node("div", "resource-chips");
   const space = resourceSpace(resource);
   const topics = resourceTopics(resource);
+  const focuses = resourceFocuses(resource);
   const projects = resourceProjects(resource);
   const duplicate = duplicateSummary(resource);
-  const queued = state.decisions[resource.resourceId];
   if (!hideSpace && space) chips.append(chip(space, "space-chip"));
   if (topics[0]) chips.append(chip(topics[0], "topic-chip"));
+  if (focuses[0]) chips.append(chip(focuses[0], "focus-chip"));
   else if (projects[0]) chips.append(chip(projects[0], "project-chip"));
   if (duplicate.sets) {
     const count = duplicate.safeCloseCandidates || duplicate.instances;
     const qualifier = duplicate.safeCloseCandidates ? "" : " protected";
     chips.append(chip(`${count}${qualifier} exact ${count === 1 ? "copy" : "copies"}`, "duplicate-chip"));
   }
-  if (queued) chips.append(chip(decisionLabel(queued), `queued-chip queued-${queued}`));
   return chips;
 }
 
-function decisionActions(resource, className) {
-  const wrapper = node("div", `decision-actions ${className}`);
-  const selected = state.decisions[resource.resourceId] || "";
-  wrapper.setAttribute("aria-label", `Queued decision for ${resourceDisplayTitle(resource)}`);
-  for (const [status, label] of DECISIONS) {
-    const button = node("button", selected === status ? `active action-${status}` : `action-${status}`, label);
+function resourceFooter(resource, placement) {
+  const openCount = liveTabs(resource).length;
+  const duplicateCount = duplicateSummary(resource).safeCloseCandidates;
+  const wrapper = node("div", `resource-footer ${placement}-resource-footer`);
+  if (resource.libraryState === "candidate") {
+    wrapper.classList.add("has-command", "is-discovery");
+    const copy = node("span", "resource-footer-copy");
+    copy.append(
+      node("strong", "", "New discovery"),
+      node("span", "", "Not yet in the durable library")
+    );
+    const button = node("button", "resource-action-command accept-resource-command", "Add to library");
     button.type = "button";
-    button.setAttribute("aria-pressed", String(selected === status));
-    button.title = "Queues this action only; the report does not change browser tabs.";
-    button.addEventListener("click", () => setDecision(resource.resourceId, status));
-    wrapper.append(button);
+    button.addEventListener("click", () => requestDiscoveryAcceptance(resource));
+    wrapper.append(copy, button);
+    return wrapper;
   }
+  if (duplicateCount) {
+    wrapper.classList.add("has-command");
+    const copy = node("span", "resource-footer-copy");
+    copy.append(
+      node("strong", "", `${formatNumber(duplicateCount)} safe ${duplicateCount === 1 ? "extra" : "extras"}`),
+      node("span", "", "Request only; verified first")
+    );
+    const button = node("button", "resource-action-command", "Close duplicate extras");
+    button.type = "button";
+    button.title = "Downloads a privacy-safe action request; it does not close tabs directly.";
+    button.setAttribute("aria-label", `Close duplicate extras for ${resourceDisplayTitle(resource)}. ${REQUEST_SAFETY_TEXT}`);
+    button.addEventListener("click", () => requestDuplicateClose(resource));
+    wrapper.append(copy, button);
+    return wrapper;
+  }
+
+  wrapper.classList.add(openCount ? "is-open" : "is-stored");
+  const copy = node("span", "resource-footer-copy");
+  copy.append(
+    node("strong", "", openCount ? `${formatNumber(openCount)} open ${openCount === 1 ? "tab" : "tabs"}` : "Stored"),
+    node("span", "", openCount ? "Captured in library" : "No open browser tabs")
+  );
+  wrapper.append(copy);
   return wrapper;
 }
 
@@ -628,8 +820,9 @@ function renderDrawer() {
     if (resource.detail) more.append(detailText("Details", resource.detail));
     content.append(more);
   }
-  content.append(instanceDisclosure(resource));
-  drawer.append(content, decisionActions(resource, "drawer-actions"));
+  const contexts = instanceDisclosure(resource);
+  if (contexts) content.append(contexts);
+  drawer.append(content, resourceFooter(resource, "drawer"));
   backdrop.append(drawer);
   elements.drawerHost.replaceChildren(backdrop);
   requestAnimationFrame(() => close.focus({ preventScroll: true }));
@@ -639,8 +832,9 @@ function detailCategories(resource) {
   const values = [
     ["Space", resourceSpace(resource)],
     ["Topics", resourceTopics(resource).join(", ")],
+    ["Focus", resourceFocuses(resource).join(", ")],
     ["Projects", resourceProjects(resource).join(", ")],
-    ["Browser groups", (resource.presentation?.groupTitles || []).join(", ")]
+    ["Browser groups", contextGroupTitles(resource).join(", ")]
   ].filter(item => item[1]);
   if (!values.length) return null;
   const section = node("section", "detail-section");
@@ -672,6 +866,8 @@ function duplicateDetails(resource, duplicate) {
 }
 
 function metadataSection(resource) {
+  const contexts = resourceContexts(resource);
+  const openCount = liveTabs(resource).length;
   const section = node("section", "detail-section");
   section.append(node("h3", "", "Metadata"));
   const facts = node("dl", "metadata-grid");
@@ -679,8 +875,9 @@ function metadataSection(resource) {
     cue("Source", resource.presentation?.source || resource.host),
     cue("Format", resource.presentation?.format || resource.kind),
     cue("Intent", resource.presentation?.intent),
-    cue("Open copies", String((resource.tabs || []).length)),
-    cue("Browsers", unique((resource.tabs || []).map(tab => capitalize(tab.browser))).join(", ")),
+    cue("Open tabs", String(openCount)),
+    cue("Captured in", unique(contexts.map(context => capitalize(context.browser)).filter(Boolean)).join(", ")),
+    cue("Library state", openCount ? "Open in browser" : "Stored"),
     cue("First seen", formatDate(resource.firstSeenAt, true))
   );
   section.append(facts);
@@ -694,15 +891,26 @@ function detailText(label, value) {
 }
 
 function instanceDisclosure(resource) {
+  const contexts = resourceContexts(resource);
+  if (!contexts.length) return null;
   const details = document.createElement("details");
   details.className = "detail-disclosure";
-  details.append(node("summary", "", `Tab instances (${(resource.tabs || []).length})`));
+  details.append(node("summary", "", `Captured contexts (${contexts.length})`));
   const list = node("div", "instance-list");
-  for (const tab of resource.tabs || []) {
+  for (const context of contexts) {
     const item = node("div", "instance-row");
+    const contextDetails = [];
+    if (context.position !== null && context.position !== undefined && Number.isFinite(Number(context.position))) {
+      contextDetails.push(`Position ${Number(context.position) + 1}`);
+    }
+    if (context.live === true) contextDetails.push("current capture");
+    else if (context.live === false) contextDetails.push("stored capture");
+    if (context.pinned) contextDetails.push("pinned");
+    if (context.active) contextDetails.push("active");
+    if (context.audible) contextDetails.push("audible");
     item.append(
-      node("strong", "", `${capitalize(tab.browser)}${tab.groupTitle ? ` / ${tab.groupTitle}` : ""}`),
-      node("span", "", `Position ${Number(tab.position) + 1}${tab.pinned ? " / pinned" : ""}${tab.active ? " / active" : ""}${tab.audible ? " / audible" : ""}`)
+      node("strong", "", `${capitalize(context.browser)}${context.groupTitle ? ` / ${context.groupTitle}` : ""}`),
+      node("span", "", contextDetails.join(" / ") || "Captured browser context")
     );
     list.append(item);
   }
@@ -795,6 +1003,7 @@ function openScope(kind, id) {
   elements.search.value = "";
   state.scope = { kind, id };
   state.topic = "all";
+  state.focus = "all";
   state.filters = defaultFilters();
   state.visibleLimit = PAGE_SIZE;
   state.selectedResource = null;
@@ -818,20 +1027,29 @@ function resourcesForSummary(summary) {
 }
 
 function scopeTopics(summary, members) {
-  const named = (summary.topTopics || []).map(topic => topic.name).filter(Boolean);
-  if (named.length) return named;
   const counts = new Map();
   for (const resource of members) {
     for (const topic of resourceTopics(resource)) counts.set(topic, (counts.get(topic) || 0) + 1);
   }
-  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 6).map(item => item[0]);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(item => item[0]);
+}
+
+function scopeFocuses(members, topic) {
+  const counts = new Map();
+  for (const resource of members) {
+    if (topic !== "all" && !resourceTopics(resource).includes(topic)) continue;
+    for (const focus of resourceFocuses(resource, topic === "all" ? "" : topic)) {
+      counts.set(focus, (counts.get(focus) || 0) + 1);
+    }
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(item => item[0]);
 }
 
 function filterResources(items) {
   return items.filter(resource => {
     if (state.filters.format !== "all" && resource.presentation?.format !== state.filters.format) return false;
-    if (state.filters.browser !== "all" && !(resource.tabs || []).some(tab => tab.browser === state.filters.browser)) return false;
-    const groups = resource.presentation?.groupTitles || [];
+    if (state.filters.browser !== "all" && !resourceContexts(resource).some(context => context.browser === state.filters.browser)) return false;
+    const groups = contextGroupTitles(resource);
     if (state.filters.group === "__ungrouped" && groups.length) return false;
     if (!['all', '__ungrouped'].includes(state.filters.group) && !groups.includes(state.filters.group)) return false;
     return true;
@@ -858,32 +1076,21 @@ function inboxResources() {
 }
 
 function exactDuplicateResources() {
-  return resources.filter(resource => duplicateSummary(resource).sets > 0).sort((a, b) => {
+  return allResources.filter(resource => duplicateSummary(resource).sets > 0).sort((a, b) => {
     const count = duplicateSummary(b).safeCloseCandidates - duplicateSummary(a).safeCloseCandidates;
     return count || resourceSort(a, b);
   });
 }
 
-function queuedResources() {
-  return resources.filter(resource => state.decisions[resource.resourceId]).sort(resourceSort);
+function openTabResources() {
+  return allResources.filter(resource => liveTabs(resource).length > 0).sort(resourceSort);
 }
 
 function safeDuplicateCount() {
-  const value = Number(data.inventory?.safeCloseCandidates);
-  if (Number.isFinite(value)) return value;
-  return resources.reduce((total, resource) => total + duplicateSummary(resource).safeCloseCandidates, 0);
+  return allResources.reduce((total, resource) => total + duplicateSummary(resource).safeCloseCandidates, 0);
 }
 
 function duplicateSummary(resource) {
-  const duplicate = resource.presentation?.duplicates;
-  if (duplicate && typeof duplicate === "object") {
-    return {
-      sets: Number(duplicate.sets || 0),
-      instances: Number(duplicate.instances || 0),
-      safeCloseCandidates: Number(duplicate.safeCloseCandidates || 0),
-      protectedInstances: Number(duplicate.protectedInstances || 0)
-    };
-  }
   const groups = exactDuplicateGroups(resource);
   return {
     sets: groups.length,
@@ -895,8 +1102,8 @@ function duplicateSummary(resource) {
 
 function exactDuplicateGroups(resource) {
   const buckets = new Map();
-  for (const tab of resource.tabs || []) {
-    if (!/^https?:\/\//i.test(tab.url || "")) continue;
+  for (const tab of liveTabs(resource)) {
+    if (!/^https:\/\//i.test(tab.url || "")) continue;
     const key = [tab.browser, tab.windowId, tab.groupId, tab.url].join("\n");
     if (!buckets.has(key)) buckets.set(key, []);
     buckets.get(key).push(tab);
@@ -910,8 +1117,8 @@ function exactDuplicateGroups(resource) {
       browser: ordered[0].browser,
       groupTitle: ordered[0].groupTitle || "",
       tabs: ordered,
-      safe: candidates.filter(tab => !tab.active && !tab.pinned && !tab.audible).length,
-      protected: candidates.filter(tab => tab.active || tab.pinned || tab.audible).length
+      safe: candidates.filter(tab => !tab.active && !tab.highlighted && !tab.pinned && !tab.audible).length,
+      protected: candidates.filter(tab => tab.active || tab.highlighted || tab.pinned || tab.audible).length
     });
   }
   return result;
@@ -920,6 +1127,7 @@ function exactDuplicateGroups(resource) {
 function duplicateKeeperSort(a, b) {
   const rank = tab => [
     tab.active ? 0 : 1,
+    tab.highlighted ? 0 : 1,
     tab.pinned ? 0 : 1,
     tab.audible ? 0 : 1,
     tab.discarded ? 1 : 0,
@@ -947,14 +1155,25 @@ function resourceTopics(resource) {
   return (resource.collections || []).filter(value => value.kind === "topic").map(value => value.name);
 }
 
+function resourceFocuses(resource, topic = "") {
+  const collections = (resource.collections || []).filter(value => value.kind === "focus");
+  if (topic) {
+    return collections
+      .filter(value => !value.parentName || value.parentName === topic)
+      .map(value => value.name);
+  }
+  if (Array.isArray(resource.presentation?.focuses) && resource.presentation.focuses.length) {
+    return resource.presentation.focuses;
+  }
+  return collections.map(value => value.name);
+}
+
 function resourceProjects(resource) {
   if (Array.isArray(resource.presentation?.projects) && resource.presentation.projects.length) return resource.presentation.projects;
   return (resource.collections || []).filter(value => value.kind === "project").map(value => value.name);
 }
 
 function resourceSort(a, b) {
-  const queuedDifference = Number(Boolean(state.decisions[b.resourceId])) - Number(Boolean(state.decisions[a.resourceId]));
-  if (queuedDifference) return queuedDifference;
   const previewDifference = Number(Boolean(b.presentation?.preview?.localImage)) - Number(Boolean(a.presentation?.preview?.localImage));
   if (previewDifference) return previewDifference;
   return resourceDisplayTitle(a).localeCompare(resourceDisplayTitle(b));
@@ -975,22 +1194,25 @@ function matchesSearch(resource) {
     resource.presentation?.contextCue,
     resourceSpace(resource),
     ...resourceTopics(resource),
+    ...resourceFocuses(resource),
     ...resourceProjects(resource),
-    ...(resource.presentation?.groupTitles || [])
+    ...contextGroupTitles(resource)
   ].join("\n").toLocaleLowerCase();
   return value.includes(state.search);
 }
 
 function reviewDescription(mode) {
+  if (mode === "discoveries") return "New canonical resources from the latest capture. Accept selected items or the complete batch before archiving their tabs.";
   if (mode === "duplicates") return "Exact URL matches within the same browser window and group. Protected tabs remain visible and excluded from safe candidates.";
-  if (mode === "queued") return "Actions selected in this report. Export preserves the existing annotation schema and does not mutate browser tabs.";
-  return "Resources without a purpose space. Decide whether they belong in current work or can be closed after capture.";
+  if (mode === "open") return "Resources represented by the latest captured browser state. Their metadata and reopen links remain in the durable library after tabs close.";
+  return "Stored or open resources without a purpose space. Organize them without keeping browser tabs alive.";
 }
 
 function reviewEmptyMessage(mode) {
+  if (mode === "discoveries") return "No new resources are waiting for approval.";
   if (mode === "duplicates") return "No exact duplicate sets are present in the current capture.";
-  if (mode === "queued") return "No decisions have been queued in this report.";
-  return "Every current resource has a purpose space.";
+  if (mode === "open") return "No captured tabs are currently open. The retained library remains available in Spaces and search.";
+  return "Every library resource has a purpose space.";
 }
 
 function openReview(mode) {
@@ -1014,6 +1236,7 @@ function setView(view) {
   if (state.view === "spaces") {
     state.scope = null;
     state.topic = "all";
+    state.focus = "all";
     state.filters = defaultFilters();
   }
   renderAtTop();
@@ -1042,55 +1265,62 @@ function closeDetails() {
   if (restore && restore.isConnected) requestAnimationFrame(() => restore.focus({ preventScroll: true }));
 }
 
-function setDecision(resourceId, status) {
-  if (state.decisions[resourceId] === status) delete state.decisions[resourceId];
-  else state.decisions[resourceId] = status;
-  saveDecisions();
-  const scrollY = window.scrollY;
-  render();
-  window.scrollTo({ top: scrollY });
+function requestCapturedTabArchive() {
+  const currentTabs = currentTabCount();
+  if (!currentTabs || pendingDiscoveryCount() || inventoryCount("currentDismissedResources", 0)) return;
+  downloadActionRequest("archive_captured_tabs", {
+    libraryResources: libraryResourceCount(),
+    currentResources: currentResourceCount(),
+    currentTabs
+  });
 }
 
-function loadDecisions() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return Object.fromEntries(Object.entries(parsed).filter(([resourceId, status]) =>
-      validResourceIds.has(resourceId) && ["saved", "open", "close_candidate"].includes(status)
-    ));
-  } catch {
-    return {};
-  }
+function requestDiscoveryAcceptance(resource = null) {
+  const selected = resource
+    ? [resource.resourceId]
+    : discoveries.map(item => item.resourceId);
+  const count = selected.length;
+  if (!count) return;
+  downloadActionRequest("accept_discoveries", {
+    pendingDiscoveries: pendingDiscoveryCount(),
+    selectedResources: count
+  }, selected);
 }
 
-function saveDecisions() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state.decisions));
-  } catch {
-    // The report remains usable when browser storage is unavailable.
-  }
+function requestDuplicateClose(resource = null) {
+  const safeDuplicateCandidates = resource
+    ? duplicateSummary(resource).safeCloseCandidates
+    : safeDuplicateCount();
+  if (!safeDuplicateCandidates) return;
+  const matchingResources = resource
+    ? 1
+    : exactDuplicateResources().filter(item => duplicateSummary(item).safeCloseCandidates > 0).length;
+  downloadActionRequest("close_exact_duplicates", {
+    libraryResources: libraryResourceCount(),
+    currentResources: currentResourceCount(),
+    currentTabs: currentTabCount(),
+    matchingResources,
+    safeDuplicateCandidates
+  }, resource ? [resource.resourceId] : []);
 }
 
-function exportDecisions() {
-  const annotatedResources = Object.entries(state.decisions).map(([resourceId, status]) => ({ resourceId, status }));
-  if (!annotatedResources.length) return;
+function downloadActionRequest(action, counts, resourceIds = []) {
   const payload = {
     schemaVersion: 1,
-    generatedAt: new Date().toISOString(),
-    sourceReportGeneratedAt: data.generatedAt,
-    resources: annotatedResources
+    action,
+    generatedAt: new Date().toISOString()
   };
+  const safeResourceIds = unique(resourceIds.filter(resourceId => resourceById.has(resourceId)));
+  if (safeResourceIds.length) payload.resourceIds = safeResourceIds;
+  payload.counts = Object.fromEntries(Object.entries(counts).map(([key, value]) => [key, Math.max(0, Number(value) || 0)]));
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = "tabatlas-decisions.json";
+  link.download = "tabatlas-action-request.json";
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-function decisionLabel(status) {
-  return Object.fromEntries(DECISIONS)[status] || "Queued";
+  elements.actionStatus.textContent = "Action request downloaded. No browser tabs were changed.";
 }
 
 function factChip(value) {
@@ -1116,8 +1346,40 @@ function renderAtTop() {
   window.scrollTo({ top: 0 });
 }
 
-function totalTabCount() {
-  return resources.reduce((total, resource) => total + (resource.tabs || []).length, 0);
+function liveTabs(resource) {
+  return Array.isArray(resource.tabs) ? resource.tabs : [];
+}
+
+function resourceContexts(resource) {
+  const contexts = resource.contexts || resource.tabs;
+  return Array.isArray(contexts) ? contexts : [];
+}
+
+function contextGroupTitles(resource) {
+  return unique(resourceContexts(resource).map(context => context.groupTitle).filter(Boolean));
+}
+
+function libraryResourceCount() {
+  return inventoryCount("libraryResources", resources.length);
+}
+
+function currentResourceCount() {
+  return inventoryCount("currentResources", openTabResources().length);
+}
+
+function currentTabCount() {
+  const fallback = allResources.reduce((total, resource) => total + liveTabs(resource).length, 0);
+  return inventoryCount("currentTabs", fallback);
+}
+
+function pendingDiscoveryCount() {
+  return inventoryCount("pendingDiscoveries", discoveries.length);
+}
+
+function inventoryCount(name, fallback) {
+  const value = data.inventory?.[name];
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return fallback;
+  return Math.max(0, Number(value));
 }
 
 function resourceDisplayTitle(resource) {

@@ -2,120 +2,115 @@
 
 ## Product Boundary
 
-The user operates TabAtlas by talking to Codex. The workspace supplies deterministic local capabilities:
+The user operates TabAtlas by talking to Codex. The workspace supplies local,
+deterministic capabilities; it does not embed a model runtime.
 
 ```text
 Chrome / Edge extension
         |
-        | authenticated loopback capture
+        | authenticated loopback command
         v
-one-shot Python receiver -> raw snapshot -> SQLite catalog
-                                             |
-                                             +-> bounded Codex batches
-                                             +-> static local HTML report
+one-shot receiver -> raw capture -> SQLite catalog
+                                      |-- staged discoveries
+                                      |-- durable accepted library
+                                      |-- bounded Codex batches
+                                      `-- static local report
 ```
 
-There is no embedded model runtime. The current Codex agent performs semantic work and writes structured results through the CLI.
+The agent-operated cycle is:
 
-## Browser Extension
+```text
+refresh -> review discoveries -> accept or dismiss -> enrich and reconsider
+        -> report -> optionally run a verified archive
+```
 
-Use one Manifest V3 package in Chrome and Edge.
+## Browser Extension And Receiver
 
-- `OFF`: clear the polling alarm. Do not query tabs or perform network requests.
-- `ON`: create one 30-second alarm. On each alarm, ask the loopback receiver whether a bounded command is pending. Query windows, tabs, and tab groups only after an authenticated capture command. A mutation command is accepted only for the exact-duplicate protocol below.
-- Register no tab, window, or group change listeners. Hundreds of tabs must not create background event churn.
-- Request only `alarms`, `storage`, `tabs`, and `tabGroups`, plus loopback host access.
-- Use a fixed public manifest key so unpacked installs keep a stable extension ID.
+Use one Manifest V3 extension package in Chrome and Edge.
 
-The receiver cannot wake a fully dormant extension directly. The 30-second alarm is the smallest browser-supported automatic rendezvous without a persistent native process or WebSocket heartbeat.
+- `OFF`: clear the polling alarm; do not query tabs or contact the receiver.
+- `ON`: use one low-frequency alarm to check the loopback receiver. Read windows,
+  tabs, and groups only after an authenticated bounded command is available.
+- Register no tab, window, or group change listeners.
+- Keep permissions limited to alarms, storage, tabs, tab groups, and loopback.
 
-## Receiver
+The receiver is not scheduled and does not start with Windows. A CLI operation
+owns its lifetime. Bind only to `127.0.0.1`, validate size and schema, and use
+nonce-bound HMAC proofs for receiver identity, commands, snapshots, results, and
+cleanup. Write raw snapshots atomically before importing them.
 
-The receiver is not scheduled and does not start with Windows. `capture` or `pair` owns its complete lifetime.
+Ordinary capture does not focus, navigate, group, move, or close tabs. It works
+with paired extensions in browsers that are already running. Automatic launch of
+normal browser profiles is not part of the implemented capture path.
 
-- Bind only to `127.0.0.1`.
-- Pair with a random 256-bit token, then retain only its SHA-256 verifier in
-  SQLite and extension storage. Every command and snapshot uses nonce-bound HMAC
-  proofs; no reusable token or verifier crosses the loopback socket.
-- Require the receiver to prove the same pairing key before the extension reads
-  tabs. A process that merely occupies port `9786` cannot solicit a snapshot.
-- Limit request size and validate every payload.
-- Write raw snapshots atomically before importing them.
-- Stop after all requested browsers respond or the timeout expires.
-- Never open or focus a browser window. The ordinary capture receiver never mutates a tab.
-- Do not expose a generic health endpoint. An older local exporter used one as
-  its signal to collect tabs, so the authenticated command endpoint is the only
-  capture rendezvous.
+## Catalog State
 
-## Catalog
+Keep three concepts separate:
 
-Keep raw browser observations distinct from deduplicated resources.
+1. A live observation preserves browser, window, group, order, title, exact URL,
+   and tab state for a specific capture.
+2. A staged discovery is a newly observed canonical resource awaiting accept or
+   dismiss.
+3. An accepted resource is a durable library record that survives tab closure.
 
-- A capture preserves browser, window, group, ordering, title, exact URL, and state.
-- A resource represents a canonical URL across captures and browsers.
-- One `space` expresses the user's primary purpose, up to two `topic` collections
-  refine it, and `project` collections overlay active work without replacing purpose.
-- Brief, detail, why-kept, and next-action fields support progressive disclosure.
-- Tasks represent work derived from resources; they do not mutate browser state.
+Canonical identity prevents a known resource from being staged again. A later
+capture updates its observations and provenance. Dismissed resources remain
+outside the accepted library and remain visible to safety checks while open.
 
-The latest trusted capture per browser defines the current inventory. Older
-captures remain provenance and recovery evidence. Experimental closed-browser
-results are stored as candidates and cannot replace current inventory until a
-separate review promotes them.
+Semantic organization uses **Space -> Topic -> Focus**. A Project is a
+cross-cutting overlay and does not replace this hierarchy. Codex should
+periodically reconsider the accepted library as a whole when new accepted
+resources reveal a better grouping; stable high-confidence memberships should
+not churn without evidence.
 
 ## Presentation
 
-Generate a self-contained HTML decision report. It queues local decisions but does
-not directly mutate browser state. It must support scanning first and detail on
-demand without a long-running app server, build chain, or account.
+Generate a self-contained local HTML report. It supports discovery review,
+purpose-first navigation, hierarchy filters, Project overlays, global search,
+and progressive resource detail. Resource lists append in bounded batches through
+infinite scrolling so large libraries remain responsive. Browser groups preserve
+working context and tab order but remain secondary filters.
 
-The default view is a decision overview, not a complete resource list. Purpose
-spaces are the primary navigation, topics refine a selected purpose, and browser
-groups remain contextual filters with stable IDs and preserved tab order. A new
-space resets filters that no longer apply; an explicitly selected browser group
-then narrows the visible resources inside that space.
-
-Presentation metadata has three layers:
+Presentation evidence has three layers:
 
 1. Deterministic local signals for source, format, intent, duplicates, groups,
-   and safe generated previews.
-2. Codex annotations for concise descriptions, decision context, and next steps.
-3. Selective source inspection only when the first two layers cannot support a
-   concrete decision.
+   and safe previews.
+2. Codex annotations for concise summaries, decision context, and next actions.
+3. Selective source inspection when the first two layers cannot support a useful
+   decision.
 
-Cache known public video thumbnails into private local state during an explicit
-`enrich` run, validate their origin and media type, then copy them into the static
-report. Do not load remote thumbnails when the report opens. Do not crawl arbitrary
-tab URLs or authenticated pages. Local decision controls store only resource IDs
-and proposed statuses and export an annotation-compatible JSON file.
+Cache only allowlisted public preview media during explicit enrichment. Do not
+crawl arbitrary URLs, access authenticated pages, or load remote media when the
+report opens.
 
-## Exact Duplicate Mutation
+## Mutation Protocols
 
-Exact duplicate cleanup is a separate one-shot receiver workflow:
+Exact-duplicate cleanup and archive-all are distinct one-shot protocols. Each
+requires its own bounded approval, fresh capture, authenticated target plan,
+extension-side revalidation, post-action capture, and private audit.
 
-1. Capture the requested browsers immediately before planning.
-2. Plan only byte-identical HTTPS URLs in the same browser, window, and group.
-3. Retain one keeper and exclude active, pinned, audible, highlighted, file,
-   browser-internal, local HTTP, cross-window, and cross-group tabs.
-4. Bind tab IDs and URL hashes to an authenticated receiver command.
-5. Revalidate the target URL, keeper URL, protection state, window, and group in
-   the extension immediately before each close.
-6. Submit per-tab outcomes through an authenticated result message, capture again,
-   and retain an ignored append-only audit containing plan and post-capture IDs.
+Archive-all adds stronger durability and completeness checks:
 
-Canonical URL matches are retrieval hints only and are never mutation evidence.
+1. Capture the requested running browsers immediately before planning and bind
+   the plan to the exact capture IDs returned by that receiver run. Receiver
+   arrival order, rather than the browser's wall clock, defines current state.
+2. Block if any live resource is pending review or was dismissed.
+3. Verify catalog integrity, raw capture evidence, accepted resource records, and
+   an integrity-checked private database backup.
+4. Bind every target to its tab ID, exact URL hash, window, and group.
+5. Create one temporary pinned inactive extension control tab per affected browser.
+6. Revalidate each target in the extension immediately before closing it.
+7. Capture again and require a real newer trusted capture in which every target
+   is both reported closed and absent.
+8. Remove the control tab before submitting its authenticated cleanup result, and
+   retain the actual outcome in ignored audit evidence.
 
-## Deferred Boundary
+The accepted library remains available after successful closure. A failure stops
+the protocol and preserves its evidence; it does not silently claim completion.
 
-Closed-browser recovery is not ordinary capture. The production fallback is the
-last trusted capture, with its per-browser age shown clearly. Never launch a
-normal profile, headless or otherwise: browser startup can alter session state,
-and modern Chrome refuses remote debugging against its default data directory.
+## Test Boundary
 
-Any experimental recovery must require the browser to be fully stopped, copy
-only allowlisted session artifacts into immutable evidence, verify source hashes
-before and after, restore through a second disposable writable derivative with
-external networking blocked, and store the result as a non-authoritative
-candidate. Encrypted or incompatible session data fails back to the trusted
-capture; it never broadens into copying cookies, history, passwords, storage,
-extensions, or encryption keys.
+Browser end-to-end tests use bundled Chromium or isolated disposable Chrome and
+Edge profiles with test data. They must not read, mutate, launch, or close the
+user's normal browser profiles. Production captures use the installed, paired
+extension only when the user asks the agent to operate TabAtlas.

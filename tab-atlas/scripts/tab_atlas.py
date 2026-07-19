@@ -11,17 +11,28 @@ from typing import Any
 from tab_atlas_core import (
     annotation_batch,
     apply_annotations,
+    build_exact_duplicate_plan,
+    cache_public_previews,
     connect,
     copy_extension,
     current_resources,
     generate_report,
     import_file,
     inventory,
+    finalize_mutation_plan,
     pairing_status,
     query_resources,
+    record_mutation_plan,
     revoke_pairing,
+    utc_now,
 )
-from tab_atlas_receiver import EXPECTED_EXTENSION_ID, run_capture, run_pairing, run_revocation
+from tab_atlas_receiver import (
+    EXPECTED_EXTENSION_ID,
+    run_capture,
+    run_mutation,
+    run_pairing,
+    run_revocation,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,6 +94,29 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser = subparsers.add_parser("report", help="Generate the local read-only HTML report")
     report_parser.add_argument("--output", type=Path, default=DEFAULT_REPORT)
     report_parser.add_argument("--open", action="store_true", dest="open_report")
+
+    enrich_parser = subparsers.add_parser(
+        "enrich",
+        help="Cache privacy-bounded public visual evidence for the current library",
+    )
+    enrich_parser.add_argument("--refresh", action="store_true")
+    enrich_parser.add_argument("--workers", type=int, default=8)
+
+    dedupe_parser = subparsers.add_parser(
+        "dedupe",
+        help="Preview or execute conservative exact-URL duplicate closure",
+    )
+    dedupe_parser.add_argument("--browser", choices=["all", "chrome", "edge"], default="all")
+    dedupe_parser.add_argument("--execute", action="store_true")
+    dedupe_parser.add_argument("--approval", default="")
+    dedupe_parser.add_argument("--timeout", type=int, default=70)
+
+    approval_parser = subparsers.add_parser(
+        "dedupe-approval",
+        help="Inspect, grant, or revoke the private standing exact-duplicate approval",
+    )
+    approval_parser.add_argument("action", choices=["status", "grant", "revoke"])
+    approval_parser.add_argument("--scope", default="")
     return parser
 
 
@@ -231,9 +265,131 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
+        if args.command == "enrich":
+            output(
+                cache_public_previews(
+                    connection,
+                    state_dir,
+                    refresh=args.refresh,
+                    workers=max(1, min(16, args.workers)),
+                )
+            )
+            return 0
+
+        if args.command == "dedupe":
+            targets = {"chrome", "edge"} if args.browser == "all" else {args.browser}
+            if not args.execute:
+                plan = build_exact_duplicate_plan(connection, targets)
+                output(_dedupe_output(plan))
+                return 0
+            approval_scope = args.approval.strip() or _load_standing_approval(state_dir)
+            if not approval_scope:
+                raise ValueError(
+                    "--execute requires --approval or an active private dedupe-approval"
+                )
+            paired = {item["browser"] for item in pairing_status(connection) if item["enabled"]}
+            missing = sorted(targets - paired)
+            if missing:
+                raise ValueError(f"Pair the following browser(s) first: {', '.join(missing)}")
+
+            connection.close()
+            pre_complete, _pre_captures = run_capture(
+                database_path,
+                state_dir,
+                targets,
+                _bounded_timeout(args.timeout),
+            )
+            if not pre_complete:
+                output({"complete": False, "phase": "fresh_capture", "browsers": sorted(targets)})
+                return 1
+
+            connection = connect(database_path)
+            plan = build_exact_duplicate_plan(connection, targets)
+            if not plan["summary"]["plannedClosures"]:
+                output({**_dedupe_output(plan), "complete": True, "executed": False})
+                return 0
+            evidence_path = record_mutation_plan(connection, state_dir, plan, approval_scope)
+            connection.close()
+
+            mutation_complete, results = run_mutation(
+                database_path,
+                state_dir,
+                plan,
+                _bounded_timeout(args.timeout),
+            )
+            affected = {
+                browser
+                for browser, browser_plan in plan["browsers"].items()
+                if browser_plan["targets"]
+            }
+            post_complete = False
+            post_captures: dict[str, dict[str, Any]] = {}
+            if mutation_complete:
+                post_complete, post_captures = run_capture(
+                    database_path,
+                    state_dir,
+                    affected,
+                    _bounded_timeout(args.timeout),
+                )
+            error = ""
+            if not mutation_complete:
+                error = "mutation receiver timed out before every browser returned results"
+            elif not post_complete:
+                error = "post-action capture did not complete"
+            connection = connect(database_path)
+            totals = finalize_mutation_plan(
+                connection,
+                state_dir,
+                plan,
+                results,
+                post_captures,
+                error,
+            )
+            complete = (
+                mutation_complete
+                and post_complete
+                and totals["skipped"] == 0
+                and totals["verifiedBrowsers"] == totals["expectedBrowsers"]
+            )
+            output({
+                **_dedupe_output(plan),
+                "complete": complete,
+                "executed": True,
+                "closed": totals["closed"],
+                "skipped": totals["skipped"],
+                "postVerifiedBrowsers": totals["verifiedBrowsers"],
+                "postCaptureComplete": post_complete,
+                "auditPath": str(evidence_path),
+                "error": error,
+            })
+            return 0 if complete else 1
+
+        if args.command == "dedupe-approval":
+            if args.action == "grant":
+                scope = args.scope.strip()
+                if not scope:
+                    raise ValueError("grant requires a bounded --scope")
+                path = _write_standing_approval(state_dir, scope, True)
+                output({"active": True, "action": "close_exact_duplicates", "path": str(path)})
+                return 0
+            if args.action == "revoke":
+                path = _write_standing_approval(
+                    state_dir,
+                    "Standing exact-duplicate approval revoked by the user or operator.",
+                    False,
+                )
+                output({"active": False, "action": "close_exact_duplicates", "path": str(path)})
+                return 0
+            output({
+                "active": bool(_load_standing_approval(state_dir)),
+                "action": "close_exact_duplicates",
+                "path": str(_standing_approval_path(state_dir)),
+            })
+            return 0
+
         if args.command == "report":
             output_dir = args.output.resolve()
-            report_path = generate_report(connection, output_dir, REPORT_ASSETS)
+            report_path = generate_report(connection, output_dir, REPORT_ASSETS, state_dir)
             output({"report": str(report_path), "resources": len(current_resources(connection))})
             if args.open_report:
                 webbrowser.open(report_path.as_uri())
@@ -262,6 +418,65 @@ def _query_result(item: dict[str, Any]) -> dict[str, Any]:
         "collections": [value["name"] for value in item["collections"]],
         "tabInstances": len(item["tabs"]),
     }
+
+
+def _dedupe_output(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "policy": plan["policy"],
+        "planHash": plan["planHash"],
+        "summary": plan["summary"],
+        "browsers": {
+            browser: {
+                "beforeCaptureId": browser_plan["beforeCaptureId"],
+                "plannedClosures": len(browser_plan["targets"]),
+                "targetsHash": browser_plan["targetsHash"],
+            }
+            for browser, browser_plan in plan["browsers"].items()
+        },
+    }
+
+
+def _standing_approval_path(state_dir: Path) -> Path:
+    return state_dir / "approvals" / "exact-duplicate.json"
+
+
+def _load_standing_approval(state_dir: Path) -> str:
+    path = _standing_approval_path(state_dir)
+    if not path.is_file():
+        return ""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if (
+        not isinstance(document, dict)
+        or document.get("schemaVersion") != 1
+        or document.get("action") != "close_exact_duplicates"
+        or document.get("policyVersion") != 1
+        or document.get("active") is not True
+    ):
+        return ""
+    return str(document.get("scope") or "").strip()[:1000]
+
+
+def _write_standing_approval(state_dir: Path, scope: str, active: bool) -> Path:
+    path = _standing_approval_path(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = {
+        "schemaVersion": 1,
+        "action": "close_exact_duplicates",
+        "policyVersion": 1,
+        "active": bool(active),
+        "scope": scope.strip()[:1000],
+        "recordedAt": utc_now(),
+    }
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return path
 
 
 def _bounded_timeout(value: int) -> int:

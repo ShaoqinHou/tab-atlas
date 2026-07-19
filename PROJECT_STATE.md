@@ -10,35 +10,37 @@ Success means the user can find what matters, understand why a tab was kept, tur
 
 ## Current Milestone
 
-Build and prove the smallest complete loop:
+The decision-workspace loop is implemented and proven:
 
-1. Capture open Chrome and Edge tabs and tab groups without focusing or mutating them.
-2. Store append-only snapshots and deduplicated resources locally.
-3. Let Codex annotate bounded batches.
-4. Generate a compact overview-to-detail HTML report.
+1. Passive authenticated capture preserves Chrome and Edge windows, order, tabs,
+   and 18 browser groups without focusing content tabs.
+2. The current catalog contains 713 tab instances and 609 resources. All 609 have
+   concise briefs; 505 have a high-confidence primary purpose space and 104
+   opaque/private items remain in Inbox instead of being guessed.
+3. Six durable spaces replace the old flat collection wall: Produce Media &
+   Stories, Make Games, Build Software & Agents, Understand AI Models, Learn &
+   Reference, and Personal & Admin. Topics and four Active Workspaces are overlays.
+4. An explicit enrichment run cached 306 validated YouTube frames locally. A
+   visual second pass classified 25 title-opaque videos from those frames.
+5. The report now has only Home, Spaces, and Review. Browser groups work as
+   filters and context rather than competing navigation. Desktop and 390-pixel
+   E2E covered space drill-down, group filtering, search, details, queued decisions,
+   export, and mobile layout with no overflow, broken images, console errors, or
+   automatic remote requests.
+6. Exact duplicate cleanup is implemented as a separate authenticated workflow.
+   The last trusted capture contains 70 policy-safe exact HTTPS duplicate
+   instances. A private standing approval is active, but those normal-profile
+   tabs were not changed because Chrome and Edge are currently closed.
 
-The smallest complete loop is now proven against the user's current browsers.
-The replacement extension is installed, enabled, and paired in both Chrome and
-Edge. An authenticated live capture collected 218 Chrome tabs and 495 Edge tabs,
-including 18 browser groups, without closing, moving, grouping, or navigating a
-captured content tab. Both one-shot receivers exited after capture.
+The real extension mutation path passed disposable headless E2E in Chromium on
+the Chrome protocol and installed Edge: each run captured six tabs, planned two
+closures, closed two, skipped zero, retained the keeper, and verified the
+post-capture audit. The installed Chrome build blocks command-line loading of an
+unpacked extension in an isolated headless profile, so its normal profile was not
+opened or copied for testing.
 
-The replacement capture protocol now authenticates both extension and receiver
-with nonce-bound HMAC proofs. No reusable pairing key crosses loopback, OFF
-aborts in-flight network work and prevents submission, and signed revocation
-turns the extension fully off. Fourteen focused Python tests and one independent
-Node protocol test pass.
-
-A bounded discovery and assignment pass covers all 609 current resources. Every
-resource has a cautious scan-level brief, a 12-collection vocabulary is frozen,
-and 134 low-context resources remain unclassified instead of being guessed. All
-generated memberships remain suggestions until accepted. The regenerated local
-report has been rebuilt as a decision surface rather than a flat inventory. It
-now separates Overview, Decide, Groups, Collections, and Resources; preserves
-browser order within 18 independently working groups; derives source, format,
-intent, and decision cues locally; keeps remote previews opt-in; and exports
-local decision proposals without mutating tabs. Desktop and 390-pixel browser
-acceptance passed with no horizontal overflow or console warnings.
+Eighteen focused Python tests and two independent Node protocol tests protect the
+current user-facing behavior and safety boundaries.
 
 ## Frozen Decisions
 
@@ -46,7 +48,10 @@ acceptance passed with no horizontal overflow or console warnings.
 - There is no embedded Codex SDK, model runner, provider thread, job framework, or release-evidence framework.
 - The extension has explicit OFF and ON states. OFF clears its only alarm. ON polls loopback at the browser-supported 30-second minimum and reads tabs only when an authenticated receiver requests a capture.
 - The receiver is started on demand, binds only to `127.0.0.1`, writes one capture, and exits.
-- Browser tabs are read-only. Closing, moving, grouping, bookmarking, or navigating tabs is outside the current milestone.
+- Capture and report use are read-only. The only authorized mutation is the
+  strict exact-HTTPS-duplicate policy with fresh capture, standing or one-run
+  approval, live revalidation, and post-action audit. Moving, grouping,
+  bookmarking, activating, and navigating captured tabs remain out of scope.
 - The normal Chrome and Edge profiles must not be remote-debugged or launched for automation. Closed-browser recovery remains isolated until it proves profile immutability.
 - A closed browser uses its last trusted capture. Experimental session recovery
   is candidate-only and cannot displace trusted inventory by timestamp.
@@ -66,17 +71,22 @@ Everything under `legacy/` is quarantined evidence. Active `AGENTS.md`, `.agents
 
 ## Next Actions
 
-1. Use the decision queues and largest real browser groups with the user; record only concrete decision failures.
-2. Review the 134 deliberately unclassified resources selectively, starting with resources the user is considering closing.
-3. Apply exported Keep, Later, or Close candidate decisions through Codex after review; do not mutate tabs from the report.
-4. Add page inspection or LLM enrichment only when local metadata and the current brief cannot support a real decision.
-5. Keep browser-tab mutation out of scope until the user authorizes a separate, explicit workflow.
+1. When the user next opens normal Chrome and Edge, run
+   `dedupe --browser all --execute`. It will recapture first and use the active
+   standing approval; stale tab IDs are never acted on.
+2. Use Home and Spaces for normal review. Start with purpose spaces, not the raw
+   library or browser groups.
+3. Review the 104-item Inbox selectively. Authenticated chats, local pages, and
+   opaque social posts require direct evidence rather than inferred topics.
+4. Apply exported report decisions through Codex. A report decision is not a tab
+   mutation until a separate bounded workflow exists for that action.
 
 ## Current Constraint
 
-There is no installation or capture blocker. Extension installation still
-requires the browser's native confirmation surface; the user completed that
-one-time action in both browsers. Normal operation is passive: the extension does
-no tab read while OFF, and while ON it reads tabs only after authenticating an
-on-demand local receiver. Report use, not speculative expansion, now controls the
-next milestone.
+There is no code, taxonomy, preview, report, or protocol blocker. The user
+completed the one-time unpacked installation in both normal browsers, and the
+updated package is staged at the same stable path and extension ID. Both normal
+browsers are currently closed, so the production duplicate plan remains evidence
+from the last trusted capture until a fresh run. Normal operation is passive:
+OFF performs no polling or tab reads; ON checks loopback every 30 seconds and acts
+only after authenticating an on-demand receiver.

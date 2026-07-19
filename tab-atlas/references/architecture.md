@@ -22,7 +22,7 @@ There is no embedded model runtime. The current Codex agent performs semantic wo
 Use one Manifest V3 package in Chrome and Edge.
 
 - `OFF`: clear the polling alarm. Do not query tabs or perform network requests.
-- `ON`: create one 30-second alarm. On each alarm, ask the loopback receiver whether a capture is pending. Query windows, tabs, and tab groups only after an authenticated capture command.
+- `ON`: create one 30-second alarm. On each alarm, ask the loopback receiver whether a bounded command is pending. Query windows, tabs, and tab groups only after an authenticated capture command. A mutation command is accepted only for the exact-duplicate protocol below.
 - Register no tab, window, or group change listeners. Hundreds of tabs must not create background event churn.
 - Request only `alarms`, `storage`, `tabs`, and `tabGroups`, plus loopback host access.
 - Use a fixed public manifest key so unpacked installs keep a stable extension ID.
@@ -42,7 +42,7 @@ The receiver is not scheduled and does not start with Windows. `capture` or `pai
 - Limit request size and validate every payload.
 - Write raw snapshots atomically before importing them.
 - Stop after all requested browsers respond or the timeout expires.
-- Never open a browser window or mutate a tab.
+- Never open or focus a browser window. The ordinary capture receiver never mutates a tab.
 - Do not expose a generic health endpoint. An older local exporter used one as
   its signal to collect tabs, so the authenticated command endpoint is the only
   capture rendezvous.
@@ -53,7 +53,8 @@ Keep raw browser observations distinct from deduplicated resources.
 
 - A capture preserves browser, window, group, ordering, title, exact URL, and state.
 - A resource represents a canonical URL across captures and browsers.
-- Collections express projects, themes, or workflows.
+- One `space` expresses the user's primary purpose, up to two `topic` collections
+  refine it, and `project` collections overlay active work without replacing purpose.
 - Brief, detail, why-kept, and next-action fields support progressive disclosure.
 - Tasks represent work derived from resources; they do not mutate browser state.
 
@@ -64,13 +65,15 @@ separate review promotes them.
 
 ## Presentation
 
-Generate a self-contained, read-only HTML report. It must support scanning first and detail on demand. Do not require a long-running app server, build chain, or account.
+Generate a self-contained HTML decision report. It queues local decisions but does
+not directly mutate browser state. It must support scanning first and detail on
+demand without a long-running app server, build chain, or account.
 
-The default view is a decision overview, not a complete resource list. Browser
-groups and topic collections are first-class scopes with stable resource IDs and
-summaries. A group selection replaces the previous scope; it never silently
-intersects with stale browser or collection filters. Preserve browser tab order
-inside group detail.
+The default view is a decision overview, not a complete resource list. Purpose
+spaces are the primary navigation, topics refine a selected purpose, and browser
+groups remain contextual filters with stable IDs and preserved tab order. A new
+space resets filters that no longer apply; an explicitly selected browser group
+then narrows the visible resources inside that space.
 
 Presentation metadata has three layers:
 
@@ -80,10 +83,27 @@ Presentation metadata has three layers:
 3. Selective source inspection only when the first two layers cannot support a
    concrete decision.
 
-Never load remote thumbnails or fetch page metadata for the whole catalog. A
-known public preview may be exposed as an opt-in action for one resource. Local
-decision controls store only resource IDs and proposed statuses and export an
-annotation-compatible JSON file; they do not mutate browser state.
+Cache known public video thumbnails into private local state during an explicit
+`enrich` run, validate their origin and media type, then copy them into the static
+report. Do not load remote thumbnails when the report opens. Do not crawl arbitrary
+tab URLs or authenticated pages. Local decision controls store only resource IDs
+and proposed statuses and export an annotation-compatible JSON file.
+
+## Exact Duplicate Mutation
+
+Exact duplicate cleanup is a separate one-shot receiver workflow:
+
+1. Capture the requested browsers immediately before planning.
+2. Plan only byte-identical HTTPS URLs in the same browser, window, and group.
+3. Retain one keeper and exclude active, pinned, audible, highlighted, file,
+   browser-internal, local HTTP, cross-window, and cross-group tabs.
+4. Bind tab IDs and URL hashes to an authenticated receiver command.
+5. Revalidate the target URL, keeper URL, protection state, window, and group in
+   the extension immediately before each close.
+6. Submit per-tab outcomes through an authenticated result message, capture again,
+   and retain an ignored append-only audit containing plan and post-capture IDs.
+
+Canonical URL matches are retrieval hints only and are never mutation evidence.
 
 ## Deferred Boundary
 

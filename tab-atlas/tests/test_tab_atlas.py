@@ -18,14 +18,17 @@ sys.path.insert(0, str(SCRIPTS))
 
 from tab_atlas_core import (  # noqa: E402
     apply_annotations,
+    build_exact_duplicate_plan,
     connect,
     current_resources,
     generate_report,
+    finalize_mutation_plan,
     inventory,
     normalize_snapshot_document,
     pairing_secret,
     protocol_proof,
     report_payload,
+    record_mutation_plan,
     resource_presentation,
     revoke_pairing,
     save_pairing,
@@ -35,10 +38,16 @@ from tab_atlas_core import (  # noqa: E402
 from tab_atlas_receiver import (  # noqa: E402
     EXPECTED_EXTENSION_ID,
     run_capture,
+    run_mutation,
     run_pairing,
     run_revocation,
 )
-from tab_atlas import DEFAULT_STATE, build_parser  # noqa: E402
+from tab_atlas import (  # noqa: E402
+    DEFAULT_STATE,
+    _load_standing_approval,
+    _write_standing_approval,
+    build_parser,
+)
 
 
 ORIGIN = f"chrome-extension://{EXPECTED_EXTENSION_ID}"
@@ -50,6 +59,18 @@ class CatalogTests(unittest.TestCase):
 
         self.assertEqual(args.state, DEFAULT_STATE)
         self.assertEqual(args.batch_state, "all")
+
+    def test_standing_duplicate_approval_is_private_and_revocable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            scope = "Close only policy-v1 exact HTTPS duplicates."
+
+            path = _write_standing_approval(state, scope, True)
+            self.assertEqual(_load_standing_approval(state), scope)
+            self.assertTrue(path.is_relative_to(state))
+
+            _write_standing_approval(state, "revoked", False)
+            self.assertEqual(_load_standing_approval(state), "")
 
     def test_uppercase_legacy_rows_are_grouped_by_browser(self) -> None:
         snapshots = normalize_snapshot_document(
@@ -92,6 +113,95 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(totals["groups"], 1)
             self.assertEqual({tab["groupTitle"] for tab in resources[0]["tabs"]}, {"Research"})
             self.assertTrue(all(tab["groupCollapsed"] for tab in resources[0]["tabs"]))
+
+    def test_exact_duplicate_plan_only_closes_same_context_public_web_tabs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-19T00:00:00Z",
+                    "groups": [{"id": 7, "windowId": 1, "title": "One"}],
+                    "tabs": [
+                        {"id": 1, "windowId": 1, "index": 0, "groupId": -1, "active": True, "title": "A", "url": "https://example.com/a"},
+                        {"id": 2, "windowId": 1, "index": 1, "groupId": -1, "title": "A copy", "url": "https://example.com/a"},
+                        {"id": 3, "windowId": 1, "index": 2, "groupId": 7, "title": "A grouped", "url": "https://example.com/a"},
+                        {"id": 4, "windowId": 1, "index": 3, "groupId": -1, "title": "File", "url": "file:///C:/private.txt"},
+                        {"id": 5, "windowId": 1, "index": 4, "groupId": -1, "title": "File copy", "url": "file:///C:/private.txt"},
+                        {"id": 6, "windowId": 1, "index": 5, "groupId": -1, "title": "Local", "url": "http://127.0.0.1:9000/app"},
+                        {"id": 7, "windowId": 1, "index": 6, "groupId": -1, "title": "Local copy", "url": "http://127.0.0.1:9000/app"},
+                        {"id": 8, "windowId": 2, "index": 0, "groupId": -1, "active": True, "title": "Selected", "url": "https://example.com/selected"},
+                        {"id": 9, "windowId": 2, "index": 1, "groupId": -1, "highlighted": True, "title": "Selected copy", "url": "https://example.com/selected"},
+                    ],
+                },
+                "test",
+            )
+
+            plan = build_exact_duplicate_plan(connection, {"chrome"})
+            connection.close()
+
+            self.assertEqual(plan["summary"]["plannedClosures"], 1)
+            self.assertEqual(plan["summary"]["excludedInstances"], 1)
+            self.assertEqual(plan["browsers"]["chrome"]["targets"][0]["targetTabId"], 2)
+            self.assertNotIn("https://", json.dumps(plan))
+            self.assertNotIn("file:///", json.dumps(plan))
+            self.assertNotIn("127.0.0.1", json.dumps(plan))
+
+    def test_mutation_audit_verifies_closed_target_absent_and_keeper_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-19T00:00:00Z",
+                    "tabs": [
+                        {"id": 1, "windowId": 1, "index": 0, "groupId": -1, "active": True, "title": "A", "url": "https://example.com/a"},
+                        {"id": 2, "windowId": 1, "index": 1, "groupId": -1, "title": "A copy", "url": "https://example.com/a"},
+                    ],
+                },
+                "test",
+            )
+            plan = build_exact_duplicate_plan(connection, {"chrome"})
+            evidence_path = record_mutation_plan(
+                connection,
+                state,
+                plan,
+                "User approved exact duplicate closure for this test.",
+            )
+            after = store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-19T00:01:00Z",
+                    "tabs": [
+                        {"id": 1, "windowId": 1, "index": 0, "groupId": -1, "active": True, "title": "A", "url": "https://example.com/a"}
+                    ],
+                },
+                "test",
+            )
+            target_id = plan["browsers"]["chrome"]["targets"][0]["targetTabId"]
+            totals = finalize_mutation_plan(
+                connection,
+                state,
+                plan,
+                {"chrome": {"closedCount": 1, "skippedCount": 0, "results": [{"tabId": target_id, "status": "closed", "reason": "exact_duplicate"}]}},
+                {"chrome": after},
+            )
+            audit = connection.execute("SELECT * FROM mutation_audits").fetchone()
+            connection.close()
+
+            self.assertEqual(totals["closed"], 1)
+            self.assertEqual(totals["verifiedBrowsers"], 1)
+            self.assertEqual(audit["status"], "completed")
+            evidence = evidence_path.read_text(encoding="utf-8")
+            self.assertNotIn("https://", evidence)
 
     def test_revocation_invalidates_the_server_capability(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -217,7 +327,7 @@ class CatalogTests(unittest.TestCase):
                 "canonicalUrl": "https://www.youtube.com/watch?v=abc123XYZ00",
                 "host": "www.youtube.com",
                 "kind": "youtube",
-                "title": "Example video",
+                "title": "(12) Example video - YouTube",
                 "brief": "A useful example.",
                 "whyKept": "",
                 "nextAction": "watch or listen",
@@ -232,6 +342,7 @@ class CatalogTests(unittest.TestCase):
         )
 
         self.assertEqual(presentation["format"], "Video")
+        self.assertEqual(presentation["displayTitle"], "Example video")
         self.assertEqual(presentation["intent"], "Watch")
         self.assertEqual(presentation["queue"], "needs_context")
         self.assertTrue(presentation["preview"]["requiresUserLoad"])
@@ -408,6 +519,7 @@ class ReceiverIntegrationTests(unittest.TestCase):
                     command_nonce,
                     command["requestId"],
                     "capture",
+                    "",
                 ),
             )
             snapshot = {
@@ -491,6 +603,100 @@ class ReceiverIntegrationTests(unittest.TestCase):
                     nonce,
                     "",
                     "revoked",
+                ),
+            )
+
+    def test_mutation_command_and_results_are_bound_to_the_exact_target_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            database = state / "atlas.sqlite"
+            connection = connect(database)
+            save_pairing(connection, "chrome", EXPECTED_EXTENSION_ID, "mutation-token")
+            connection.close()
+            key = token_hash("mutation-token")
+            targets = [{
+                "targetTabId": 12,
+                "keeperTabId": 11,
+                "expectedUrlHash": "a" * 64,
+                "windowId": "1",
+                "groupId": "-1",
+                "targetInstanceId": "tab_target",
+                "keeperInstanceId": "tab_keeper",
+            }]
+            targets_hash = hashlib.sha256(
+                json.dumps(targets, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            plan = {
+                "requestId": "request-mutation",
+                "browsers": {"chrome": {"targets": targets, "targetsHash": targets_hash}},
+            }
+            mutation_result: list[object] = []
+            thread = threading.Thread(
+                target=lambda: mutation_result.extend(run_mutation(database, state, plan, 5)),
+                daemon=True,
+            )
+            thread.start()
+
+            command_nonce = "5" * 32
+            command = self._retry_request(
+                "/v1/command",
+                headers=self._signed_headers(key, "command", command_nonce),
+            )
+            self.assertEqual(command["action"], "close_exact_duplicates")
+            self.assertEqual(command["targetsHash"], targets_hash)
+            self.assertEqual(
+                command["serverProof"],
+                protocol_proof(
+                    key,
+                    "response",
+                    "chrome",
+                    EXPECTED_EXTENSION_ID,
+                    command_nonce,
+                    plan["requestId"],
+                    "close_exact_duplicates",
+                    targets_hash,
+                ),
+            )
+
+            body = {
+                "requestId": plan["requestId"],
+                "targetsHash": targets_hash,
+                "browser": "chrome",
+                "extensionId": EXPECTED_EXTENSION_ID,
+                "results": [{"tabId": 12, "status": "closed", "reason": "exact_duplicate"}],
+            }
+            encoded = json.dumps(body).encode("utf-8")
+            result_nonce = "6" * 32
+            accepted = self._json_request(
+                "/v1/mutation",
+                method="POST",
+                headers=self._signed_headers(
+                    key,
+                    "mutation",
+                    result_nonce,
+                    plan["requestId"],
+                    targets_hash,
+                    hashlib.sha256(encoded).hexdigest(),
+                ),
+                body=body,
+            )
+            thread.join(timeout=3)
+
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(mutation_result[0])
+            self.assertEqual(mutation_result[1]["chrome"]["closedCount"], 1)
+            self.assertEqual(
+                accepted["serverProof"],
+                protocol_proof(
+                    key,
+                    "mutation-accepted",
+                    "chrome",
+                    EXPECTED_EXTENSION_ID,
+                    result_nonce,
+                    plan["requestId"],
+                    targets_hash,
+                    "1",
+                    "0",
                 ),
             )
 

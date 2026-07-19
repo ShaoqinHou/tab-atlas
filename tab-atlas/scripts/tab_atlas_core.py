@@ -5,17 +5,21 @@ import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import tempfile
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 TRACKING_PARAMETERS = {
     "fbclid",
     "gclid",
@@ -27,6 +31,14 @@ TRACKING_PARAMETERS = {
 }
 RESOURCE_STATUSES = {"open", "saved", "archived", "close_candidate"}
 TASK_STATUSES = {"open", "done", "deferred", "cancelled"}
+SPACE_DEFINITIONS = {
+    "Produce Media & Stories": "AI video, animation, filmmaking, story craft, and visual production references.",
+    "Make Games": "Game systems, real-time graphics, development techniques, and games worth studying.",
+    "Build Software & Agents": "Coding agents, automation, architecture, product engineering, and interface work.",
+    "Understand AI Models": "Model releases, capabilities, evaluation, training, inference, and research.",
+    "Learn & Reference": "Durable history, architecture, science, engineering, and general knowledge.",
+    "Personal & Admin": "Career, education, New Zealand life, shopping, travel, and personal operations.",
+}
 
 
 SCHEMA = """
@@ -90,6 +102,7 @@ CREATE TABLE IF NOT EXISTS tab_instances (
   tab_id TEXT,
   position INTEGER,
   active INTEGER NOT NULL DEFAULT 0,
+  highlighted INTEGER NOT NULL DEFAULT 0,
   pinned INTEGER NOT NULL DEFAULT 0,
   audible INTEGER NOT NULL DEFAULT 0,
   discarded INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +111,7 @@ CREATE TABLE IF NOT EXISTS tab_instances (
   group_color TEXT,
   group_collapsed INTEGER NOT NULL DEFAULT 0,
   title TEXT,
+  favicon_url TEXT,
   exact_url TEXT NOT NULL
 );
 
@@ -138,6 +152,36 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS resource_previews (
+  resource_id TEXT PRIMARY KEY REFERENCES resources(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('thumbnail', 'screenshot')),
+  local_path TEXT NOT NULL,
+  source TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  width INTEGER,
+  height INTEGER,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mutation_audits (
+  id TEXT PRIMARY KEY,
+  action TEXT NOT NULL,
+  browser TEXT NOT NULL,
+  request_id TEXT NOT NULL UNIQUE,
+  approval_scope TEXT NOT NULL,
+  plan_hash TEXT NOT NULL,
+  planned_count INTEGER NOT NULL,
+  closed_count INTEGER NOT NULL DEFAULT 0,
+  skipped_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK (status IN ('planned', 'completed', 'partial', 'failed')),
+  evidence_path TEXT NOT NULL,
+  before_capture_id TEXT,
+  after_capture_id TEXT,
+  created_at TEXT NOT NULL,
+  completed_at TEXT,
+  error TEXT
+);
 """
 
 
@@ -158,6 +202,15 @@ def connect(database_path: Path) -> sqlite3.Connection:
     if "trust_state" not in capture_columns:
         connection.execute(
             "ALTER TABLE captures ADD COLUMN trust_state TEXT NOT NULL DEFAULT 'trusted'"
+        )
+    tab_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(tab_instances)").fetchall()
+    }
+    if "favicon_url" not in tab_columns:
+        connection.execute("ALTER TABLE tab_instances ADD COLUMN favicon_url TEXT")
+    if "highlighted" not in tab_columns:
+        connection.execute(
+            "ALTER TABLE tab_instances ADD COLUMN highlighted INTEGER NOT NULL DEFAULT 0"
         )
     connection.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
@@ -384,6 +437,7 @@ def _normalize_tab(item: dict[str, Any], fallback_index: int) -> dict[str, Any]:
         "autoDiscardable": _as_bool(item.get("autoDiscardable")),
         "incognito": _as_bool(item.get("incognito")),
         "title": str(item.get("title") or "")[:10000],
+        "favIconUrl": str(item.get("favIconUrl") or "")[:100000],
         "url": str(url)[:100000],
     }
 
@@ -578,9 +632,9 @@ def store_snapshot(
                     """
                     INSERT INTO tab_instances(
                       id, capture_id, resource_id, browser, window_id, window_focused,
-                      tab_id, position, active, pinned, audible, discarded, group_id,
-                      group_title, group_color, group_collapsed, title, exact_url
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      tab_id, position, active, highlighted, pinned, audible, discarded, group_id,
+                      group_title, group_color, group_collapsed, title, favicon_url, exact_url
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         instance_id,
@@ -592,6 +646,7 @@ def store_snapshot(
                         tab["id"],
                         tab["index"],
                         int(tab["active"]),
+                        int(tab["highlighted"]),
                         int(tab["pinned"]),
                         int(tab["audible"]),
                         int(tab["discarded"]),
@@ -600,6 +655,7 @@ def store_snapshot(
                         str(group.get("color") or ""),
                         int(bool(group.get("collapsed"))),
                         title,
+                        tab["favIconUrl"] or None,
                         tab["url"],
                     ),
                 )
@@ -680,9 +736,13 @@ def current_resources(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         f"""
         SELECT t.*, r.canonical_url, r.host, r.kind, r.title AS resource_title,
                r.first_seen_at, r.last_seen_at, r.brief, r.detail, r.why_kept,
-               r.next_action, r.status, r.confidence
+               r.next_action, r.status, r.confidence,
+               p.kind AS preview_kind, p.local_path AS preview_local_path,
+               p.source AS preview_source, p.content_sha256 AS preview_sha256,
+               p.width AS preview_width, p.height AS preview_height
         FROM tab_instances t
         JOIN resources r ON r.id=t.resource_id
+        LEFT JOIN resource_previews p ON p.resource_id=r.id
         WHERE t.capture_id IN ({placeholders})
         ORDER BY t.browser, t.window_id, t.position
         """,
@@ -726,6 +786,12 @@ def current_resources(connection: sqlite3.Connection) -> list[dict[str, Any]]:
                 "nextAction": row["next_action"] or "",
                 "status": row["status"],
                 "confidence": row["confidence"],
+                "previewKind": row["preview_kind"] or "",
+                "previewLocalPath": row["preview_local_path"] or "",
+                "previewSource": row["preview_source"] or "",
+                "previewSha256": row["preview_sha256"] or "",
+                "previewWidth": row["preview_width"],
+                "previewHeight": row["preview_height"],
                 "collections": collections[row["resource_id"]],
                 "tasks": tasks[row["resource_id"]],
                 "tabs": [],
@@ -740,6 +806,7 @@ def current_resources(connection: sqlite3.Connection) -> list[dict[str, Any]]:
                 "tabId": row["tab_id"],
                 "position": row["position"],
                 "active": bool(row["active"]),
+                "highlighted": bool(row["highlighted"]),
                 "pinned": bool(row["pinned"]),
                 "audible": bool(row["audible"]),
                 "discarded": bool(row["discarded"]),
@@ -748,6 +815,7 @@ def current_resources(connection: sqlite3.Connection) -> list[dict[str, Any]]:
                 "groupColor": row["group_color"] or "",
                 "groupCollapsed": bool(row["group_collapsed"]),
                 "title": row["title"] or "",
+                "favIconUrl": row["favicon_url"] or "",
                 "url": row["exact_url"],
             }
         )
@@ -765,7 +833,19 @@ def inventory(connection: sqlite3.Connection) -> dict[str, Any]:
         for tab in item["tabs"]
         if tab["groupId"] not in {None, "", "-1"}
     }
-    unclassified = sum(1 for item in resources if not item["collections"])
+    unclassified = sum(
+        1
+        for item in resources
+        if not any(collection["kind"] == "space" for collection in item["collections"])
+    )
+    exact_duplicate_sets = 0
+    exact_duplicate_instances = 0
+    safe_close_candidates = 0
+    for item in resources:
+        duplicate = exact_duplicate_summary(item)
+        exact_duplicate_sets += duplicate["sets"]
+        exact_duplicate_instances += duplicate["instances"]
+        safe_close_candidates += duplicate["safeCloseCandidates"]
     collection_count = connection.execute("SELECT COUNT(*) AS count FROM collections").fetchone()["count"]
     open_tasks = connection.execute("SELECT COUNT(*) AS count FROM tasks WHERE status='open'").fetchone()["count"]
     candidate_captures = connection.execute(
@@ -793,6 +873,9 @@ def inventory(connection: sqlite3.Connection) -> dict[str, Any]:
         "currentTabs": tab_count,
         "currentResources": len(resources),
         "duplicateTabInstances": max(0, tab_count - len(resources)),
+        "exactDuplicateSets": exact_duplicate_sets,
+        "exactDuplicateInstances": exact_duplicate_instances,
+        "safeCloseCandidates": safe_close_candidates,
         "groupedTabInstances": grouped_instances,
         "groups": len(group_keys),
         "unclassifiedResources": unclassified,
@@ -810,7 +893,11 @@ def annotation_batch(
 ) -> dict[str, Any]:
     resources = current_resources(connection)
     if state == "unclassified":
-        resources = [item for item in resources if not item["collections"]]
+        resources = [
+            item
+            for item in resources
+            if not any(collection["kind"] == "space" for collection in item["collections"])
+        ]
     elif state == "actionable":
         resources = [item for item in resources if item["nextAction"] and item["nextAction"] != "none"]
     elif state != "all":
@@ -1077,10 +1164,14 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
     format_label = _format_label(host, kind, title, parts.path, parts.scheme)
     intent = _intent_label(str(resource.get("nextAction") or ""), format_label)
     collections = resource.get("collections") or []
+    spaces = [collection for collection in collections if collection.get("kind") == "space"]
+    topics = [collection for collection in collections if collection.get("kind") == "topic"]
+    projects = [collection for collection in collections if collection.get("kind") == "project"]
     tabs = resource.get("tabs") or []
     tasks = resource.get("tasks") or []
     group_titles = sorted({str(tab.get("groupTitle") or "") for tab in tabs if tab.get("groupTitle")})
-    duplicate_count = max(0, len(tabs) - 1)
+    duplicate = exact_duplicate_summary(resource)
+    duplicate_count = duplicate["safeCloseCandidates"]
     status = str(resource.get("status") or "open")
 
     if status == "close_candidate":
@@ -1095,7 +1186,7 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
         queue = "task"
         decision_label = "Task attached"
         decision_tone = "action"
-    elif not collections:
+    elif not spaces:
         queue = "needs_context"
         decision_label = "Needs context"
         decision_tone = "review"
@@ -1116,8 +1207,9 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
     if next_action and next_action.casefold() != "none":
         decision_cue = _sentence(next_action)
     elif duplicate_count:
-        decision_cue = f"Consolidate {len(tabs)} open copies."
-    elif not collections:
+        noun = "tab" if duplicate_count == 1 else "tabs"
+        decision_cue = f"{duplicate_count} exact duplicate {noun} can be closed safely."
+    elif not spaces:
         decision_cue = "Decide whether this still matters."
     else:
         decision_cue = "Keep as a reference."
@@ -1127,8 +1219,8 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
         context_cue = _sentence(why_kept)
     elif group_titles:
         context_cue = f"Browser group context: {group_titles[0]}."
-    elif collections:
-        context_cue = f"Reference for {collections[0]['name']}."
+    elif spaces:
+        context_cue = f"Reference for {spaces[0]['name']}."
     elif duplicate_count:
         context_cue = f"Open in {len(tabs)} tab instances."
     else:
@@ -1156,8 +1248,14 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
         "Local file": "grey",
     }.get(source, "teal")
     preview_url = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg" if video_id else ""
+    local_preview = ""
+    if resource.get("previewLocalPath"):
+        suffix = Path(str(resource["previewLocalPath"])).suffix.casefold()
+        if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+            local_preview = f"media/{resource['resourceId']}{suffix}"
 
     return {
+        "displayTitle": _clean_display_title(title, source),
         "source": source,
         "format": format_label,
         "intent": intent,
@@ -1167,13 +1265,349 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
         "decisionCue": decision_cue,
         "contextCue": context_cue,
         "groupTitles": group_titles,
+        "space": spaces[0]["name"] if spaces else "",
+        "topics": [collection["name"] for collection in topics[:2]],
+        "projects": [collection["name"] for collection in projects],
+        "duplicates": duplicate,
         "preview": {
             "label": preview_label,
             "accent": accent,
+            "localImage": local_preview,
             "remoteImage": preview_url,
-            "requiresUserLoad": bool(preview_url),
+            "requiresUserLoad": bool(preview_url and not local_preview),
         },
     }
+
+
+def exact_duplicate_summary(resource: dict[str, Any]) -> dict[str, int]:
+    buckets: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for tab in resource.get("tabs") or []:
+        url = str(tab.get("url") or "")
+        try:
+            scheme = urlsplit(url).scheme.casefold()
+        except ValueError:
+            continue
+        if scheme != "https":
+            continue
+        key = (
+            str(tab.get("browser") or ""),
+            str(tab.get("windowId") or ""),
+            str(tab.get("groupId") or ""),
+            url,
+        )
+        buckets[key].append(tab)
+
+    sets = 0
+    instances = 0
+    safe = 0
+    protected = 0
+    for tabs in buckets.values():
+        if len(tabs) < 2:
+            continue
+        sets += 1
+        instances += len(tabs) - 1
+        ordered = sorted(tabs, key=_duplicate_keeper_order)
+        for tab in ordered[1:]:
+            if (
+                tab.get("active")
+                or tab.get("highlighted")
+                or tab.get("pinned")
+                or tab.get("audible")
+            ):
+                protected += 1
+            else:
+                safe += 1
+    return {
+        "sets": sets,
+        "instances": instances,
+        "safeCloseCandidates": safe,
+        "protectedInstances": protected,
+    }
+
+
+def _duplicate_keeper_order(tab: dict[str, Any]) -> tuple[int, int, int, int, int, int, str]:
+    position = tab.get("position")
+    return (
+        0 if tab.get("active") else 1,
+        0 if tab.get("highlighted") else 1,
+        0 if tab.get("pinned") else 1,
+        0 if tab.get("audible") else 1,
+        0 if not tab.get("discarded") else 1,
+        int(position) if position is not None else 1_000_000_000,
+        str(tab.get("instanceId") or ""),
+    )
+
+
+def build_exact_duplicate_plan(
+    connection: sqlite3.Connection,
+    browsers: set[str],
+) -> dict[str, Any]:
+    requested = {normalize_browser(browser) for browser in browsers}
+    if not requested or not requested.issubset({"chrome", "edge"}):
+        raise ValueError("Exact duplicate planning supports Chrome and Edge only")
+    latest = {item["browser"]: item for item in latest_capture_rows(connection)}
+    missing = requested - latest.keys()
+    if missing:
+        raise ValueError(f"No trusted capture for: {', '.join(sorted(missing))}")
+
+    targets_by_browser: dict[str, list[dict[str, Any]]] = {browser: [] for browser in requested}
+    duplicate_sets = 0
+    excluded_instances = 0
+    for resource in current_resources(connection):
+        buckets: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        for tab in resource["tabs"]:
+            browser = str(tab.get("browser") or "")
+            if browser not in requested:
+                continue
+            url = str(tab.get("url") or "")
+            try:
+                scheme = urlsplit(url).scheme.casefold()
+            except ValueError:
+                continue
+            if scheme != "https":
+                continue
+            buckets[(browser, str(tab.get("windowId") or ""), str(tab.get("groupId") or ""), url)].append(tab)
+
+        for (browser, window_id, group_id, exact_url), tabs in buckets.items():
+            if len(tabs) < 2:
+                continue
+            duplicate_sets += 1
+            ordered = sorted(tabs, key=_duplicate_keeper_order)
+            keeper = ordered[0]
+            keeper_tab_id = _numeric_tab_id(keeper.get("tabId"))
+            if keeper_tab_id is None:
+                excluded_instances += len(ordered) - 1
+                continue
+            expected_url_hash = hashlib.sha256(exact_url.encode("utf-8")).hexdigest()
+            for target in ordered[1:]:
+                target_tab_id = _numeric_tab_id(target.get("tabId"))
+                if (
+                    target_tab_id is None
+                    or target.get("active")
+                    or target.get("highlighted")
+                    or target.get("pinned")
+                    or target.get("audible")
+                ):
+                    excluded_instances += 1
+                    continue
+                targets_by_browser[browser].append(
+                    {
+                        "targetTabId": target_tab_id,
+                        "keeperTabId": keeper_tab_id,
+                        "expectedUrlHash": expected_url_hash,
+                        "windowId": window_id,
+                        "groupId": group_id,
+                        "targetInstanceId": target["instanceId"],
+                        "keeperInstanceId": keeper["instanceId"],
+                    }
+                )
+
+    request_id = secrets.token_hex(12)
+    browser_plans = {}
+    for browser in sorted(requested):
+        targets = sorted(
+            targets_by_browser[browser],
+            key=lambda item: (item["windowId"], item["groupId"], item["targetTabId"]),
+        )
+        target_payload = json.dumps(targets, separators=(",", ":"), ensure_ascii=True)
+        browser_plans[browser] = {
+            "beforeCaptureId": latest[browser]["id"],
+            "targets": targets,
+            "targetsHash": hashlib.sha256(target_payload.encode("utf-8")).hexdigest(),
+        }
+    plan = {
+        "schemaVersion": 1,
+        "action": "close_exact_duplicates",
+        "policy": "same-browser-window-group exact HTTPS URL; retain one; protect active, highlighted, pinned, audible",
+        "requestId": request_id,
+        "createdAt": utc_now(),
+        "browsers": browser_plans,
+        "summary": {
+            "duplicateSets": duplicate_sets,
+            "plannedClosures": sum(len(item["targets"]) for item in browser_plans.values()),
+            "excludedInstances": excluded_instances,
+        },
+    }
+    plan_json = json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    plan["planHash"] = hashlib.sha256(plan_json.encode("utf-8")).hexdigest()
+    return plan
+
+
+def record_mutation_plan(
+    connection: sqlite3.Connection,
+    state_dir: Path,
+    plan: dict[str, Any],
+    approval_scope: str,
+) -> Path:
+    approval = approval_scope.strip()[:1000]
+    if not approval:
+        raise ValueError("A bounded explicit approval scope is required")
+    request_id = str(plan["requestId"])
+    safe_time = re.sub(r"[^0-9]", "", str(plan["createdAt"]))[:14] or "undated"
+    evidence_path = state_dir / "mutations" / f"{safe_time}-dedupe-{request_id[:8]}.json"
+    evidence = {"plan": plan, "approvalScope": approval, "results": {}, "postCaptures": {}}
+    _atomic_write(
+        evidence_path,
+        json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"),
+    )
+    relative_path = str(evidence_path.relative_to(state_dir))
+    with connection:
+        for browser, browser_plan in plan["browsers"].items():
+            if not browser_plan["targets"]:
+                continue
+            audit_id = "mut_" + hashlib.sha256(f"{request_id}|{browser}".encode("utf-8")).hexdigest()[:24]
+            connection.execute(
+                """
+                INSERT INTO mutation_audits(
+                  id, action, browser, request_id, approval_scope, plan_hash,
+                  planned_count, status, evidence_path, before_capture_id, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?)
+                """,
+                (
+                    audit_id,
+                    plan["action"],
+                    browser,
+                    f"{request_id}:{browser}",
+                    approval,
+                    browser_plan["targetsHash"],
+                    len(browser_plan["targets"]),
+                    relative_path,
+                    browser_plan["beforeCaptureId"],
+                    plan["createdAt"],
+                ),
+            )
+    return evidence_path
+
+
+def finalize_mutation_plan(
+    connection: sqlite3.Connection,
+    state_dir: Path,
+    plan: dict[str, Any],
+    results: dict[str, dict[str, Any]],
+    post_captures: dict[str, dict[str, Any]],
+    error: str = "",
+) -> dict[str, int]:
+    request_id = str(plan["requestId"])
+    row = connection.execute(
+        "SELECT evidence_path FROM mutation_audits WHERE request_id LIKE ? LIMIT 1",
+        (f"{request_id}:%",),
+    ).fetchone()
+    if not row:
+        raise ValueError("Mutation audit plan was not recorded")
+    evidence_path = state_dir / row["evidence_path"]
+    post_verification: dict[str, dict[str, Any]] = {}
+    for browser, browser_plan in plan["browsers"].items():
+        if not browser_plan["targets"]:
+            continue
+        post_capture = post_captures.get(browser)
+        result = results.get(browser) or {}
+        result_by_id = {
+            int(item["tabId"]): item
+            for item in result.get("results") or []
+            if isinstance(item, dict) and item.get("tabId") is not None
+        }
+        post_tab_ids: set[int] = set()
+        if post_capture:
+            for tab_row in connection.execute(
+                "SELECT tab_id FROM tab_instances WHERE capture_id=?",
+                (post_capture.get("id"),),
+            ):
+                tab_id = _numeric_tab_id(tab_row["tab_id"])
+                if tab_id is not None:
+                    post_tab_ids.add(tab_id)
+        closed_targets = {
+            int(item["targetTabId"])
+            for item in browser_plan["targets"]
+            if result_by_id.get(int(item["targetTabId"]), {}).get("status") == "closed"
+        }
+        required_keepers = {
+            int(item["keeperTabId"])
+            for item in browser_plan["targets"]
+            if int(item["targetTabId"]) in closed_targets
+        }
+        closed_absent = bool(post_capture) and closed_targets.isdisjoint(post_tab_ids)
+        keepers_present = bool(post_capture) and required_keepers.issubset(post_tab_ids)
+        post_verification[browser] = {
+            "closedTargetsAbsent": closed_absent,
+            "keepersPresent": keepers_present,
+            "verified": closed_absent and keepers_present,
+        }
+    evidence = {
+        "plan": plan,
+        "approvalScope": connection.execute(
+            "SELECT approval_scope FROM mutation_audits WHERE request_id LIKE ? LIMIT 1",
+            (f"{request_id}:%",),
+        ).fetchone()["approval_scope"],
+        "results": results,
+        "postCaptures": {
+            browser: {"captureId": item.get("id"), "tabCount": item.get("tab_count")}
+            for browser, item in post_captures.items()
+        },
+        "postVerification": post_verification,
+        "completedAt": utc_now(),
+        "error": error[:500],
+    }
+    _atomic_write(
+        evidence_path,
+        json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"),
+    )
+    closed_total = 0
+    skipped_total = 0
+    with connection:
+        for browser, browser_plan in plan["browsers"].items():
+            if not browser_plan["targets"]:
+                continue
+            result = results.get(browser) or {}
+            closed = int(result.get("closedCount") or 0)
+            skipped = int(result.get("skippedCount") or 0)
+            planned = len(browser_plan["targets"])
+            post_capture = post_captures.get(browser)
+            if error or not result:
+                status = "failed"
+            elif (
+                closed == planned
+                and skipped == 0
+                and post_capture
+                and post_verification.get(browser, {}).get("verified")
+            ):
+                status = "completed"
+            else:
+                status = "partial"
+            connection.execute(
+                """
+                UPDATE mutation_audits
+                SET closed_count=?, skipped_count=?, status=?, after_capture_id=?,
+                    completed_at=?, error=?
+                WHERE request_id=?
+                """,
+                (
+                    closed,
+                    skipped,
+                    status,
+                    post_capture.get("id") if post_capture else None,
+                    evidence["completedAt"],
+                    error[:500] or None,
+                    f"{request_id}:{browser}",
+                ),
+            )
+            closed_total += closed
+            skipped_total += skipped
+    return {
+        "closed": closed_total,
+        "skipped": skipped_total,
+        "verifiedBrowsers": sum(
+            bool(item.get("verified")) for item in post_verification.values()
+        ),
+        "expectedBrowsers": len(post_verification),
+    }
+
+
+def _numeric_tab_id(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
 
 
 def report_group_summaries(resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1227,7 +1661,11 @@ def report_group_summaries(resources: list[dict[str, Any]]) -> list[dict[str, An
         format_counts = Counter(item["presentation"]["format"] for item in members)
         intent_counts = Counter(item["presentation"]["intent"] for item in members)
         queue_counts = Counter(item["presentation"]["queue"] for item in members)
-        duplicate_resources = sum(1 for item in members if len(item["tabs"]) > 1)
+        duplicate_resources = sum(
+            1
+            for item in members
+            if item["presentation"]["duplicates"]["safeCloseCandidates"]
+        )
         top_collections = [name for name, _count in collection_counts.most_common(3)]
         top_formats = [{"name": name, "count": count} for name, count in format_counts.most_common(3)]
         top_intents = [{"name": name, "count": count} for name, count in intent_counts.most_common(3)]
@@ -1277,9 +1715,17 @@ def report_collection_summaries(
         format_counts = Counter(item["presentation"]["format"] for item in members)
         intent_counts = Counter(item["presentation"]["intent"] for item in members)
         queue_counts = Counter(item["presentation"]["queue"] for item in members)
+        topic_counts = Counter(
+            value["name"]
+            for item in members
+            for value in item["collections"]
+            if value["kind"] == "topic"
+        )
         top_formats = [{"name": name, "count": count} for name, count in format_counts.most_common(3)]
         top_intents = [{"name": name, "count": count} for name, count in intent_counts.most_common(3)]
         description = str(collection.get("description") or "").strip()
+        if collection["kind"] == "space" and collection["name"] in SPACE_DEFINITIONS:
+            description = SPACE_DEFINITIONS[collection["name"]]
         if not description and top_formats:
             description = f"Mostly {top_formats[0]['name'].casefold()} resources"
             if top_intents:
@@ -1289,9 +1735,25 @@ def report_collection_summaries(
             {
                 "id": collection["id"],
                 "name": collection["name"],
+                "kind": collection["kind"],
                 "description": description or "No resources assigned yet.",
+                "objective": str(collection.get("objective") or ""),
                 "resourceCount": len(members),
                 "resourceIds": [item["resourceId"] for item in members],
+                "previewResourceIds": [
+                    item["resourceId"]
+                    for item in sorted(
+                        members,
+                        key=lambda value: (
+                            not bool(value["presentation"]["preview"]["localImage"]),
+                            value["title"].casefold(),
+                        ),
+                    )[:3]
+                ],
+                "topTopics": [
+                    {"name": name, "count": count}
+                    for name, count in topic_counts.most_common(5)
+                ],
                 "topFormats": top_formats,
                 "topIntents": top_intents,
                 "queueCounts": dict(queue_counts),
@@ -1321,6 +1783,14 @@ def _source_label(host: str, kind: str, scheme: str) -> str:
         if any(suffix in host for suffix in suffixes):
             return label
     return host.removeprefix("www.") or "Unknown source"
+
+
+def _clean_display_title(title: str, source: str) -> str:
+    value = title.strip()
+    if source == "YouTube":
+        value = re.sub(r"^\(\d+\)\s+", "", value)
+        value = re.sub(r"\s+-\s+YouTube$", "", value, flags=re.IGNORECASE)
+    return value or source
 
 
 def _format_label(host: str, kind: str, title: str, path: str, scheme: str) -> str:
@@ -1394,6 +1864,90 @@ def _youtube_video_id(url: str) -> str:
     return candidate if re.fullmatch(r"[A-Za-z0-9_-]{6,32}", candidate) else ""
 
 
+def cache_public_previews(
+    connection: sqlite3.Connection,
+    state_dir: Path,
+    refresh: bool = False,
+    workers: int = 8,
+) -> dict[str, int]:
+    preview_dir = state_dir / "previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    resources = current_resources(connection)
+    candidates: list[tuple[str, str, Path]] = []
+    cached = 0
+    for resource in resources:
+        video_id = _youtube_video_id(str(resource.get("canonicalUrl") or ""))
+        if not video_id:
+            continue
+        target = preview_dir / f"{resource['resourceId']}.jpg"
+        if not refresh and resource.get("previewKind") == "thumbnail" and target.is_file():
+            cached += 1
+            continue
+        candidates.append((resource["resourceId"], video_id, target))
+
+    downloaded: list[tuple[str, Path, str]] = []
+    failed = 0
+    with ThreadPoolExecutor(max_workers=max(1, min(16, workers))) as executor:
+        futures = {
+            executor.submit(_download_youtube_preview, video_id, target): (resource_id, target)
+            for resource_id, video_id, target in candidates
+        }
+        for future in as_completed(futures):
+            resource_id, target = futures[future]
+            try:
+                digest = future.result()
+            except (HTTPError, URLError, OSError, ValueError):
+                failed += 1
+                continue
+            downloaded.append((resource_id, target, digest))
+
+    now = utc_now()
+    with connection:
+        for resource_id, target, digest in downloaded:
+            connection.execute(
+                """
+                INSERT INTO resource_previews(
+                  resource_id, kind, local_path, source, content_sha256,
+                  width, height, created_at
+                ) VALUES(?, 'thumbnail', ?, 'youtube_public_thumbnail', ?, 320, 180, ?)
+                ON CONFLICT(resource_id) DO UPDATE SET
+                  kind=excluded.kind,
+                  local_path=excluded.local_path,
+                  source=excluded.source,
+                  content_sha256=excluded.content_sha256,
+                  width=excluded.width,
+                  height=excluded.height,
+                  created_at=excluded.created_at
+                """,
+                (resource_id, str(target.relative_to(state_dir)), digest, now),
+            )
+    return {
+        "eligible": cached + len(candidates),
+        "alreadyCached": cached,
+        "downloaded": len(downloaded),
+        "failed": failed,
+    }
+
+
+def _download_youtube_preview(video_id: str, target: Path) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", video_id):
+        raise ValueError("Invalid public video identifier")
+    url = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
+    request = Request(url, headers={"User-Agent": "TabAtlas/0.3 local-preview-cache"})
+    with urlopen(request, timeout=12) as response:
+        final = urlsplit(response.geturl())
+        if final.scheme != "https" or final.hostname != "i.ytimg.com":
+            raise ValueError("Preview redirect left the allowed origin")
+        content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].casefold()
+        if content_type not in {"image/jpeg", "image/jpg"}:
+            raise ValueError("Preview response was not JPEG")
+        data = response.read(1_000_001)
+    if len(data) > 1_000_000 or not data.startswith(b"\xff\xd8\xff"):
+        raise ValueError("Preview response failed image validation")
+    _atomic_write(target, data)
+    return hashlib.sha256(data).hexdigest()
+
+
 def _group_identifier(tab: dict[str, Any]) -> str:
     seed = "|".join(
         (
@@ -1428,6 +1982,12 @@ def report_payload(connection: sqlite3.Connection) -> dict[str, Any]:
     tasks = [dict(row) for row in connection.execute("SELECT * FROM tasks ORDER BY status, created_at")]
     groups = report_group_summaries(resources)
     collection_summaries = report_collection_summaries(resources, collections)
+    active_summaries = [item for item in collection_summaries if item["resourceCount"]]
+    space_order = {name: index for index, name in enumerate(SPACE_DEFINITIONS)}
+    space_summaries = sorted(
+        (item for item in active_summaries if item["kind"] == "space"),
+        key=lambda item: (space_order.get(item["name"], 999), item["name"].casefold()),
+    )
     format_counts = Counter(item["presentation"]["format"] for item in resources)
     intent_counts = Counter(item["presentation"]["intent"] for item in resources)
     queue_counts = Counter(item["presentation"]["queue"] for item in resources)
@@ -1437,7 +1997,10 @@ def report_payload(connection: sqlite3.Connection) -> dict[str, Any]:
         "resources": resources,
         "groups": groups,
         "collections": collections,
-        "collectionSummaries": collection_summaries,
+        "collectionSummaries": active_summaries,
+        "spaceSummaries": space_summaries,
+        "topicSummaries": [item for item in active_summaries if item["kind"] == "topic"],
+        "projectSummaries": [item for item in active_summaries if item["kind"] == "project"],
         "facets": {
             "formats": [{"name": name, "count": count} for name, count in format_counts.most_common()],
             "intents": [{"name": name, "count": count} for name, count in intent_counts.most_common()],
@@ -1451,9 +2014,19 @@ def generate_report(
     connection: sqlite3.Connection,
     report_dir: Path,
     assets_dir: Path,
+    state_dir: Path | None = None,
 ) -> Path:
     report_dir.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(report_payload(connection), ensure_ascii=False, separators=(",", ":"))
+    available_previews = _copy_report_previews(
+        connection,
+        state_dir or _database_parent(connection),
+        report_dir,
+    )
+    document = report_payload(connection)
+    for resource in document["resources"]:
+        if resource["resourceId"] not in available_previews:
+            resource["presentation"]["preview"]["localImage"] = ""
+    payload = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
     payload = payload.replace("</", "<\\/").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
     template = """<!doctype html>
 <html lang=\"en\">
@@ -1474,6 +2047,41 @@ def generate_report(
     shutil.copy2(assets_dir / "app.css", report_dir / "app.css")
     shutil.copy2(assets_dir / "app.js", report_dir / "app.js")
     return report_dir / "index.html"
+
+
+def _database_parent(connection: sqlite3.Connection) -> Path:
+    for row in connection.execute("PRAGMA database_list"):
+        if row[1] == "main" and row[2]:
+            return Path(row[2]).resolve().parent
+    return Path.cwd()
+
+
+def _copy_report_previews(
+    connection: sqlite3.Connection,
+    state_dir: Path,
+    report_dir: Path,
+) -> set[str]:
+    media_dir = report_dir / "media"
+    if media_dir.exists():
+        shutil.rmtree(media_dir)
+    media_dir.mkdir(parents=True, exist_ok=True)
+    state_root = state_dir.resolve()
+    copied: set[str] = set()
+    for row in connection.execute(
+        "SELECT resource_id, local_path FROM resource_previews ORDER BY resource_id"
+    ):
+        source = (state_root / row["local_path"]).resolve()
+        try:
+            source.relative_to(state_root)
+        except ValueError:
+            continue
+        suffix = source.suffix.casefold()
+        if not source.is_file() or suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            continue
+        destination = media_dir / f"{row['resource_id']}{suffix}"
+        shutil.copy2(source, destination)
+        copied.add(row["resource_id"])
+    return copied
 
 
 def import_file(

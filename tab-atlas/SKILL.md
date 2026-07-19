@@ -15,7 +15,7 @@ Run commands from this skill directory:
 python scripts/tab_atlas.py status
 ```
 
-Read `references/architecture.md` before changing capture, storage, or report boundaries. Read `references/safety.md` before interacting with browser profiles, private URLs, page content, or any future tab mutation.
+Read `references/architecture.md` before changing capture, storage, or report boundaries. Read `references/safety.md` before interacting with browser profiles, private URLs, page content, or tab mutation. Use `references/taxonomy.md` for semantic organization.
 
 ## Capture
 
@@ -74,7 +74,8 @@ Use concise, concrete fields:
 - `detail`: enough context to decide whether to revisit.
 - `whyKept`: an evidence-based hypothesis, not invented certainty.
 - `nextAction`: a practical next step or `none`.
-- `collections`: meaningful projects, themes, or workflows; avoid category sprawl.
+- `collections`: one high-confidence `space`, up to two `topic` values, and an
+  optional `project` overlay; avoid category sprawl.
 
 Prefer a small stable collection set. A resource may belong to more than one collection when that improves retrieval.
 
@@ -90,28 +91,65 @@ Use captured metadata and deterministic URL structure for every resource before 
 
 ## Present And Query
 
-Generate the local read-only report:
+Cache privacy-bounded public visual evidence and generate the local report:
 
 ```powershell
+python scripts/tab_atlas.py enrich
 python scripts/tab_atlas.py report
 ```
 
-Open `report/index.html` for decision queues, independent browser groups, topic collections, global search, and progressive resource detail. Regenerate after applying annotations.
+Open `report/index.html` for Home, purpose-based Spaces, Review, global search,
+and progressive resource detail. Browser groups remain contextual evidence and
+filters rather than primary navigation. Regenerate after applying annotations.
 
-The report's Keep, Later, and Close candidate controls are local proposals. They do not mutate tabs. If the user exports `tabatlas-decisions.json`, inspect it and apply accepted statuses with:
+The report's **Keep open**, **Save + close**, and **Dismiss + close** controls are
+local proposals. They do not mutate tabs. If the user exports
+`tabatlas-decisions.json`, inspect it and apply accepted statuses with:
 
 ```powershell
 python scripts/tab_atlas.py apply path\to\tabatlas-decisions.json
 python scripts/tab_atlas.py report
 ```
 
-Remote source previews are opt-in per resource. Do not trigger them automatically during report generation or acceptance testing.
+The enrichment command caches only allowlisted public source thumbnails. It does
+not crawl arbitrary tab URLs, send URLs to an LLM provider, or access authenticated
+pages. The report does not load remote media automatically.
 
 Use `python scripts/tab_atlas.py query --text "..."` for conversational retrieval. Summarize the result for the user instead of dumping raw database rows.
 
+## Exact Duplicate Cleanup
+
+Preview the current plan without mutation:
+
+```powershell
+python scripts/tab_atlas.py dedupe --browser all
+```
+
+Record or revoke a bounded standing approval only after an explicit user instruction:
+
+```powershell
+python scripts/tab_atlas.py dedupe-approval grant --scope "<bounded user approval>"
+python scripts/tab_atlas.py dedupe-approval status
+python scripts/tab_atlas.py dedupe-approval revoke
+```
+
+Execution requires either the active private standing approval or a one-run
+`--approval` string. It performs a fresh
+capture, authenticated live revalidation, closure, post-action capture, and an
+ignored audit in `state/mutations/`:
+
+```powershell
+python scripts/tab_atlas.py dedupe --browser all --execute
+```
+
+Only byte-identical HTTPS URLs in the same browser, window, and group are
+eligible. Active, highlighted, pinned, audible, internal, file, cross-window,
+cross-group, and canonical-only matches are excluded.
+
 ## Safety Boundaries
 
-- Do not close, move, group, bookmark, activate, or navigate tabs without a separate explicit user approval for that exact mutation plan.
+- Do not close, move, group, bookmark, activate, or navigate tabs without explicit
+  bounded approval and the corresponding audited protocol.
 - Do not launch, copy wholesale, or remote-debug a normal browser profile during ordinary capture.
 - Do not fetch every URL automatically. Public-page enrichment is selective; authenticated and sensitive pages require an explicit reason and appropriate browser tooling.
 - Do not expose pairing tokens, raw private URLs, profile paths, or unredacted snapshots in reports or chat.

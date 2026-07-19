@@ -20,3 +20,16 @@ test("extension proofs match an independent HMAC implementation", async () => {
   assert.equal(await protocol.verifyHmac(key, message, expectedProof), true);
   assert.equal(await protocol.verifyHmac(key, `${message}x`, expectedProof), false);
 });
+
+test("exact duplicate validation protects live tab state and context", () => {
+  const hash = "a".repeat(64);
+  const plan = { expectedUrlHash: hash, windowId: "7", groupId: "-1" };
+  const tab = { windowId: 7, groupId: -1, active: false, highlighted: false, pinned: false, audible: false };
+  const keeper = { windowId: 7, groupId: -1 };
+
+  assert.equal(protocol.duplicateTargetReason(plan, tab, keeper, hash, hash), "");
+  assert.equal(protocol.duplicateTargetReason(plan, { ...tab, active: true }, keeper, hash, hash), "tab_became_protected");
+  assert.equal(protocol.duplicateTargetReason(plan, { ...tab, highlighted: true }, keeper, hash, hash), "tab_became_protected");
+  assert.equal(protocol.duplicateTargetReason(plan, tab, keeper, "b".repeat(64), hash), "url_changed");
+  assert.equal(protocol.duplicateTargetReason(plan, { ...tab, groupId: 9 }, keeper, hash, hash), "context_changed");
+});

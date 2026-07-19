@@ -15,7 +15,7 @@ elements.mode.addEventListener("change", () => run(async () => {
   const statusValue = await send({ type: "tabatlas:set-mode", mode: elements.mode.checked ? "on" : "off" });
   if (!statusValue.ok) throw new Error(statusValue.error || "Mode change failed.");
   render(statusValue);
-  say(statusValue.mode === "on" ? "Passive capture is on." : "Capture is fully off.");
+  say(statusValue.mode === "on" ? "Passive local bridge is on." : "The bridge is fully off.");
 }));
 
 elements.pair.addEventListener("click", () => run(async () => {
@@ -23,7 +23,7 @@ elements.pair.addEventListener("click", () => run(async () => {
   const result = await send({ type: "tabatlas:pair", code });
   if (!result.ok) throw new Error(result.error || "Pairing failed.");
   elements.code.value = "";
-  say("Paired. Passive capture is on.");
+  say("Paired. Passive local bridge is on.");
   render(await status());
 }));
 
@@ -31,7 +31,9 @@ elements.capture.addEventListener("click", () => run(async () => {
   say("Checking for a capture request...");
   const result = await send({ type: "tabatlas:capture-now" });
   if (!result.ok && !result.idle) throw new Error(result.error || "Capture failed.");
-  say(result.captured ? `Captured ${result.tabCount} tabs.` : "No receiver is requesting a capture.");
+  if (result.captured) say(`Captured ${result.tabCount} tabs.`);
+  else if (result.mutated) say(`Closed ${result.closedCount} verified duplicate tabs.`);
+  else say("No receiver is waiting.");
   render(await status());
 }));
 

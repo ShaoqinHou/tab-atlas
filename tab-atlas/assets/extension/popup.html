@@ -3,18 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TabAtlas Capture</title>
+  <title>TabAtlas Bridge</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
   <header>
     <div class="mark" aria-hidden="true">TA</div>
     <div>
-      <h1>TabAtlas Capture</h1>
+      <h1>TabAtlas Bridge</h1>
       <p id="browser">Checking browser...</p>
     </div>
-    <label class="switch" title="Turn passive capture polling on or off">
-      <input id="mode" type="checkbox" role="switch" aria-label="Capture mode">
+    <label class="switch" title="Turn the passive local bridge on or off">
+      <input id="mode" type="checkbox" role="switch" aria-label="Local bridge mode">
       <span></span>
     </label>
   </header>
@@ -35,7 +35,7 @@
     </section>
 
     <div class="actions">
-      <button id="capture" type="button">Capture now</button>
+      <button id="capture" type="button">Check receiver</button>
     </div>
     <p id="message" class="message" aria-live="polite"></p>
   </main>

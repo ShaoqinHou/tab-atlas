@@ -48,6 +48,23 @@ export function randomNonce() {
   return bytesToHex(bytes);
 }
 
+export function duplicateTargetReason(plan, tab, keeper, targetUrlHash, keeperUrlHash) {
+  const expected = String(plan?.expectedUrlHash || "");
+  if (targetUrlHash !== expected || keeperUrlHash !== expected) return "url_changed";
+  if (tab?.active || tab?.highlighted || tab?.pinned || tab?.audible) {
+    return "tab_became_protected";
+  }
+  if (
+    String(tab?.windowId) !== String(plan?.windowId)
+    || String(tab?.groupId) !== String(plan?.groupId)
+    || String(keeper?.windowId) !== String(plan?.windowId)
+    || String(keeper?.groupId) !== String(plan?.groupId)
+  ) {
+    return "context_changed";
+  }
+  return "";
+}
+
 function hexToBytes(value) {
   const text = String(value || "");
   if (!/^[a-f0-9]+$/.test(text) || text.length % 2 !== 0) {

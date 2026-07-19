@@ -27,12 +27,19 @@
 
 ## Mutation Gate
 
-Browser mutation is out of scope until the read-only workflow is useful. A future mutation requires:
+Browser mutation is limited to the implemented exact-duplicate workflow. It requires:
 
 1. A named list of target tab instance IDs and URLs.
 2. A fresh capture proving those instances still exist.
-3. A preview that distinguishes duplicates from unique resources.
-4. Explicit user approval after the preview.
+3. A preview that distinguishes exact duplicates from canonical URL matches and
+   unique resources.
+4. Explicit user approval for the bounded policy. Approval may be a standing
+   instruction such as "close exact duplicates automatically" only when the
+   implementation stores its scope in private local state, keeps it revocable,
+   copies it into every audit, and still creates a fresh plan immediately before
+   every run.
 5. A post-action capture and recoverable audit record.
 
-Never infer approval from a request to organize, review, archive, or clean up information.
+Never infer approval from a request to organize, review, archive, or clean up
+information. Never expand exact-duplicate approval to canonical matches, similar
+pages, cross-group copies, or another mutation type.

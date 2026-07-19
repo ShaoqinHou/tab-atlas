@@ -41,6 +41,8 @@ class ReceiverSession:
     request_id: str = field(default_factory=lambda: secrets.token_hex(12))
     pairing_code: str | None = None
     captured: dict[str, dict[str, Any]] = field(default_factory=dict)
+    mutation_plan: dict[str, Any] | None = None
+    mutated: dict[str, dict[str, Any]] = field(default_factory=dict)
     paired_browser: str | None = None
     done: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -101,25 +103,41 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             if self.server.session.mode == "revoke" and browser in self.server.session.expected_browsers:
                 self.server.session.done.set()
             return
-        if self.server.session.mode != "capture":
-            self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "capture is not active"})
-            return
         connection = connect(self.server.session.database_path)
         try:
             mark_pairing_seen(connection, browser)
         finally:
             connection.close()
+        targets: list[dict[str, Any]] = []
+        targets_hash = ""
         with self.server.session.lock:
-            if browser not in self.server.session.expected_browsers or browser in self.server.session.captured:
-                action = "idle"
-                request_id = ""
+            session = self.server.session
+            if session.mode == "capture":
+                if browser not in session.expected_browsers or browser in session.captured:
+                    action = "idle"
+                    request_id = ""
+                else:
+                    action = "capture"
+                    request_id = session.request_id
+            elif session.mode == "mutate" and session.mutation_plan:
+                browser_plan = session.mutation_plan.get("browsers", {}).get(browser)
+                if browser not in session.expected_browsers or browser in session.mutated or not browser_plan:
+                    action = "idle"
+                    request_id = ""
+                else:
+                    action = "close_exact_duplicates"
+                    request_id = str(session.mutation_plan["requestId"])
+                    targets = browser_plan["targets"]
+                    targets_hash = browser_plan["targetsHash"]
             else:
-                action = "capture"
-                request_id = self.server.session.request_id
+                self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "receiver is not active"})
+                return
         payload = {
             "ok": True,
             "action": action,
             "requestId": request_id,
+            "targets": targets,
+            "targetsHash": targets_hash,
             "serverProof": protocol_proof(
                 pairing["secret"],
                 "response",
@@ -128,6 +146,7 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
                 pairing["nonce"],
                 request_id,
                 action,
+                targets_hash,
             ),
         }
         self._send_json(HTTPStatus.OK, payload)
@@ -142,6 +161,9 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/snapshot":
             self._snapshot()
+            return
+        if path == "/v1/mutation":
+            self._mutation()
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
 
@@ -255,6 +277,90 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
                 pairing["nonce"],
                 request_id,
                 result["id"],
+            ),
+        })
+        if complete:
+            session.done.set()
+
+    def _mutation(self) -> None:
+        session = self.server.session
+        if session.mode != "mutate" or not session.mutation_plan:
+            self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "mutation is not active"})
+            return
+        try:
+            raw_body = self._read_body(2 * 1024 * 1024)
+            body = json.loads(raw_body.decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("request body must be an object")
+            request_id = str(body.get("requestId") or "")
+            targets_hash = str(body.get("targetsHash") or "")
+            body_hash = hashlib.sha256(raw_body).hexdigest()
+            pairing = self._authenticate_signed("mutation", request_id, targets_hash, body_hash)
+            if not pairing or not pairing["enabled"]:
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                return
+            browser = normalize_browser(body.get("browser"))
+            extension_id = str(body.get("extensionId") or "")
+            if browser != pairing["browser"] or browser not in session.expected_browsers:
+                raise ValueError("browser does not match mutation plan")
+            if extension_id != pairing["extension_id"] or extension_id != EXPECTED_EXTENSION_ID:
+                raise ValueError("extension does not match pairing")
+            if request_id != str(session.mutation_plan["requestId"]):
+                raise ValueError("mutation request does not match receiver run")
+            browser_plan = session.mutation_plan["browsers"].get(browser)
+            if not browser_plan or targets_hash != browser_plan["targetsHash"]:
+                raise ValueError("mutation target set does not match receiver plan")
+            results = body.get("results")
+            if not isinstance(results, list) or len(results) != len(browser_plan["targets"]):
+                raise ValueError("mutation result count does not match plan")
+            expected_ids = {int(item["targetTabId"]) for item in browser_plan["targets"]}
+            seen_ids: set[int] = set()
+            normalized_results = []
+            for item in results:
+                if not isinstance(item, dict):
+                    raise ValueError("mutation result must be an object")
+                tab_id = int(item.get("tabId"))
+                status = str(item.get("status") or "")
+                reason = str(item.get("reason") or "")[:160]
+                if tab_id not in expected_ids or tab_id in seen_ids:
+                    raise ValueError("mutation result contains an unexpected tab")
+                if status not in {"closed", "skipped"}:
+                    raise ValueError("mutation result status is invalid")
+                seen_ids.add(tab_id)
+                normalized_results.append({"tabId": tab_id, "status": status, "reason": reason})
+            if seen_ids != expected_ids:
+                raise ValueError("mutation results are incomplete")
+        except (ValueError, TypeError, json.JSONDecodeError) as error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)[:240]})
+            return
+
+        closed_count = sum(item["status"] == "closed" for item in normalized_results)
+        skipped_count = len(normalized_results) - closed_count
+        result = {
+            "requestId": request_id,
+            "targetsHash": targets_hash,
+            "closedCount": closed_count,
+            "skippedCount": skipped_count,
+            "results": normalized_results,
+        }
+        with session.lock:
+            session.mutated[browser] = result
+            complete = session.expected_browsers.issubset(session.mutated.keys())
+        self._send_json(HTTPStatus.OK, {
+            "ok": True,
+            "browser": browser,
+            "closedCount": closed_count,
+            "skippedCount": skipped_count,
+            "serverProof": protocol_proof(
+                pairing["secret"],
+                "mutation-accepted",
+                browser,
+                pairing["extension_id"],
+                pairing["nonce"],
+                request_id,
+                targets_hash,
+                str(closed_count),
+                str(skipped_count),
             ),
         })
         if complete:
@@ -398,6 +504,31 @@ def run_revocation(
         expected_browsers={normalize_browser(browser)},
     )
     return _run(session, timeout_seconds)
+
+
+def run_mutation(
+    database_path: Path,
+    state_dir: Path,
+    plan: dict[str, Any],
+    timeout_seconds: int,
+) -> tuple[bool, dict[str, dict[str, Any]]]:
+    expected = {
+        browser
+        for browser, browser_plan in plan.get("browsers", {}).items()
+        if browser_plan.get("targets")
+    }
+    if not expected:
+        return True, {}
+    session = ReceiverSession(
+        mode="mutate",
+        database_path=database_path,
+        state_dir=state_dir,
+        expected_browsers=expected,
+        request_id=str(plan["requestId"]),
+        mutation_plan=plan,
+    )
+    completed = _run(session, timeout_seconds)
+    return completed, session.mutated
 
 
 def _run(

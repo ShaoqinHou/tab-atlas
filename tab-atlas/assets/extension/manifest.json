@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "TabAtlas Capture",
-  "version": "0.2.0",
-  "description": "Read-only Chrome and Edge tab capture for a local TabAtlas workspace.",
+  "name": "TabAtlas Bridge",
+  "version": "0.3.0",
+  "description": "Passive local tab capture with narrowly approved exact-duplicate cleanup.",
   "minimum_chrome_version": "120",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA406U3ynq4/M16bZ1CZEUV10L1qtlrw7iy03Da6W48xmR5JGHI6ptoI4D92AuaBYvqhpG2U/ECB9Dlu1DadpLGUZToEE3GPvsbBu2pkhf6Zxy/gSb4QKvPFZcw7rgpQmyscoUstwNnXtdnarvnMW/8KUqf0tZoTWOsoaf8AYZqoByNyKme8VISNH7mKbHpvkfjSN/NOUWFBm30Fpm4fK7fKeGf8s88vz1NIFSA6Wvhlt4Z2XhmJc+85bcZUVfcb9KeucwX7iF/2bFRv29C5pAKPTlpZ6VgySw+oXLx9U2CSI18CmtJJfKsRhIxjb60l8AdwMiVGkpzezIE07lgyifYQIDAQAB",
   "permissions": [
@@ -19,7 +19,7 @@
     "type": "module"
   },
   "action": {
-    "default_title": "TabAtlas Capture",
+    "default_title": "TabAtlas Bridge",
     "default_popup": "popup.html"
   },
   "incognito": "not_allowed"

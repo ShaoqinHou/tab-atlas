@@ -17,9 +17,11 @@ Build and prove the smallest complete loop:
 3. Let Codex annotate bounded batches.
 4. Generate a compact overview-to-detail HTML report.
 
-The clean kernel and first meaningful real-data pass are complete. A live,
-read-only migration capture proved the catalog against hundreds of Chrome and
-Edge tabs without focusing or mutating either browser.
+The smallest complete loop is now proven against the user's current browsers.
+The replacement extension is installed, enabled, and paired in both Chrome and
+Edge. An authenticated live capture collected 218 Chrome tabs and 495 Edge tabs,
+including 18 browser groups, without closing, moving, grouping, or navigating a
+captured content tab. Both one-shot receivers exited after capture.
 
 The replacement capture protocol now authenticates both extension and receiver
 with nonce-bound HMAC proofs. No reusable pairing key crosses loopback, OFF
@@ -27,10 +29,12 @@ aborts in-flight network work and prevents submission, and signed revocation
 turns the extension fully off. Ten focused Python tests and one independent
 Node protocol test pass.
 
-A bounded discovery and assignment pass covered the full current library. Every
+A bounded discovery and assignment pass covers all 609 current resources. Every
 resource has a cautious scan-level brief, a 12-collection vocabulary is frozen,
-and low-context resources remain unclassified instead of being guessed. All
-generated memberships remain suggestions until accepted.
+and 137 low-context resources remain unclassified instead of being guessed. All
+generated memberships remain suggestions until accepted. The regenerated local
+report passed desktop and 390-pixel responsive checks, search, collection
+filtering, and a clean browser-console check.
 
 ## Frozen Decisions
 
@@ -58,15 +62,16 @@ Everything under `legacy/` is quarantined evidence. Active `AGENTS.md`, `.agents
 
 ## Next Actions
 
-1. Replace the legacy exporter with the new OFF/ON extension in Chrome and Edge.
-2. Pair both browsers and prove a second live capture through the authenticated receiver.
-3. Use the generated report with the user before adding extraction or mutation.
-4. Add selective enrichment only when report use exposes a concrete information gap.
+1. Use the generated report with the user and record concrete retrieval or presentation problems.
+2. Review the 137 deliberately unclassified resources only when their value justifies deeper context.
+3. Add selective enrichment only when report use exposes a concrete information gap.
+4. Keep all browser-tab mutation out of scope until the user authorizes a separate, explicit workflow.
 
 ## Current Constraint
 
-Browser automation cannot open Chrome or Edge internal extension-management
-pages. The legacy exporter provided one safe migration snapshot, but it does not
-meet the new OFF/ON and authentication design. Replacing it requires one explicit
-extension-install interaction in each browser; do not disguise that setup step as
-headless automation or weaken the receiver to avoid it.
+There is no installation or capture blocker. Extension installation still
+requires the browser's native confirmation surface; the user completed that
+one-time action in both browsers. Normal operation is passive: the extension does
+no tab read while OFF, and while ON it reads tabs only after authenticating an
+on-demand local receiver. Report use, not speculative expansion, now controls the
+next milestone.

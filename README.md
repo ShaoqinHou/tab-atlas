@@ -109,7 +109,7 @@ reload instruction. After `prepare-extension` changes the unpacked source, click
 **Reload** once on TabAtlas Bridge in `chrome://extensions` and
 `edge://extensions`; restarting the browsers does not reliably refresh an
 already registered unpacked worker. The popup's **Build** row shows the code the
-browser actually loaded, for example `v0.4.1 / protocol 4`. If **Reload** leaves
+browser actually loaded, for example `v0.4.2 / protocol 4`. If **Reload** leaves
 an older value active, toggle the TabAtlas Bridge extension-manager card off and
 on; do not confuse that manager control with the popup's passive-mode switch.
 
@@ -158,6 +158,10 @@ both reported closed and absent. A temporary extension-owned control tab keeps
 verification alive and is removed through a separate authenticated result.
 Any pre-existing TabAtlas popup tab is bound to the same fresh plan as an
 operational target, so the workflow does not leave its own setup page behind.
+If the control page is the browser's last tab, the extension briefly creates a
+blank handoff tab, submits and verifies the signed control-close result, and then
+removes the handoff. This prevents normal browser exit from killing the service
+worker before its final audit POST.
 
 ```powershell
 python scripts/tab_atlas.py archive-tabs --browser all

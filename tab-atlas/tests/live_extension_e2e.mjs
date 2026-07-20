@@ -166,6 +166,13 @@ async function exerciseBrowser(browser, selectedOperation) {
     const audit = fs.readFileSync(operationResult.auditPath, "utf8");
     assert.equal(audit.includes("example.com"), false);
     assert.equal(audit.includes(duplicateUrl), false);
+    if (selectedOperation === "archive") {
+      const auditData = JSON.parse(audit);
+      assert.equal(
+        auditData.controlCleanup?.browsers?.[protocolBrowser]?.reason,
+        "removed_with_handoff"
+      );
+    }
 
     return {
       browser,

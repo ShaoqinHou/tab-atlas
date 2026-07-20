@@ -655,73 +655,96 @@ async function executeArchiveControlCleanup(command, key, browser, extensionId, 
     return { ok: false, idle: true, reason: "off" };
   }
 
-  let status = "closed";
-  let reason = "removed";
-  try {
-    await chrome.tabs.remove(controlTabId);
-    const remaining = await chrome.tabs.get(controlTabId).catch(() => null);
-    if (remaining) {
-      status = "skipped";
-      reason = "removal_unverified";
-    }
-  } catch (_error) {
-    const remaining = await chrome.tabs.get(controlTabId).catch(() => null);
-    if (remaining) {
-      status = "skipped";
-      reason = "close_failed";
-    } else {
-      reason = "already_absent";
+  const windowTabs = await chrome.tabs.query({ windowId: controlWindowId });
+  let handoffTab = null;
+  if (!windowTabs.some(tab => Number(tab.id) !== controlTabId)) {
+    handoffTab = await chrome.tabs.create({
+      windowId: controlWindowId,
+      url: "about:blank",
+      active: false,
+      pinned: false
+    });
+    if (!Number.isInteger(handoffTab.id) || Number(handoffTab.windowId) !== controlWindowId) {
+      if (Number.isInteger(handoffTab?.id)) {
+        await chrome.tabs.remove(handoffTab.id).catch(() => {});
+      }
+      throw new Error("Could not create the archive cleanup handoff tab.");
     }
   }
-  if (status === "closed") await clearArchiveControl(controlTabId);
 
-  const bodyValue = {
-    requestId,
-    targetsHash,
-    browser,
-    extensionId,
-    controlTabId,
-    controlWindowId,
-    status,
-    reason
-  };
-  const body = JSON.stringify(bodyValue);
-  const bodyHash = await sha256Hex(body);
-  const cleanupNonce = randomNonce();
-  const cleanupAuth = await hmacHex(
-    key,
-    protocolMessage("cleanup", browser, extensionId, cleanupNonce, requestId, targetsHash, bodyHash)
-  );
-  const submitted = await fetch(`${RECEIVER}/v1/cleanup`, {
-    method: "POST",
-    cache: "no-store",
-    signal,
-    headers: {
-      ...signedHeaders(browser, extensionId, cleanupNonce, cleanupAuth),
-      "content-type": "application/json"
-    },
-    body
-  });
-  const accepted = await readJson(submitted);
-  if (!submitted.ok) throw new Error(accepted.error || `Archive cleanup failed (${submitted.status}).`);
-  const receiverAccepted = await verifyHmac(
-    key,
-    protocolMessage(
-      "cleanup-accepted",
-      browser,
-      extensionId,
-      cleanupNonce,
+  let status = "closed";
+  let reason = handoffTab ? "removed_with_handoff" : "removed";
+  try {
+    try {
+      await chrome.tabs.remove(controlTabId);
+      const remaining = await chrome.tabs.get(controlTabId).catch(() => null);
+      if (remaining) {
+        status = "skipped";
+        reason = "removal_unverified";
+      }
+    } catch (_error) {
+      const remaining = await chrome.tabs.get(controlTabId).catch(() => null);
+      if (remaining) {
+        status = "skipped";
+        reason = "close_failed";
+      } else {
+        reason = "already_absent";
+      }
+    }
+
+    const bodyValue = {
       requestId,
       targetsHash,
+      browser,
+      extensionId,
       controlTabId,
       controlWindowId,
       status,
       reason
-    ),
-    accepted.serverProof
-  );
-  if (!receiverAccepted) throw new Error("Receiver archive cleanup proof failed.");
-  return { ok: status === "closed", cleaned: status === "closed", status, reason };
+    };
+    const body = JSON.stringify(bodyValue);
+    const bodyHash = await sha256Hex(body);
+    const cleanupNonce = randomNonce();
+    const cleanupAuth = await hmacHex(
+      key,
+      protocolMessage("cleanup", browser, extensionId, cleanupNonce, requestId, targetsHash, bodyHash)
+    );
+    const submitted = await fetch(`${RECEIVER}/v1/cleanup`, {
+      method: "POST",
+      cache: "no-store",
+      signal,
+      headers: {
+        ...signedHeaders(browser, extensionId, cleanupNonce, cleanupAuth),
+        "content-type": "application/json"
+      },
+      body
+    });
+    const accepted = await readJson(submitted);
+    if (!submitted.ok) throw new Error(accepted.error || `Archive cleanup failed (${submitted.status}).`);
+    const receiverAccepted = await verifyHmac(
+      key,
+      protocolMessage(
+        "cleanup-accepted",
+        browser,
+        extensionId,
+        cleanupNonce,
+        requestId,
+        targetsHash,
+        controlTabId,
+        controlWindowId,
+        status,
+        reason
+      ),
+      accepted.serverProof
+    );
+    if (!receiverAccepted) throw new Error("Receiver archive cleanup proof failed.");
+    if (status === "closed") await clearArchiveControl(controlTabId);
+    return { ok: status === "closed", cleaned: status === "closed", status, reason };
+  } finally {
+    if (Number.isInteger(handoffTab?.id)) {
+      await chrome.tabs.remove(handoffTab.id).catch(() => {});
+    }
+  }
 }
 
 async function clearArchiveControl(tabId) {

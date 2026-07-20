@@ -155,7 +155,9 @@ integrity and a private backup, binds targets to URL hashes and browser context,
 closes revalidated tabs, captures again to prove the targets are absent, and
 records an ignored audit. The extension creates a temporary pinned inactive
 control tab so it can finish verification after closing the captured tabs, then
-removes that tab through a separate authenticated cleanup.
+removes that tab through a separate authenticated cleanup. When it is the last
+browser tab, a temporary blank handoff keeps the browser alive through the signed
+cleanup POST and is removed immediately after receiver acceptance.
 The fresh archive plan also hashes and closes any full-page TabAtlas popup as an
 operational target; it never enters the user's accepted library.
 

@@ -18,25 +18,26 @@ close operation is verified.
 The ongoing library cycle is implemented:
 
 ```text
-fresh capture -> stage unseen canonical resources -> user review -> accept or
-dismiss -> enrich and reconsider the accepted library -> report -> optional
-verified duplicate cleanup or captured-tab archive
+fresh capture -> stage unseen canonical resources -> semantic review by the user
+or delegated Codex lead -> accept or dismiss -> enrich and reconsider the
+accepted library -> report -> optional verified duplicate cleanup or
+captured-tab archive
 ```
 
 Current ignored local data:
 
-- 638 accepted durable resources. The user's exact 15-resource review batch was
-  accepted on 2026-07-20 and the report was regenerated.
-- Nine resources are staged with decision summaries. The recommended split is
-  to accept the Drive dashboard, official NZ road code, and Kimi quota page, and
-  dismiss the closed Seedance search, Chrome extension-manager page, and four
-  transient Dougong E2E URLs. No recommendation has been applied without the
-  user's approval.
-- Last trusted capture: 232 Chrome tabs and 501 Edge tabs, yielding 732
-  catalogued current tab instances, 625 current canonical resources, 18 browser
-  groups, and 74 policy-safe exact duplicate extras.
-- The proposed hierarchy adds `Driving & Licensing` and a `New Zealand Driver
-  Licence` project; these memberships remain staged with their resources.
+- 654 accepted durable resources and 12 reviewed dismissals. All discovery
+  batches from the 2026-07-20 session were resolved, summarized, and mapped
+  before closure; no discoveries remain pending.
+- The verified normal-profile archive closed 745 captured tabs: 230 in Chrome
+  and 515 in Edge. It retained 628 distinct open accepted resources, closed six
+  reviewed dismissal tabs, and removed one extension-owned operational page.
+- The post-archive inventory contains zero ordinary tabs, zero current resources,
+  zero groups, and zero remaining archive targets. Both browser processes exited
+  normally after their final control tabs closed.
+- The durable hierarchy includes `Driving & Licensing`, `New Zealand Driver
+  Licence`, current AI model and pricing research, coding-agent workflows,
+  document and visual retrieval, 3D production, and voxel-generation benchmarks.
 - Focus-level organization now includes the newly useful tactical-RPG,
   AI-assisted game-development, survival-systems, and traditional-joinery cuts.
 - 316 resources have cached public preview evidence.
@@ -91,18 +92,29 @@ capture-compatible so an older installed worker can refresh without manual
 intervention. Every tab-closing path requires protocol 4 before a mutation
 receiver starts; there is no legacy fallback for browser mutation.
 
-Extension build 0.4.1 exposes the loaded manifest version and protocol in the
+Extension build 0.4.2 exposes the loaded manifest version and protocol in the
 popup's **Build** row. This distinguishes an extension-manager restart from the
 popup's passive polling switch and makes stale-worker recovery observable.
+The final control cleanup now creates a temporary blank handoff tab when the
+control page is the browser's last tab. This keeps the service worker alive long
+enough to submit and verify the signed cleanup result, then removes the handoff.
 
 ## Verification Checkpoint
 
 - 29 Python behavior and receiver integration tests pass.
 - Three independent Node protocol tests pass.
+- Normal Chrome and Edge archive: 745 planned, 745 reported closed, zero skipped,
+  both post-captures verified, raw evidence retained, backup integrity `ok`, and
+  catalog integrity `ok`.
+- The original real-run cleanup report timed out after both browsers exited on
+  their last control tabs. External end-state evidence records no Chrome or Edge
+  process, no receiver, zero ordinary tabs, and zero remaining closure targets;
+  the original audit remains unchanged and truthfully records the missing final
+  report.
 - Disposable bundled Chromium archive: 6 planned, 6 closed, zero skipped,
-  post-capture verified, control cleanup complete.
+  post-capture verified, handoff control cleanup complete on build 0.4.2.
 - Disposable installed Edge archive: 6 planned, 6 closed, zero skipped,
-  post-capture verified, control cleanup complete.
+  post-capture verified, handoff control cleanup complete on build 0.4.2.
 - Both archive runs covered accepted retention, an explicitly reviewed discard,
   and closure of the extension-owned popup before final control cleanup.
 - Disposable Chromium and installed Edge duplicate cleanup: two extras closed in
@@ -111,10 +123,8 @@ popup's passive polling switch and makes stale-worker recovery observable.
   an isolated headless profile (`ERR_BLOCKED_BY_CLIENT`). The Chrome protocol is
   covered by bundled Chromium; the normal installed extension remains the live
   Chrome acceptance path.
-- Normal read-only acceptance captured 232 Chrome tabs and 501 Edge tabs through
-  the ordinary receiver with no diagnostic override and no missed browser.
-- Both normal workers now report protocol 4. No normal tab has yet been mutated;
-  the nine-resource review batch remains the deliberate archive gate.
+- Both normal workers reported protocol 4 immediately before the archive. The
+  prepared unpacked extension is now build 0.4.2 for the next browser start.
 
 ## Repository Checkpoint
 
@@ -162,20 +172,19 @@ prompt is authoritative. Data or code is reused only after a fresh safety review
 
 ## Next Actions
 
-1. Ask the user to approve or change the exact proposed three-accept/six-dismiss
-   split for the nine staged resources.
-2. Apply only that decision, regenerate the report, and refresh both browsers.
-3. Require zero pending discoveries and protocol 4, then preview archive-all with
-   `--include-dismissed` and report retained, discarded, operational, and total
-   closure counts.
-4. Execute the user's approved, backed-up archive only if the fresh scope is
-   unchanged; changed or newly opened tabs must block or be preserved.
-5. Verify the durable library, post-close captures, backup, ignored audit, clean
-   worktree, and pushed draft PR.
+1. On the next user request, start the one-shot receiver and capture whichever
+   paired browsers are running.
+2. Let Codex apply the user's delegated semantic policy: retain plausible durable
+   value and dismiss only clear duplicates, transient navigation, test artifacts,
+   or contextless pages.
+3. Reconsider new resources with the full accepted library, regenerate the
+   report, and present the resulting hierarchy and retrieval paths.
+4. Archive again only when requested, after a fresh stable capture, zero pending
+   discoveries, protocol 4, exact preview, backup, and post-verification.
 
 ## Current Constraint
 
-Both normal pairings are enabled and protocol 4 is verified. The remaining live
-dependency is the user's decision on the exact nine-resource review batch. Until
-that decision is received, no normal tab will be closed and no candidate will be
-silently promoted or discarded.
+There is no active closure or review blocker. Chrome and Edge are closed, the
+receiver is stopped, and private state is durable. On the next browser use,
+confirm the popup reports build 0.4.2 before any mutation; read-only capture can
+still diagnose a stale worker without touching tabs.

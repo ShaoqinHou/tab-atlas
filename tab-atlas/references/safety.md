@@ -64,7 +64,9 @@ Archive-all additionally requires:
 6. A newer trusted receiver capture, identified by its exact capture ID, proving
    every target was both reported closed and absent.
 7. Separate authenticated removal of the control tab, including the actual close
-   outcome, and retained audit evidence.
+   outcome and retained audit evidence. If it is the final browser tab, keep a
+   temporary blank handoff open until the receiver accepts that signed outcome,
+   then remove the handoff.
 
 Stop on stale targets, missing evidence, skipped closures, incomplete post-capture,
 or failed control-tab cleanup. Do not report the archive as complete. Never infer

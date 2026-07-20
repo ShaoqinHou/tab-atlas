@@ -108,7 +108,10 @@ and archive commands require protocol 4 and fail before mutation with a precise
 reload instruction. After `prepare-extension` changes the unpacked source, click
 **Reload** once on TabAtlas Bridge in `chrome://extensions` and
 `edge://extensions`; restarting the browsers does not reliably refresh an
-already registered unpacked worker.
+already registered unpacked worker. The popup's **Build** row shows the code the
+browser actually loaded, for example `v0.4.1 / protocol 4`. If **Reload** leaves
+an older value active, toggle the TabAtlas Bridge extension-manager card off and
+on; do not confuse that manager control with the popup's passive-mode switch.
 
 The receiver is started on demand, binds only to `127.0.0.1`, and exits after the
 requested operation. Nothing is scheduled with Windows. A closed browser keeps

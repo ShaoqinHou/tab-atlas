@@ -3,6 +3,7 @@ const elements = {
   mode: document.getElementById("mode"),
   modeLabel: document.getElementById("modeLabel"),
   pairing: document.getElementById("pairing"),
+  build: document.getElementById("build"),
   lastCapture: document.getElementById("lastCapture"),
   pairPanel: document.getElementById("pairPanel"),
   code: document.getElementById("code"),
@@ -71,6 +72,9 @@ function render(value) {
   elements.mode.checked = mode;
   elements.modeLabel.textContent = mode ? "ON" : "OFF";
   elements.pairing.textContent = value.paired ? "Paired" : "Unpaired";
+  elements.build.textContent = value.version && value.protocolVersion
+    ? `v${value.version} / protocol ${value.protocolVersion}`
+    : "Unavailable";
   elements.lastCapture.textContent = value.lastCaptureAt ? new Date(value.lastCaptureAt).toLocaleString() : "Never";
   elements.pairPanel.hidden = Boolean(value.paired);
   elements.mode.disabled = !value.paired;

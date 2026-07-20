@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { chromium } = loadPlaywright();
 const EXTENSION = path.join(ROOT, "state", "extension");
+const EXTENSION_MANIFEST = JSON.parse(fs.readFileSync(path.join(ROOT, "assets", "extension", "manifest.json"), "utf8"));
 const EXTENSION_ID = "ohgpplkophdikjnbefigdhikdooehmkh";
 const PYTHON = process.env.PYTHON || "python";
 const TARGETS = {
@@ -64,6 +65,9 @@ async function exerciseBrowser(browser, selectedOperation) {
   try {
     const popup = await context.newPage();
     await popup.goto(`chrome-extension://${EXTENSION_ID}/popup.html`, { timeout: 20_000 });
+    await popup.locator("#build")
+      .filter({ hasText: `v${EXTENSION_MANIFEST.version} / protocol 4` })
+      .waitFor({ timeout: 20_000 });
     let worker = context.serviceWorkers().find(value => value.url().includes(EXTENSION_ID));
     if (!worker) {
       worker = await context.waitForEvent("serviceworker", {

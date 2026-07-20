@@ -75,6 +75,8 @@ async function getStatus() {
   const alarm = await chrome.alarms.get(POLL_ALARM);
   return {
     ok: true,
+    version: chrome.runtime.getManifest().version,
+    protocolVersion: PROTOCOL_VERSION,
     mode: stored[KEYS.mode] === "on" ? "on" : "off",
     paired: typeof stored[KEYS.key] === "string" && stored[KEYS.key].length === 64,
     browser: inferBrowser(),

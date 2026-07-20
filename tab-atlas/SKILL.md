@@ -117,7 +117,10 @@ Pairing status includes `protocol_version`. A headerless protocol-2 worker may
 perform read-only capture for continuity. Never send a mutation through that
 compatibility path. Duplicate cleanup, archive, and archive-control cleanup all
 require protocol 4; tell the user to click **Reload** on TabAtlas Bridge in that
-browser's extension manager, refresh, and verify protocol 4 first.
+browser's extension manager, then confirm the popup's **Build** row says
+`protocol 4` and refresh. If the worker remains stale, have the user toggle the
+extension-manager card off and on. That manager control restarts the extension;
+the popup's ON/OFF switch only controls passive polling.
 
 Revoke a capability with:
 

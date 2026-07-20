@@ -25,16 +25,19 @@ verified duplicate cleanup or captured-tab archive
 
 Current ignored local data:
 
-- 623 accepted durable resources.
-- 11 newly discovered resources are staged with concise summaries and proposed
-  hierarchy, awaiting the user's accept or dismiss decision.
-- Last trusted inventory: 723 tab instances, 617 current canonical resources,
-  17 browser groups, and 74 policy-safe exact duplicate extras.
-- Six Spaces, 24 Topics, 49 Focuses, and four Project overlays.
+- 638 accepted durable resources. The user's exact 15-resource review batch was
+  accepted on 2026-07-20 and the report was regenerated.
+- One later Edge discovery, a Google search for `seedance ai`, is staged with a
+  concise summary and hierarchy. It remains pending; the recommendation is to
+  dismiss the search page because stronger Seedance sources are already stored.
+- Last trusted capture: 227 Chrome tabs and 500 Edge tabs, yielding 726
+  catalogued current tab instances, 620 current canonical resources, 17 browser
+  groups, and 74 policy-safe exact duplicate extras.
+- The hierarchy contains 98 collections, including six Spaces, 25 Topics, 50
+  Focuses, and five Project overlays.
 - Focus-level organization now includes the newly useful tactical-RPG,
   AI-assisted game-development, survival-systems, and traditional-joinery cuts.
-- 316 resources have cached public preview evidence, including all six staged
-  YouTube discoveries.
+- 316 resources have cached public preview evidence.
 - 99 accepted resources remain unclassified because their evidence is generic,
   private, authenticated, local, or otherwise too weak for a responsible guess.
 - Schema version 7, SQLite integrity `ok`, and zero foreign-key violations.
@@ -79,6 +82,10 @@ capture-compatible so an older installed worker can refresh without manual
 intervention. Every tab-closing path requires protocol 4 before a mutation
 receiver starts; there is no legacy fallback for browser mutation.
 
+Extension build 0.4.1 exposes the loaded manifest version and protocol in the
+popup's **Build** row. This distinguishes an extension-manager restart from the
+popup's passive polling switch and makes stale-worker recovery observable.
+
 ## Verification Checkpoint
 
 - 29 Python behavior and receiver integration tests pass.
@@ -93,7 +100,7 @@ receiver starts; there is no legacy fallback for browser mutation.
   an isolated headless profile (`ERR_BLOCKED_BY_CLIENT`). The Chrome protocol is
   covered by bundled Chromium; the normal installed extension remains the live
   Chrome acceptance path.
-- Normal read-only acceptance captured 226 Chrome tabs and 498 Edge tabs through
+- Normal read-only acceptance captured 227 Chrome tabs and 500 Edge tabs through
   the ordinary receiver with no diagnostic override and no missed browser.
 - Both normal workers currently report protocol 2. No normal tab has been
   mutated; protocol 4 is deliberately required before that can occur.
@@ -144,22 +151,22 @@ prompt is authoritative. Data or code is reused only after a fresh safety review
 
 ## Next Actions
 
-1. Ask the user to accept or dismiss the exact 11-resource staged batch. Do not
-   silently include a later discovery.
-2. In each browser's extension manager, click **Reload** once on TabAtlas Bridge,
-   then refresh and verify both pairings report protocol 4.
-3. Mark accepted collection proposals as reviewed, reconsider any newly affected
-   existing memberships, and regenerate the report.
-4. Preview archive-all against another fresh capture. Execute only after explicit
-   approval for that current browser and closure count; changed or newly opened
-   tabs must block or be preserved.
+1. Ask the user to accept or dismiss the one staged `seedance ai` search page. Do
+   not silently include it in the already approved 15-resource batch.
+2. In each browser's extension manager, toggle the TabAtlas Bridge card off and
+   on, then confirm the popup says `v0.4.1 / protocol 4`.
+3. Refresh both browsers and require zero pending discoveries plus protocol 4.
+4. Preview archive-all against that fresh capture. Execute the user's approved,
+   backed-up archive only if the fresh scope is unchanged; changed or newly
+   opened tabs must block or be preserved.
 5. Verify the durable library, post-close captures, backup, ignored audit, clean
    worktree, and pushed draft PR.
 
 ## Current Constraint
 
-Both normal pairings are enabled and read-only refresh now succeeds, including
-legacy response-proof compatibility. Their workers still report protocol 2 after
-a full browser restart, so tab mutation is intentionally blocked. The remaining
-live dependency is one explicit **Reload** click for TabAtlas Bridge in each
-browser's extension manager, followed by a protocol-4 refresh.
+Both normal pairings are enabled and read-only refresh succeeds. Their workers
+still report protocol 2 after the user's first reload attempt, so tab mutation is
+intentionally blocked. The remaining live dependencies are the user's decision
+on the single later Seedance search candidate and an explicit off/on restart of
+the TabAtlas Bridge card in each extension manager, followed by a protocol-4
+refresh.

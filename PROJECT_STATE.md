@@ -27,14 +27,16 @@ Current ignored local data:
 
 - 638 accepted durable resources. The user's exact 15-resource review batch was
   accepted on 2026-07-20 and the report was regenerated.
-- One later Edge discovery, a Google search for `seedance ai`, is staged with a
-  concise summary and hierarchy. It remains pending; the recommendation is to
-  dismiss the search page because stronger Seedance sources are already stored.
-- Last trusted capture: 227 Chrome tabs and 500 Edge tabs, yielding 726
-  catalogued current tab instances, 620 current canonical resources, 17 browser
+- Nine resources are staged with decision summaries. The recommended split is
+  to accept the Drive dashboard, official NZ road code, and Kimi quota page, and
+  dismiss the closed Seedance search, Chrome extension-manager page, and four
+  transient Dougong E2E URLs. No recommendation has been applied without the
+  user's approval.
+- Last trusted capture: 232 Chrome tabs and 501 Edge tabs, yielding 732
+  catalogued current tab instances, 625 current canonical resources, 18 browser
   groups, and 74 policy-safe exact duplicate extras.
-- The hierarchy contains 98 collections, including six Spaces, 25 Topics, 50
-  Focuses, and five Project overlays.
+- The proposed hierarchy adds `Driving & Licensing` and a `New Zealand Driver
+  Licence` project; these memberships remain staged with their resources.
 - Focus-level organization now includes the newly useful tactical-RPG,
   AI-assisted game-development, survival-systems, and traditional-joinery cuts.
 - 316 resources have cached public preview evidence.
@@ -67,7 +69,8 @@ for post-action verification.
 
 Archive-all additionally requires:
 
-1. No pending or dismissed live resources.
+1. No pending resources. Dismissed live resources block by default and require a
+   separate `--include-dismissed` opt-in after explicit review.
 2. Durable accepted records and raw capture evidence.
 3. Catalog integrity and an integrity-checked private SQLite backup.
 4. Every planned target reported closed and absent from the post-capture.
@@ -76,6 +79,12 @@ Archive-all additionally requires:
 The extension tracks URL-changing navigation during archive execution and skips
 changed targets. Its control-tab ID is persisted for recovery if a service worker
 terminates before normal cleanup.
+
+Accepted archive targets are retained in the durable library. Explicitly reviewed
+dismissals may be closed as audited discards without being promoted into the
+library. A full-page TabAtlas popup is hidden from discovery and bound to the same
+fresh archive plan as an operational target, so the workflow does not leave its
+own setup tab behind.
 
 Pairings now record authenticated worker protocol versions. Protocol 2 remains
 capture-compatible so an older installed worker can refresh without manual
@@ -90,20 +99,22 @@ popup's passive polling switch and makes stale-worker recovery observable.
 
 - 29 Python behavior and receiver integration tests pass.
 - Three independent Node protocol tests pass.
-- Disposable bundled Chromium archive: 5 planned, 5 closed, zero skipped,
+- Disposable bundled Chromium archive: 6 planned, 6 closed, zero skipped,
   post-capture verified, control cleanup complete.
-- Disposable installed Edge archive: 5 planned, 5 closed, zero skipped,
+- Disposable installed Edge archive: 6 planned, 6 closed, zero skipped,
   post-capture verified, control cleanup complete.
+- Both archive runs covered accepted retention, an explicitly reviewed discard,
+  and closure of the extension-owned popup before final control cleanup.
 - Disposable Chromium and installed Edge duplicate cleanup: two extras closed in
   each browser, zero skipped, keeper and post-capture verified.
 - Installed Chrome still blocks command-line loading of the unpacked extension in
   an isolated headless profile (`ERR_BLOCKED_BY_CLIENT`). The Chrome protocol is
   covered by bundled Chromium; the normal installed extension remains the live
   Chrome acceptance path.
-- Normal read-only acceptance captured 227 Chrome tabs and 500 Edge tabs through
+- Normal read-only acceptance captured 232 Chrome tabs and 501 Edge tabs through
   the ordinary receiver with no diagnostic override and no missed browser.
-- Both normal workers currently report protocol 2. No normal tab has been
-  mutated; protocol 4 is deliberately required before that can occur.
+- Both normal workers now report protocol 4. No normal tab has yet been mutated;
+  the nine-resource review batch remains the deliberate archive gate.
 
 ## Repository Checkpoint
 
@@ -151,22 +162,20 @@ prompt is authoritative. Data or code is reused only after a fresh safety review
 
 ## Next Actions
 
-1. Ask the user to accept or dismiss the one staged `seedance ai` search page. Do
-   not silently include it in the already approved 15-resource batch.
-2. In each browser's extension manager, toggle the TabAtlas Bridge card off and
-   on, then confirm the popup says `v0.4.1 / protocol 4`.
-3. Refresh both browsers and require zero pending discoveries plus protocol 4.
-4. Preview archive-all against that fresh capture. Execute the user's approved,
-   backed-up archive only if the fresh scope is unchanged; changed or newly
-   opened tabs must block or be preserved.
+1. Ask the user to approve or change the exact proposed three-accept/six-dismiss
+   split for the nine staged resources.
+2. Apply only that decision, regenerate the report, and refresh both browsers.
+3. Require zero pending discoveries and protocol 4, then preview archive-all with
+   `--include-dismissed` and report retained, discarded, operational, and total
+   closure counts.
+4. Execute the user's approved, backed-up archive only if the fresh scope is
+   unchanged; changed or newly opened tabs must block or be preserved.
 5. Verify the durable library, post-close captures, backup, ignored audit, clean
    worktree, and pushed draft PR.
 
 ## Current Constraint
 
-Both normal pairings are enabled and read-only refresh succeeds. Their workers
-still report protocol 2 after the user's first reload attempt, so tab mutation is
-intentionally blocked. The remaining live dependencies are the user's decision
-on the single later Seedance search candidate and an explicit off/on restart of
-the TabAtlas Bridge card in each extension manager, followed by a protocol-4
-refresh.
+Both normal pairings are enabled and protocol 4 is verified. The remaining live
+dependency is the user's decision on the exact nine-resource review batch. Until
+that decision is received, no normal tab will be closed and no candidate will be
+silently promoted or discarded.

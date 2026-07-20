@@ -170,6 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     archive_parser.add_argument("--browser", choices=["all", "chrome", "edge"], default="all")
     archive_parser.add_argument("--execute", action="store_true")
+    archive_parser.add_argument(
+        "--include-dismissed",
+        action="store_true",
+        help="Close explicitly reviewed dismissed tabs as audited discards",
+    )
     archive_parser.add_argument("--approval", default="")
     archive_parser.add_argument("--timeout", type=int, default=240)
 
@@ -499,7 +504,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "archive-tabs":
             targets = {"chrome", "edge"} if args.browser == "all" else {args.browser}
             if not args.execute:
-                plan = build_archive_plan(connection, targets)
+                plan = build_archive_plan(
+                    connection,
+                    targets,
+                    include_dismissed=args.include_dismissed,
+                )
                 output(_archive_output(plan))
                 return 0
             approval_scope = args.approval.strip() or _load_archive_approval(state_dir)
@@ -529,6 +538,7 @@ def main(argv: list[str] | None = None) -> int:
                 connection,
                 targets,
                 {browser: result["id"] for browser, result in pre_captures.items()},
+                include_dismissed=args.include_dismissed,
             )
             if plan["summary"]["pendingDiscoveryCount"]:
                 output({
@@ -539,12 +549,16 @@ def main(argv: list[str] | None = None) -> int:
                     "nextCommand": "tab-atlas discoveries",
                 })
                 return 1
-            if plan["summary"]["dismissedOpenResourceCount"]:
+            if (
+                plan["summary"]["dismissedOpenResourceCount"]
+                and not plan["summary"]["includeDismissed"]
+            ):
                 output({
                     **_archive_output(plan),
                     "complete": False,
                     "executed": False,
                     "phase": "dismissed_tabs_open",
+                    "nextCommand": "tab-atlas archive-tabs --include-dismissed",
                 })
                 return 1
             if not plan["summary"]["plannedClosures"]:
@@ -636,6 +650,8 @@ def main(argv: list[str] | None = None) -> int:
                 "closed": totals["closed"],
                 "skipped": totals["skipped"],
                 "archivedResources": totals["archivedResources"],
+                "discardedResources": totals["discardedResources"],
+                "operationalResources": totals["operationalResources"],
                 "postVerifiedBrowsers": totals["verifiedBrowsers"],
                 "postCaptureComplete": post_complete,
                 "auditPath": str(evidence_path),

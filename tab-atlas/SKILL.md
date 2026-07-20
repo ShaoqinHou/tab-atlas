@@ -135,6 +135,7 @@ Preview first:
 
 ```powershell
 python scripts/tab_atlas.py archive-tabs --browser all
+python scripts/tab_atlas.py archive-tabs --browser all --include-dismissed
 ```
 
 Execution requires a one-run approval or a private revocable standing approval:
@@ -142,15 +143,21 @@ Execution requires a one-run approval or a private revocable standing approval:
 ```powershell
 python scripts/tab_atlas.py archive-approval grant --scope "<bounded scope>"
 python scripts/tab_atlas.py archive-tabs --browser all --execute
+python scripts/tab_atlas.py archive-tabs --browser all --include-dismissed --execute --approval "<scope naming retained and discarded counts>"
 python scripts/tab_atlas.py archive-approval revoke
 ```
 
-The protocol performs a fresh capture, blocks while pending or dismissed live
-items exist, verifies catalog integrity and a private backup, binds targets to URL
-hashes and browser context, closes revalidated tabs, captures again to prove the
-targets are absent, and records an ignored audit. The extension creates a
-temporary pinned inactive control tab so it can finish verification after closing
-the captured tabs, then removes that tab through a separate authenticated cleanup.
+The protocol performs a fresh capture and always blocks while pending discoveries
+exist. Dismissed live items also block unless the user separately approves their
+closure and the operator supplies `--include-dismissed`; those targets are audited
+as discards and never enter the accepted library. The protocol verifies catalog
+integrity and a private backup, binds targets to URL hashes and browser context,
+closes revalidated tabs, captures again to prove the targets are absent, and
+records an ignored audit. The extension creates a temporary pinned inactive
+control tab so it can finish verification after closing the captured tabs, then
+removes that tab through a separate authenticated cleanup.
+The fresh archive plan also hashes and closes any full-page TabAtlas popup as an
+operational target; it never enters the user's accepted library.
 
 Exact duplicates retain their own conservative preview and approval flow:
 

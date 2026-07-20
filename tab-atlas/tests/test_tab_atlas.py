@@ -160,7 +160,7 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(after["pendingDiscoveries"], 0)
             self.assertEqual({item["libraryState"] for item in accepted}, {"accepted"})
 
-    def test_archive_plan_blocks_unreviewed_and_dismissed_resources(self) -> None:
+    def test_archive_plan_blocks_unreviewed_and_requires_opt_in_for_dismissed_resources(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
             connection = connect(state / "atlas.sqlite")
@@ -195,11 +195,29 @@ class CatalogTests(unittest.TestCase):
             )
 
             plan = build_archive_plan(connection, {"edge"})
+            discard_plan = build_archive_plan(
+                connection,
+                {"edge"},
+                include_dismissed=True,
+            )
             connection.close()
 
             self.assertEqual(plan["summary"]["plannedClosures"], 1)
             self.assertEqual(plan["summary"]["pendingDiscoveryCount"], 1)
             self.assertEqual(plan["summary"]["dismissedOpenResourceCount"], 1)
+            self.assertEqual(plan["summary"]["plannedDiscardedClosures"], 0)
+            self.assertFalse(plan["summary"]["includeDismissed"])
+            self.assertEqual(discard_plan["summary"]["plannedClosures"], 2)
+            self.assertEqual(discard_plan["summary"]["plannedRetainedClosures"], 1)
+            self.assertEqual(discard_plan["summary"]["plannedDiscardedClosures"], 1)
+            self.assertTrue(discard_plan["summary"]["includeDismissed"])
+            self.assertEqual(
+                {
+                    target["retention"]
+                    for target in discard_plan["browsers"]["edge"]["targets"]
+                },
+                {"retain", "discard"},
+            )
             self.assertNotIn("https://", json.dumps(plan))
 
     def test_dismissed_discovery_can_be_listed_and_restored_explicitly(self) -> None:
@@ -504,11 +522,35 @@ class CatalogTests(unittest.TestCase):
                     "tabs": [
                         {"id": 1, "windowId": 1, "index": 0, "groupId": -1, "active": True, "title": "Web", "url": "https://example.com/a"},
                         {"id": 2, "windowId": 1, "index": 1, "groupId": -1, "pinned": True, "title": "Local", "url": "file:///C:/reference.txt"},
+                        {"id": 3, "windowId": 1, "index": 2, "groupId": -1, "title": "Discard", "url": "https://example.com/discard"},
+                        {"id": 4, "windowId": 1, "index": 3, "groupId": -1, "title": "TabAtlas", "url": f"chrome-extension://{EXPECTED_EXTENSION_ID}/popup.html"},
                     ],
                 },
                 "test",
+                new_resource_state="candidate",
             )
-            plan = build_archive_plan(connection, {"chrome"})
+            pending = {
+                item["canonicalUrl"]: item["resourceId"]
+                for item in discovery_resources(connection)
+            }
+            set_discovery_state(
+                connection,
+                "accepted",
+                {
+                    pending["https://example.com/a"],
+                    pending["file:///C:/reference.txt"],
+                },
+            )
+            set_discovery_state(
+                connection,
+                "dismissed",
+                {pending["https://example.com/discard"]},
+            )
+            plan = build_archive_plan(
+                connection,
+                {"chrome"},
+                include_dismissed=True,
+            )
             evidence_path = record_archive_plan(
                 connection,
                 state,
@@ -534,7 +576,7 @@ class CatalogTests(unittest.TestCase):
             )
             results = {
                 "chrome": {
-                    "closedCount": 2,
+                    "closedCount": 4,
                     "skippedCount": 0,
                     "controlTabId": 99,
                     "controlWindowId": 1,
@@ -553,22 +595,36 @@ class CatalogTests(unittest.TestCase):
             )
             library = library_resources(connection)
             live = current_resources(connection)
-            statuses = {row["status"] for row in connection.execute("SELECT status FROM resources WHERE canonical_url NOT LIKE 'chrome-extension:%'")}
+            statuses = {
+                row["library_state"]: row["status"]
+                for row in connection.execute(
+                    "SELECT library_state, status FROM resources "
+                    "WHERE canonical_url NOT LIKE 'chrome-extension:%'"
+                )
+            }
             connection.close()
 
-            self.assertEqual(plan["summary"]["plannedClosures"], 2)
+            self.assertEqual(plan["summary"]["plannedClosures"], 4)
+            self.assertEqual(plan["summary"]["plannedRetainedClosures"], 2)
+            self.assertEqual(plan["summary"]["plannedDiscardedClosures"], 1)
+            self.assertEqual(plan["summary"]["plannedOperationalClosures"], 1)
             self.assertNotIn("https://", json.dumps(plan))
             self.assertNotIn("file:///", json.dumps(plan))
-            self.assertEqual(totals["closed"], 2)
+            self.assertEqual(totals["closed"], 4)
             self.assertEqual(totals["verifiedBrowsers"], 1)
             self.assertEqual(totals["archivedResources"], 2)
+            self.assertEqual(totals["discardedResources"], 1)
+            self.assertEqual(totals["operationalResources"], 1)
             self.assertEqual(live, [])
             self.assertEqual(len(library), 2)
-            self.assertEqual(statuses, {"saved"})
+            self.assertEqual(statuses, {"accepted": "saved", "dismissed": "archived"})
             evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
             backup_path = state / evidence["durability"]["backupPath"]
             self.assertTrue(backup_path.is_file())
             self.assertEqual(evidence["durability"]["catalogIntegrity"], "ok")
+            self.assertEqual(evidence["durability"]["durableResourceCount"], 2)
+            self.assertEqual(evidence["durability"]["reviewedDiscardResourceCount"], 1)
+            self.assertEqual(evidence["durability"]["operationalResourceCount"], 1)
             self.assertNotIn("example.com", evidence_path.read_text(encoding="utf-8"))
 
     def test_archive_finalization_rejects_unknown_post_capture(self) -> None:

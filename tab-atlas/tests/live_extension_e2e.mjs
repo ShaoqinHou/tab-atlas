@@ -120,15 +120,24 @@ async function exerciseBrowser(browser, selectedOperation) {
         "discoveries", "--limit", "100"
       ]).completed());
       assert.ok(discoveryResult.total >= 2);
+      const dismissedResourceId = discoveryResult.resources[0]?.resourceId;
+      assert.match(String(dismissedResourceId || ""), /^res_[a-f0-9]{24}$/);
+      const dismissalResult = parseTrailingJson(await startCli(stateDir, [
+        "dismiss", "--resource-id", dismissedResourceId
+      ]).completed());
+      assert.equal(dismissalResult.updated, 1);
       const acceptanceResult = parseTrailingJson(await startCli(stateDir, [
         "accept", "--all"
       ]).completed());
-      assert.ok(acceptanceResult.updated >= discoveryResult.total);
+      assert.ok(acceptanceResult.updated >= discoveryResult.total - 1);
       assert.equal(acceptanceResult.inventory.pendingDiscoveries, 0);
     }
 
     const command = selectedOperation === "archive"
-      ? ["archive-tabs", "--browser", protocolBrowser, "--execute", "--timeout", "90"]
+      ? [
+          "archive-tabs", "--browser", protocolBrowser, "--include-dismissed",
+          "--execute", "--timeout", "90"
+        ]
       : ["dedupe", "--browser", protocolBrowser, "--execute", "--timeout", "60"];
     const operationProcess = startCli(stateDir, command);
     await pollReceiverFromPopup(popup, operationProcess, 240_000);
@@ -140,9 +149,14 @@ async function exerciseBrowser(browser, selectedOperation) {
     const livePages = context.pages().filter(page => !page.isClosed());
     if (selectedOperation === "archive") {
       assert.ok(operationResult.closed >= 4);
+      assert.ok(operationResult.summary.plannedDiscardedClosures >= 1);
+      assert.ok(operationResult.discardedResources >= 1);
+      assert.ok(operationResult.summary.plannedOperationalClosures >= 1);
+      assert.ok(operationResult.operationalResources >= 1);
       assert.equal(operationResult.archiveVerified, true);
       assert.equal(operationResult.controlCleanupComplete, true);
       assert.equal(livePages.filter(page => /^https?:/i.test(page.url())).length, 0);
+      assert.equal(livePages.filter(page => page.url().endsWith("popup.html")).length, 0);
       assert.equal(livePages.filter(page => page.url().endsWith("archive_complete.html")).length, 0);
     } else {
       assert.equal(operationResult.closed, 2);
@@ -175,10 +189,12 @@ async function pollReceiverFromPopup(popup, child, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (!child.exited()) {
     if (Date.now() > deadline) throw new Error(`Timed out polling receiver.\n${child.output()}`);
-    await popup.bringToFront();
-    const button = popup.locator("#capture");
-    if (await button.isEnabled().catch(() => false)) {
-      await button.click().catch(() => {});
+    if (!popup.isClosed()) {
+      await popup.bringToFront();
+      const button = popup.locator("#capture");
+      if (await button.isEnabled().catch(() => false)) {
+        await button.click().catch(() => {});
+      }
     }
     await new Promise(resolve => setTimeout(resolve, 900));
   }

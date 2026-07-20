@@ -148,16 +148,21 @@ python scripts/tab_atlas.py dedupe --browser all
 python scripts/tab_atlas.py dedupe --browser all --execute --approval "<bounded scope>"
 ```
 
-Archive-all closes only accepted resources from the exact fresh receiver capture.
-It blocks on pending or dismissed live resources, verifies raw evidence and
-catalog integrity, creates an integrity-checked private backup, revalidates every
-tab immediately before closure, captures again, and requires every planned tab
-to be both reported closed and absent. A temporary extension-owned control tab
-keeps verification alive and is removed through a separate authenticated result.
+Archive-all always blocks on pending discoveries. By default it also blocks on
+dismissed live resources. After the user explicitly reviews those dismissals,
+`--include-dismissed` closes them as audited discards while accepted resources
+remain in the durable library. The command verifies raw evidence and catalog
+integrity, creates an integrity-checked private backup, revalidates every tab
+immediately before closure, captures again, and requires every planned tab to be
+both reported closed and absent. A temporary extension-owned control tab keeps
+verification alive and is removed through a separate authenticated result.
+Any pre-existing TabAtlas popup tab is bound to the same fresh plan as an
+operational target, so the workflow does not leave its own setup page behind.
 
 ```powershell
 python scripts/tab_atlas.py archive-tabs --browser all
 python scripts/tab_atlas.py archive-tabs --browser all --execute --approval "<bounded scope>"
+python scripts/tab_atlas.py archive-tabs --browser all --include-dismissed --execute --approval "<scope naming retained and discarded counts>"
 ```
 
 ## Verification

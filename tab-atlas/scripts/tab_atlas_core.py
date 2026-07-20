@@ -727,15 +727,22 @@ def store_snapshot(
             )
             for ordinal, tab in enumerate(normalized["tabs"]):
                 canonical_url, host, kind = canonicalize_url(tab["url"])
-                if canonical_url.startswith(TABATLAS_EXTENSION_URL_PREFIX):
-                    continue
+                is_extension_resource = canonical_url.startswith(TABATLAS_EXTENSION_URL_PREFIX)
                 current_resource_id = resource_id(canonical_url)
-                seen_resources.add(current_resource_id)
+                if not is_extension_resource:
+                    seen_resources.add(current_resource_id)
                 title = tab["title"].strip()
-                if current_resource_id not in new_resources and not connection.execute(
-                    "SELECT 1 FROM resources WHERE id=?", (current_resource_id,)
-                ).fetchone():
+                if (
+                    not is_extension_resource
+                    and current_resource_id not in new_resources
+                    and not connection.execute(
+                        "SELECT 1 FROM resources WHERE id=?", (current_resource_id,)
+                    ).fetchone()
+                ):
                     new_resources.add(current_resource_id)
+                effective_library_state = (
+                    "accepted" if is_extension_resource else new_resource_state
+                )
                 connection.execute(
                     """
                     INSERT INTO resources(
@@ -756,8 +763,10 @@ def store_snapshot(
                         title,
                         normalized["capturedAt"],
                         normalized["capturedAt"],
-                        new_resource_state,
-                        normalized["capturedAt"] if new_resource_state == "accepted" else None,
+                        effective_library_state,
+                        normalized["capturedAt"]
+                        if effective_library_state == "accepted"
+                        else None,
                     ),
                 )
                 group_key = str(tab["groupId"]) if tab.get("groupId") is not None else ""
@@ -871,11 +880,18 @@ def latest_capture_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
 def _resources_for_capture_ids(
     connection: sqlite3.Connection,
     capture_ids: Iterable[str],
+    include_extension_tabs: bool = False,
 ) -> list[dict[str, Any]]:
     capture_ids = [str(value) for value in capture_ids]
     if not capture_ids:
         return []
     placeholders = ",".join("?" for _ in capture_ids)
+    extension_filter = (
+        "" if include_extension_tabs else "AND r.canonical_url NOT LIKE ?"
+    )
+    parameters = [*capture_ids]
+    if not include_extension_tabs:
+        parameters.append(f"{TABATLAS_EXTENSION_URL_PREFIX}%")
     rows = connection.execute(
         f"""
         SELECT t.*, c.captured_at AS observed_at,
@@ -891,10 +907,10 @@ def _resources_for_capture_ids(
         JOIN resources r ON r.id=t.resource_id
         LEFT JOIN resource_previews p ON p.resource_id=r.id
         WHERE t.capture_id IN ({placeholders})
-          AND r.canonical_url NOT LIKE ?
+          {extension_filter}
         ORDER BY t.browser, t.window_id, t.position
         """,
-        [*capture_ids, f"{TABATLAS_EXTENSION_URL_PREFIX}%"],
+        parameters,
     ).fetchall()
 
     collections = defaultdict(list)
@@ -1942,6 +1958,7 @@ def build_archive_plan(
     connection: sqlite3.Connection,
     browsers: set[str],
     capture_ids: dict[str, str] | None = None,
+    include_dismissed: bool = False,
 ) -> dict[str, Any]:
     requested = {normalize_browser(browser) for browser in browsers}
     if not requested or not requested.issubset({"chrome", "edge"}):
@@ -1952,22 +1969,36 @@ def build_archive_plan(
     blocked: list[str] = []
     pending_discovery_ids: set[str] = set()
     dismissed_resource_ids: set[str] = set()
-    resource_ids: set[str] = set()
+    retained_resource_ids: set[str] = set()
+    discarded_resource_ids: set[str] = set()
+    operational_resource_ids: set[str] = set()
     for resource in _resources_for_capture_ids(
         connection,
         [captures[browser]["id"] for browser in sorted(requested)],
+        include_extension_tabs=True,
     ):
         resource_browsers = {
             str(tab.get("browser") or "") for tab in resource["tabs"]
         }
         if not resource_browsers.intersection(requested):
             continue
-        if resource["libraryState"] == "candidate":
+        is_extension_resource = str(resource["canonicalUrl"]).startswith(
+            TABATLAS_EXTENSION_URL_PREFIX
+        )
+        if is_extension_resource:
+            if str(resource["canonicalUrl"]).endswith("/archive_complete.html"):
+                continue
+            retention = "operational"
+        elif resource["libraryState"] == "candidate":
             pending_discovery_ids.add(resource["resourceId"])
             continue
-        if resource["libraryState"] == "dismissed":
+        elif resource["libraryState"] == "dismissed":
             dismissed_resource_ids.add(resource["resourceId"])
-            continue
+            if not include_dismissed:
+                continue
+            retention = "discard"
+        else:
+            retention = "retain"
         for tab in resource["tabs"]:
             browser = str(tab.get("browser") or "")
             if browser not in requested:
@@ -1977,8 +2008,6 @@ def build_archive_plan(
             if tab_id is None:
                 blocked.append(str(tab.get("instanceId") or "unknown"))
                 continue
-            if exact_url.startswith(TABATLAS_EXTENSION_URL_PREFIX):
-                continue
             target = {
                 "targetTabId": tab_id,
                 "expectedUrlHash": hashlib.sha256(exact_url.encode("utf-8")).hexdigest(),
@@ -1986,9 +2015,15 @@ def build_archive_plan(
                 "groupId": str(tab.get("groupId") or ""),
                 "resourceId": resource["resourceId"],
                 "targetInstanceId": tab["instanceId"],
+                "retention": retention,
             }
             targets_by_browser[browser].append(target)
-            resource_ids.add(resource["resourceId"])
+            if retention == "discard":
+                discarded_resource_ids.add(resource["resourceId"])
+            elif retention == "operational":
+                operational_resource_ids.add(resource["resourceId"])
+            else:
+                retained_resource_ids.add(resource["resourceId"])
     if blocked:
         raise ValueError(f"Archive plan contains {len(blocked)} tab(s) without stable numeric IDs")
 
@@ -2008,13 +2043,34 @@ def build_archive_plan(
     plan = {
         "schemaVersion": 1,
         "action": "archive_captured_tabs",
-        "policy": "close only tabs present in the fresh trusted capture after exact URL and context revalidation",
+        "policy": "close only freshly captured tabs after exact URL and context revalidation; retain accepted resources, discard only explicitly reviewed dismissals, and remove extension-owned operational pages",
         "requestId": request_id,
         "createdAt": utc_now(),
         "browsers": browser_plans,
         "summary": {
             "plannedClosures": sum(len(item["targets"]) for item in browser_plans.values()),
-            "resourceCount": len(resource_ids),
+            "resourceCount": len(
+                retained_resource_ids | discarded_resource_ids | operational_resource_ids
+            ),
+            "retainedResourceCount": len(retained_resource_ids),
+            "discardedResourceCount": len(discarded_resource_ids),
+            "operationalResourceCount": len(operational_resource_ids),
+            "plannedRetainedClosures": sum(
+                target["retention"] == "retain"
+                for item in browser_plans.values()
+                for target in item["targets"]
+            ),
+            "plannedDiscardedClosures": sum(
+                target["retention"] == "discard"
+                for item in browser_plans.values()
+                for target in item["targets"]
+            ),
+            "plannedOperationalClosures": sum(
+                target["retention"] == "operational"
+                for item in browser_plans.values()
+                for target in item["targets"]
+            ),
+            "includeDismissed": bool(include_dismissed),
             "pendingDiscoveryCount": len(pending_discovery_ids),
             "pendingDiscoveryIds": sorted(pending_discovery_ids),
             "dismissedOpenResourceCount": len(dismissed_resource_ids),
@@ -2091,24 +2147,75 @@ def record_archive_plan(
             "rawSha256": _file_sha256(raw_path),
         }
 
-    planned_resource_ids = {
+    retained_resource_ids = {
         str(target["resourceId"])
         for browser_plan in plan["browsers"].values()
         for target in browser_plan["targets"]
+        if str(target.get("retention") or "retain") == "retain"
     }
-    if planned_resource_ids:
-        placeholders = ",".join("?" for _ in planned_resource_ids)
-        durable_count = int(
+    discarded_resource_ids = {
+        str(target["resourceId"])
+        for browser_plan in plan["browsers"].values()
+        for target in browser_plan["targets"]
+        if str(target.get("retention") or "retain") == "discard"
+    }
+    operational_resource_ids = {
+        str(target["resourceId"])
+        for browser_plan in plan["browsers"].values()
+        for target in browser_plan["targets"]
+        if str(target.get("retention") or "retain") == "operational"
+    }
+    planned_targets = [
+        target
+        for browser_plan in plan["browsers"].values()
+        for target in browser_plan["targets"]
+    ]
+    if any(
+        str(target.get("retention") or "retain")
+        not in {"retain", "discard", "operational"}
+        for target in planned_targets
+    ):
+        raise ValueError("Archive target retention decision is invalid")
+    if retained_resource_ids:
+        placeholders = ",".join("?" for _ in retained_resource_ids)
+        retained_count = int(
             connection.execute(
                 f"SELECT COUNT(*) FROM resources WHERE id IN ({placeholders}) "
                 "AND canonical_url <> '' AND library_state='accepted'",
-                sorted(planned_resource_ids),
+                sorted(retained_resource_ids),
             ).fetchone()[0]
         )
     else:
-        durable_count = 0
-    if durable_count != len(planned_resource_ids):
+        retained_count = 0
+    if retained_count != len(retained_resource_ids):
         raise ValueError("Not every archive target has a durable resource record")
+    if discarded_resource_ids:
+        placeholders = ",".join("?" for _ in discarded_resource_ids)
+        discarded_count = int(
+            connection.execute(
+                f"SELECT COUNT(*) FROM resources WHERE id IN ({placeholders}) "
+                "AND canonical_url <> '' AND library_state='dismissed' "
+                "AND dismissed_at IS NOT NULL",
+                sorted(discarded_resource_ids),
+            ).fetchone()[0]
+        )
+    else:
+        discarded_count = 0
+    if discarded_count != len(discarded_resource_ids):
+        raise ValueError("Not every discard target has an explicit reviewed dismissal")
+    if operational_resource_ids:
+        placeholders = ",".join("?" for _ in operational_resource_ids)
+        operational_count = int(
+            connection.execute(
+                f"SELECT COUNT(*) FROM resources WHERE id IN ({placeholders}) "
+                "AND canonical_url LIKE ? AND library_state='accepted'",
+                [*sorted(operational_resource_ids), f"{TABATLAS_EXTENSION_URL_PREFIX}%"],
+            ).fetchone()[0]
+        )
+    else:
+        operational_count = 0
+    if operational_count != len(operational_resource_ids):
+        raise ValueError("Not every operational target belongs to the TabAtlas extension")
 
     safe_time = re.sub(r"[^0-9]", "", str(plan["createdAt"]))[:14] or "undated"
     backup_dir = state_dir / "backups"
@@ -2131,7 +2238,9 @@ def record_archive_plan(
     evidence_path = state_dir / "mutations" / f"{safe_time}-archive-{request_id[:8]}.json"
     durability = {
         "catalogIntegrity": integrity,
-        "durableResourceCount": durable_count,
+        "durableResourceCount": retained_count,
+        "reviewedDiscardResourceCount": discarded_count,
+        "operationalResourceCount": operational_count,
         "captures": capture_evidence,
         "backupPath": str(backup_path.relative_to(state_dir)),
         "backupSha256": _file_sha256(backup_path),
@@ -2221,7 +2330,9 @@ def finalize_archive_plan(
     post_verification: dict[str, dict[str, Any]] = {}
     valid_post_capture_ids: dict[str, str] = {}
     controls: dict[str, dict[str, int]] = {}
-    archived_resource_ids: set[str] = set()
+    retained_resource_ids: set[str] = set()
+    discarded_resource_ids: set[str] = set()
+    operational_resource_ids: set[str] = set()
     closed_total = 0
     skipped_total = 0
     completed_at = utc_now()
@@ -2275,7 +2386,14 @@ def finalize_archive_plan(
             }
         closed_total += int(result.get("closedCount") or 0)
         skipped_total += int(result.get("skippedCount") or 0)
-        archived_resource_ids.update(str(item["resourceId"]) for item in browser_plan["targets"])
+        for item in browser_plan["targets"]:
+            retention = str(item.get("retention") or "retain")
+            if retention == "discard":
+                discarded_resource_ids.add(str(item["resourceId"]))
+            elif retention == "operational":
+                operational_resource_ids.add(str(item["resourceId"]))
+            else:
+                retained_resource_ids.add(str(item["resourceId"]))
 
     expected_control_browsers = {
         browser for browser, browser_plan in plan["browsers"].items()
@@ -2288,13 +2406,35 @@ def finalize_archive_plan(
         and all_controls_reported
         and not error
     )
-    if all_verified and archived_resource_ids:
+    if all_verified and retained_resource_ids:
         with connection:
-            for resource_chunk in _chunks(sorted(archived_resource_ids), 400):
+            for resource_chunk in _chunks(sorted(retained_resource_ids), 400):
                 placeholders = ",".join("?" for _ in resource_chunk)
                 connection.execute(
                     f"UPDATE resources SET status='saved', archived_at=? WHERE id IN ({placeholders})",
                     [completed_at, *resource_chunk],
+                )
+    if all_verified and discarded_resource_ids:
+        with connection:
+            for resource_chunk in _chunks(sorted(discarded_resource_ids), 400):
+                placeholders = ",".join("?" for _ in resource_chunk)
+                connection.execute(
+                    f"UPDATE resources SET status='archived', archived_at=? "
+                    f"WHERE library_state='dismissed' AND id IN ({placeholders})",
+                    [completed_at, *resource_chunk],
+                )
+    if all_verified and operational_resource_ids:
+        with connection:
+            for resource_chunk in _chunks(sorted(operational_resource_ids), 400):
+                placeholders = ",".join("?" for _ in resource_chunk)
+                connection.execute(
+                    f"UPDATE resources SET status='archived', archived_at=? "
+                    f"WHERE canonical_url LIKE ? AND id IN ({placeholders})",
+                    [
+                        completed_at,
+                        f"{TABATLAS_EXTENSION_URL_PREFIX}%",
+                        *resource_chunk,
+                    ],
                 )
 
     evidence = {
@@ -2351,7 +2491,9 @@ def finalize_archive_plan(
         "verifiedBrowsers": sum(bool(item["verified"]) for item in post_verification.values()),
         "expectedBrowsers": len(post_verification),
         "allControlsReported": all_controls_reported,
-        "archivedResources": len(archived_resource_ids) if all_verified else 0,
+        "archivedResources": len(retained_resource_ids) if all_verified else 0,
+        "discardedResources": len(discarded_resource_ids) if all_verified else 0,
+        "operationalResources": len(operational_resource_ids) if all_verified else 0,
         "controls": controls,
         "evidencePath": str(evidence_path),
     }

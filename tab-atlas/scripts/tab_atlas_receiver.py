@@ -15,13 +15,16 @@ from urllib.parse import urlsplit
 
 from tab_atlas_core import (
     connect,
+    LEGACY_CAPTURE_PROTOCOL_VERSION,
     mark_pairing_seen,
+    MUTATION_PROTOCOL_VERSION,
     normalize_browser,
     pairing_secret,
     protocol_proof,
     save_pairing,
     store_snapshot,
     TABATLAS_EXTENSION_ID,
+    TARGET_HASH_PROTOCOL_VERSION,
     token_hash,
 )
 
@@ -67,7 +70,7 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Access-Control-Allow-Headers",
             "content-type, x-tabatlas-auth, x-tabatlas-browser, "
-            "x-tabatlas-extension, x-tabatlas-nonce",
+            "x-tabatlas-extension, x-tabatlas-nonce, x-tabatlas-protocol",
         )
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Max-Age", "300")
@@ -107,7 +110,7 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             return
         connection = connect(self.server.session.database_path)
         try:
-            mark_pairing_seen(connection, browser)
+            mark_pairing_seen(connection, browser, pairing["protocol_version"])
         finally:
             connection.close()
         targets: list[dict[str, Any]] = []
@@ -144,6 +147,16 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "receiver is not active"})
                 return
+        response_parts = [
+            "response",
+            browser,
+            pairing["extension_id"],
+            pairing["nonce"],
+            request_id,
+            action,
+        ]
+        if pairing["protocol_version"] >= TARGET_HASH_PROTOCOL_VERSION:
+            response_parts.append(targets_hash)
         payload = {
             "ok": True,
             "action": action,
@@ -152,13 +165,7 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             "targetsHash": targets_hash,
             "serverProof": protocol_proof(
                 pairing["secret"],
-                "response",
-                browser,
-                pairing["extension_id"],
-                pairing["nonce"],
-                request_id,
-                action,
-                targets_hash,
+                *response_parts,
             ),
         }
         self._send_json(HTTPStatus.OK, payload)
@@ -268,7 +275,7 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
                 raise ValueError("capture request does not match receiver run")
             connection = connect(session.database_path)
             try:
-                mark_pairing_seen(connection, browser)
+                mark_pairing_seen(connection, browser, pairing["protocol_version"])
                 result = store_snapshot(
                     connection,
                     session.state_dir,
@@ -481,6 +488,13 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
         extension_id = self.headers.get("X-TabAtlas-Extension", "")
         nonce = self.headers.get("X-TabAtlas-Nonce", "")
         supplied = self.headers.get("X-TabAtlas-Auth", "")
+        protocol_header = self.headers.get("X-TabAtlas-Protocol", "").strip()
+        if not protocol_header:
+            protocol_version = LEGACY_CAPTURE_PROTOCOL_VERSION
+        elif re.fullmatch(r"[1-9][0-9]{0,2}", protocol_header):
+            protocol_version = int(protocol_header)
+        else:
+            return None
         if (
             browser not in {"chrome", "edge"}
             or extension_id != EXPECTED_EXTENSION_ID
@@ -505,7 +519,7 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
         )
         if not hmac.compare_digest(supplied, expected):
             return None
-        return {**pairing, "nonce": nonce}
+        return {**pairing, "nonce": nonce, "protocol_version": protocol_version}
 
     def _read_json(self, maximum: int) -> dict[str, Any]:
         value = json.loads(self._read_body(maximum).decode("utf-8"))
@@ -629,6 +643,7 @@ def run_mutation(
     }
     if not expected:
         return True, {}
+    require_mutation_protocol(database_path, expected)
     session = ReceiverSession(
         mode="mutate",
         database_path=database_path,
@@ -654,6 +669,7 @@ def run_archive_cleanup(
     }
     if not expected:
         return True, {}
+    require_mutation_protocol(database_path, expected)
     session = ReceiverSession(
         mode="cleanup",
         database_path=database_path,
@@ -664,6 +680,33 @@ def run_archive_cleanup(
     )
     completed = _run(session, timeout_seconds)
     return completed, session.cleaned
+
+
+def require_mutation_protocol(database_path: Path, browsers: set[str]) -> None:
+    expected = {normalize_browser(browser) for browser in browsers}
+    connection = connect(database_path)
+    try:
+        statuses = {
+            item["browser"]: item
+            for item in connection.execute(
+                "SELECT browser, enabled, protocol_version FROM pairings"
+            ).fetchall()
+        }
+    finally:
+        connection.close()
+    unsupported = [
+        browser
+        for browser in sorted(expected)
+        if browser not in statuses
+        or not bool(statuses[browser]["enabled"])
+        or int(statuses[browser]["protocol_version"]) < MUTATION_PROTOCOL_VERSION
+    ]
+    if unsupported:
+        names = ", ".join(browser.title() for browser in unsupported)
+        raise ValueError(
+            f"Tab-closing requires TabAtlas protocol {MUTATION_PROTOCOL_VERSION}. "
+            f"Reload the TabAtlas Bridge extension in {names}, then run refresh again."
+        )
 
 
 def _run(

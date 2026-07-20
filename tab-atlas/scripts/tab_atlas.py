@@ -35,6 +35,7 @@ from tab_atlas_core import (
 )
 from tab_atlas_receiver import (
     EXPECTED_EXTENSION_ID,
+    require_mutation_protocol,
     run_archive_cleanup,
     run_capture,
     run_mutation,
@@ -404,6 +405,7 @@ def main(argv: list[str] | None = None) -> int:
             if not pre_complete:
                 output({"complete": False, "phase": "fresh_capture", "browsers": sorted(targets)})
                 return 1
+            require_mutation_protocol(database_path, targets)
 
             connection = connect(database_path)
             plan = build_exact_duplicate_plan(
@@ -520,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
             if not pre_complete:
                 output({"complete": False, "phase": "fresh_capture", "browsers": sorted(targets)})
                 return 1
+            require_mutation_protocol(database_path, targets)
 
             connection = connect(database_path)
             plan = build_archive_plan(

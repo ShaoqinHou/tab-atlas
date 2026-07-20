@@ -102,6 +102,14 @@ The extension has two explicit states:
 - **ON**: one low-cost 30-second alarm checks the fixed loopback receiver. Tabs
   are read only when a one-shot authenticated command is waiting.
 
+The receiver records the protocol version reported by each authenticated worker.
+Older paired workers remain usable for read-only capture, but duplicate cleanup
+and archive commands require protocol 4 and fail before mutation with a precise
+reload instruction. After `prepare-extension` changes the unpacked source, click
+**Reload** once on TabAtlas Bridge in `chrome://extensions` and
+`edge://extensions`; restarting the browsers does not reliably refresh an
+already registered unpacked worker.
+
 The receiver is started on demand, binds only to `127.0.0.1`, and exits after the
 requested operation. Nothing is scheduled with Windows. A closed browser keeps
 its last trusted inventory; TabAtlas does not secretly launch or automate the
@@ -117,6 +125,8 @@ normal browser profile.
 - Resource cards show the smallest useful decision set: visual evidence where
   available, cleaned title, concise brief, topic/focus signal, next action, and
   open or stored state. The inspector exposes provenance and detail on demand.
+- Discovery cards receive agent-written decision summaries and safe public video
+  thumbnails before acceptance, so review is not limited to raw tab titles.
 - The first 30 matching cards render immediately. More are appended as the user
   scrolls, without a manual Show more control.
 

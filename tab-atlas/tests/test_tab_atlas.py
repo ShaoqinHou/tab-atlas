@@ -30,7 +30,9 @@ from tab_atlas_core import (  # noqa: E402
     finalize_mutation_plan,
     inventory,
     library_resources,
+    MUTATION_PROTOCOL_VERSION,
     normalize_snapshot_document,
+    pairing_status,
     pairing_secret,
     protocol_proof,
     report_payload,
@@ -112,6 +114,21 @@ class CatalogTests(unittest.TestCase):
 
             before = inventory(connection)
             pending = discovery_resources(connection)
+            apply_annotations(
+                connection,
+                {
+                    "resources": [{
+                        "resourceId": pending[0]["resourceId"],
+                        "brief": "A concise decision summary for the staged resource.",
+                        "collections": [{
+                            "name": "Review topic",
+                            "kind": "topic",
+                            "parentName": "Review space",
+                        }],
+                    }]
+                },
+            )
+            review_batch = discovery_batch(connection, 10)
             staged_report = report_payload(connection)
             decision = set_discovery_state(
                 connection,
@@ -127,6 +144,14 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(before["pendingDiscoveries"], 1)
             self.assertEqual(before["currentKnownResources"], 1)
             self.assertEqual(before["currentDiscoveryResources"], 1)
+            self.assertEqual(
+                review_batch["resources"][0]["brief"],
+                "A concise decision summary for the staged resource.",
+            )
+            self.assertEqual(
+                review_batch["resources"][0]["collections"][0]["name"],
+                "Review topic",
+            )
             self.assertEqual(len(staged_report["resources"]), 1)
             self.assertEqual(len(staged_report["discoveries"]), 1)
             self.assertEqual(staged_report["discoveries"][0]["libraryState"], "candidate")
@@ -464,6 +489,7 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(len(payload["resources"]), 1)
             self.assertEqual(payload["inventory"]["currentTabs"], 0)
             self.assertEqual(payload["inventory"]["libraryResources"], 1)
+            self.assertEqual(payload["groups"], [])
 
     def test_archive_plan_backs_up_catalog_and_preserves_closed_resources(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1066,12 +1092,118 @@ class ReceiverIntegrationTests(unittest.TestCase):
                 ),
             )
 
+    def test_legacy_worker_can_capture_but_cannot_receive_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            database = state / "atlas.sqlite"
+            connection = connect(database)
+            save_pairing(connection, "chrome", EXPECTED_EXTENSION_ID, "legacy-token")
+            connection.close()
+            key = token_hash("legacy-token")
+
+            capture_result: list[object] = []
+            thread = threading.Thread(
+                target=lambda: capture_result.extend(run_capture(database, state, {"chrome"}, 5)),
+                daemon=True,
+            )
+            thread.start()
+            command_nonce = "9" * 32
+            command = self._retry_request(
+                "/v1/command",
+                headers=self._signed_headers(
+                    key,
+                    "command",
+                    command_nonce,
+                    protocol_version=None,
+                ),
+            )
+            self.assertEqual(command["action"], "capture")
+            self.assertEqual(
+                command["serverProof"],
+                protocol_proof(
+                    key,
+                    "response",
+                    "chrome",
+                    EXPECTED_EXTENSION_ID,
+                    command_nonce,
+                    command["requestId"],
+                    "capture",
+                ),
+            )
+
+            snapshot = {
+                "schemaVersion": 1,
+                "requestId": command["requestId"],
+                "browser": "chrome",
+                "extensionId": EXPECTED_EXTENSION_ID,
+                "capturedAt": "2026-07-20T00:00:00Z",
+                "windows": [{"id": 1, "focused": False, "tabCount": 1}],
+                "groups": [],
+                "tabs": [{
+                    "id": 4,
+                    "windowId": 1,
+                    "index": 0,
+                    "title": "Legacy capture",
+                    "url": "https://example.com/legacy",
+                }],
+            }
+            encoded = json.dumps(snapshot).encode("utf-8")
+            snapshot_nonce = "a" * 32
+            self._json_request(
+                "/v1/snapshot",
+                method="POST",
+                headers=self._signed_headers(
+                    key,
+                    "snapshot",
+                    snapshot_nonce,
+                    command["requestId"],
+                    hashlib.sha256(encoded).hexdigest(),
+                    protocol_version=None,
+                ),
+                body=snapshot,
+            )
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(capture_result[0])
+
+            connection = connect(database)
+            status = pairing_status(connection)[0]
+            connection.close()
+            self.assertEqual(status["protocol_version"], 2)
+
+            targets = [{"targetTabId": 4}]
+            targets_hash = hashlib.sha256(
+                json.dumps(targets, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(
+                ValueError,
+                f"protocol {MUTATION_PROTOCOL_VERSION}.*Reload",
+            ):
+                run_mutation(
+                    database,
+                    state,
+                    {
+                        "requestId": "legacy-mutation",
+                        "action": "close_exact_duplicates",
+                        "browsers": {
+                            "chrome": {"targets": targets, "targetsHash": targets_hash}
+                        },
+                    },
+                    1,
+                )
+
     def test_mutation_command_and_results_are_bound_to_the_exact_target_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
             database = state / "atlas.sqlite"
             connection = connect(database)
-            save_pairing(connection, "chrome", EXPECTED_EXTENSION_ID, "mutation-token")
+            save_pairing(
+                connection,
+                "chrome",
+                EXPECTED_EXTENSION_ID,
+                "mutation-token",
+                protocol_version=MUTATION_PROTOCOL_VERSION,
+            )
             connection.close()
             key = token_hash("mutation-token")
             targets = [{
@@ -1165,7 +1297,13 @@ class ReceiverIntegrationTests(unittest.TestCase):
             state = Path(temporary)
             database = state / "atlas.sqlite"
             connection = connect(database)
-            save_pairing(connection, "chrome", EXPECTED_EXTENSION_ID, "cleanup-token")
+            save_pairing(
+                connection,
+                "chrome",
+                EXPECTED_EXTENSION_ID,
+                "cleanup-token",
+                protocol_version=MUTATION_PROTOCOL_VERSION,
+            )
             connection.close()
             key = token_hash("cleanup-token")
             plan = build_archive_cleanup_plan(
@@ -1293,8 +1431,9 @@ class ReceiverIntegrationTests(unittest.TestCase):
         purpose: str,
         nonce: str,
         *extra_parts: str,
+        protocol_version: int | None = MUTATION_PROTOCOL_VERSION,
     ) -> dict[str, str]:
-        return {
+        headers = {
             "X-TabAtlas-Browser": "chrome",
             "X-TabAtlas-Extension": EXPECTED_EXTENSION_ID,
             "X-TabAtlas-Nonce": nonce,
@@ -1307,6 +1446,9 @@ class ReceiverIntegrationTests(unittest.TestCase):
                 *extra_parts,
             ),
         }
+        if protocol_version is not None:
+            headers["X-TabAtlas-Protocol"] = str(protocol_version)
+        return headers
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ import {
 } from "./protocol.js";
 
 const RECEIVER = "http://127.0.0.1:9786";
+const PROTOCOL_VERSION = 4;
 const POLL_ALARM = "tab-atlas-poll";
 const POLL_MINUTES = 0.5;
 const KEYS = {
@@ -755,7 +756,8 @@ function signedHeaders(browser, extensionId, nonce, auth) {
     "x-tabatlas-browser": browser,
     "x-tabatlas-extension": extensionId,
     "x-tabatlas-nonce": nonce,
-    "x-tabatlas-auth": auth
+    "x-tabatlas-auth": auth,
+    "x-tabatlas-protocol": String(PROTOCOL_VERSION)
   };
 }
 

@@ -26,20 +26,25 @@ verified duplicate cleanup or captured-tab archive
 Current ignored local data:
 
 - 623 accepted durable resources.
-- Last trusted inventory: 711 tab instances, 608 current canonical resources,
-  18 browser groups, and 70 policy-safe exact duplicate extras.
-- Six Spaces, 24 Topics, 45 Focuses, and four Project overlays.
-- 350 resources have Focus-level organization.
-- 310 resources have cached public preview evidence.
+- 11 newly discovered resources are staged with concise summaries and proposed
+  hierarchy, awaiting the user's accept or dismiss decision.
+- Last trusted inventory: 723 tab instances, 617 current canonical resources,
+  17 browser groups, and 74 policy-safe exact duplicate extras.
+- Six Spaces, 24 Topics, 49 Focuses, and four Project overlays.
+- Focus-level organization now includes the newly useful tactical-RPG,
+  AI-assisted game-development, survival-systems, and traditional-joinery cuts.
+- 316 resources have cached public preview evidence, including all six staged
+  YouTube discoveries.
 - 99 accepted resources remain unclassified because their evidence is generic,
   private, authenticated, local, or otherwise too weak for a responsible guess.
-- Zero pending or dismissed discoveries in the last trusted capture.
-- Schema version 6, SQLite integrity `ok`, and zero foreign-key violations.
+- Schema version 7, SQLite integrity `ok`, and zero foreign-key violations.
 
 The report now separates New discoveries, Inbox, Exact duplicates, and Open tabs.
 It exposes Space -> Topic -> Focus navigation, browser-group filters, search,
 preview crops, progressive detail, per-resource and aggregate action requests,
-and 30-item batched infinite scrolling.
+and 30-item batched infinite scrolling. Group filters are derived only from the
+latest live captures; historical group provenance remains in resource details but
+cannot create a stale navigation group.
 
 ## Browser Safety
 
@@ -69,9 +74,14 @@ The extension tracks URL-changing navigation during archive execution and skips
 changed targets. Its control-tab ID is persisted for recovery if a service worker
 terminates before normal cleanup.
 
+Pairings now record authenticated worker protocol versions. Protocol 2 remains
+capture-compatible so an older installed worker can refresh without manual
+intervention. Every tab-closing path requires protocol 4 before a mutation
+receiver starts; there is no legacy fallback for browser mutation.
+
 ## Verification Checkpoint
 
-- 28 Python behavior and receiver integration tests pass.
+- 29 Python behavior and receiver integration tests pass.
 - Three independent Node protocol tests pass.
 - Disposable bundled Chromium archive: 5 planned, 5 closed, zero skipped,
   post-capture verified, control cleanup complete.
@@ -83,14 +93,15 @@ terminates before normal cleanup.
   an isolated headless profile (`ERR_BLOCKED_BY_CLIENT`). The Chrome protocol is
   covered by bundled Chromium; the normal installed extension remains the live
   Chrome acceptance path.
-- Normal browser profiles were not used for automated tests and no normal tabs
-  were mutated during this milestone.
+- Normal read-only acceptance captured 226 Chrome tabs and 498 Edge tabs through
+  the ordinary receiver with no diagnostic override and no missed browser.
+- Both normal workers currently report protocol 2. No normal tab has been
+  mutated; protocol 4 is deliberately required before that can occur.
 
 ## Repository Checkpoint
 
 ```text
 Branch: codex/ongoing-library-and-safe-archive
-Commit: aab03c09e1260af95908324b4529e3bd76c14600 (implementation checkpoint)
 Draft PR: https://github.com/ShaoqinHou/tab-atlas/pull/1
 ```
 
@@ -133,22 +144,22 @@ prompt is authoritative. Data or code is reused only after a fresh safety review
 
 ## Next Actions
 
-1. Fully quit and reopen normal Chrome and Edge once so their existing unpacked
-   extensions load version 0.4 from the stable ignored extension directory.
-2. Run `python scripts/tab_atlas.py refresh --browser all --timeout 90`.
-3. Show the resulting discoveries to the user. Accept only selected opaque IDs or
-   the exact reviewed batch; do not silently accept later arrivals.
-4. Enrich accepted discoveries, reconsider relevant existing memberships, and
-   regenerate the report.
-5. Preview archive-all. Execute only after the user confirms the fresh reviewed
-   scope; preserve any newly opened or changed tab automatically.
-6. Update the draft PR with this checkpoint and merge only after normal Chrome and
-   Edge capture acceptance succeeds.
+1. Ask the user to accept or dismiss the exact 11-resource staged batch. Do not
+   silently include a later discovery.
+2. In each browser's extension manager, click **Reload** once on TabAtlas Bridge,
+   then refresh and verify both pairings report protocol 4.
+3. Mark accepted collection proposals as reviewed, reconsider any newly affected
+   existing memberships, and regenerate the report.
+4. Preview archive-all against another fresh capture. Execute only after explicit
+   approval for that current browser and closure count; changed or newly opened
+   tabs must block or be preserved.
+5. Verify the durable library, post-close captures, backup, ignored audit, clean
+   worktree, and pushed draft PR.
 
 ## Current Constraint
 
-Both normal pairings are enabled and authenticated polling was seen during the
-latest receiver attempt, but neither browser submitted a snapshot. Their running
-processes have not reloaded the prepared extension revision. The read-only refresh
-therefore timed out with no data change. A full browser quit and reopen is the
-remaining live acceptance dependency.
+Both normal pairings are enabled and read-only refresh now succeeds, including
+legacy response-proof compatibility. Their workers still report protocol 2 after
+a full browser restart, so tab mutation is intentionally blocked. The remaining
+live dependency is one explicit **Reload** click for TabAtlas Bridge in each
+browser's extension manager, followed by a protocol-4 refresh.

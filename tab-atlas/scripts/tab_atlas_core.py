@@ -19,9 +19,12 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 TABATLAS_EXTENSION_ID = "ohgpplkophdikjnbefigdhikdooehmkh"
 TABATLAS_EXTENSION_URL_PREFIX = f"chrome-extension://{TABATLAS_EXTENSION_ID}/"
+LEGACY_CAPTURE_PROTOCOL_VERSION = 2
+TARGET_HASH_PROTOCOL_VERSION = 3
+MUTATION_PROTOCOL_VERSION = 4
 TRACKING_PARAMETERS = {
     "fbclid",
     "gclid",
@@ -83,6 +86,7 @@ CREATE TABLE IF NOT EXISTS pairings (
   extension_id TEXT NOT NULL,
   token_hash TEXT NOT NULL UNIQUE,
   enabled INTEGER NOT NULL DEFAULT 1,
+  protocol_version INTEGER NOT NULL DEFAULT 2,
   created_at TEXT NOT NULL,
   last_seen_at TEXT
 );
@@ -234,6 +238,13 @@ def connect(database_path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA journal_mode = WAL")
     connection.executescript(SCHEMA)
+    pairing_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(pairings)").fetchall()
+    }
+    if "protocol_version" not in pairing_columns:
+        connection.execute(
+            "ALTER TABLE pairings ADD COLUMN protocol_version INTEGER NOT NULL DEFAULT 2"
+        )
     capture_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(captures)").fetchall()
     }
@@ -304,26 +315,32 @@ def save_pairing(
     browser: str,
     extension_id: str,
     token: str,
+    protocol_version: int = LEGACY_CAPTURE_PROTOCOL_VERSION,
 ) -> None:
     browser = normalize_browser(browser)
     if browser not in {"chrome", "edge"}:
         raise ValueError("Pairing supports Chrome or Edge only")
     if not re.fullmatch(r"[a-p]{32}", extension_id):
         raise ValueError("Unexpected extension ID")
+    if not isinstance(protocol_version, int) or not 1 <= protocol_version <= 999:
+        raise ValueError("Pairing protocol version is invalid")
     now = utc_now()
     with connection:
         connection.execute(
             """
-            INSERT INTO pairings(browser, extension_id, token_hash, enabled, created_at)
-            VALUES(?, ?, ?, 1, ?)
+            INSERT INTO pairings(
+              browser, extension_id, token_hash, enabled, protocol_version, created_at
+            )
+            VALUES(?, ?, ?, 1, ?, ?)
             ON CONFLICT(browser) DO UPDATE SET
               extension_id=excluded.extension_id,
               token_hash=excluded.token_hash,
               enabled=1,
+              protocol_version=excluded.protocol_version,
               created_at=excluded.created_at,
               last_seen_at=NULL
             """,
-            (browser, extension_id, token_hash(token), now),
+            (browser, extension_id, token_hash(token), protocol_version, now),
         )
 
 
@@ -335,7 +352,7 @@ def pairing_secret(
     browser = normalize_browser(browser)
     row = connection.execute(
         """
-        SELECT browser, extension_id, token_hash, enabled
+        SELECT browser, extension_id, token_hash, enabled, protocol_version
         FROM pairings
         WHERE browser=? AND extension_id=?
         """,
@@ -348,15 +365,31 @@ def pairing_secret(
         "extension_id": row["extension_id"],
         "secret": row["token_hash"],
         "enabled": bool(row["enabled"]),
+        "protocol_version": int(row["protocol_version"]),
     }
 
 
-def mark_pairing_seen(connection: sqlite3.Connection, browser: str) -> None:
+def mark_pairing_seen(
+    connection: sqlite3.Connection,
+    browser: str,
+    protocol_version: int | None = None,
+) -> None:
+    browser = normalize_browser(browser)
+    if protocol_version is not None and (
+        not isinstance(protocol_version, int) or not 1 <= protocol_version <= 999
+    ):
+        raise ValueError("Pairing protocol version is invalid")
     with connection:
-        connection.execute(
-            "UPDATE pairings SET last_seen_at=? WHERE browser=?",
-            (utc_now(), normalize_browser(browser)),
-        )
+        if protocol_version is None:
+            connection.execute(
+                "UPDATE pairings SET last_seen_at=? WHERE browser=?",
+                (utc_now(), browser),
+            )
+        else:
+            connection.execute(
+                "UPDATE pairings SET last_seen_at=?, protocol_version=? WHERE browser=?",
+                (utc_now(), protocol_version, browser),
+            )
 
 
 def protocol_proof(secret_hex: str, *parts: str) -> str:
@@ -370,7 +403,8 @@ def protocol_proof(secret_hex: str, *parts: str) -> str:
 
 def pairing_status(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = connection.execute(
-        "SELECT browser, extension_id, enabled, created_at, last_seen_at FROM pairings ORDER BY browser"
+        "SELECT browser, extension_id, enabled, protocol_version, created_at, last_seen_at "
+        "FROM pairings ORDER BY browser"
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -1224,6 +1258,17 @@ def discovery_batch(
                 "host": item["host"],
                 "firstSeenAt": item["firstSeenAt"],
                 "liveTabInstances": len(item["tabs"]),
+                "brief": item["brief"],
+                "whyKept": item["whyKept"],
+                "nextAction": item["nextAction"],
+                "collections": [
+                    {
+                        "name": collection["name"],
+                        "kind": collection["kind"],
+                        "parentName": collection.get("parentName") or "",
+                    }
+                    for collection in item["collections"]
+                ],
                 "browsers": sorted(
                     {
                         tab["browser"]
@@ -2584,7 +2629,7 @@ def report_group_summaries(resources: list[dict[str, Any]]) -> list[dict[str, An
     groups: dict[str, dict[str, Any]] = {}
     resources_by_id = {item["resourceId"]: item for item in resources}
     for resource in resources:
-        for tab in resource.get("contexts") or resource["tabs"]:
+        for tab in resource["tabs"]:
             if tab["groupId"] in {None, "", "-1"}:
                 continue
             identifier = _group_identifier(tab)
@@ -2854,7 +2899,7 @@ def cache_public_previews(
 ) -> dict[str, int]:
     preview_dir = state_dir / "previews"
     preview_dir.mkdir(parents=True, exist_ok=True)
-    resources = library_resources(connection)
+    resources = library_resources(connection, {"accepted", "candidate"})
     candidates: list[tuple[str, str, Path]] = []
     cached = 0
     for resource in resources:

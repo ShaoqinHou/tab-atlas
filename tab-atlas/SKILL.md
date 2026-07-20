@@ -53,6 +53,11 @@ A canonical repeat updates live and provenance data without creating another
 discovery. Accepted resources remain in the durable library after their browser
 tabs close.
 
+Before asking for a discovery decision, write bounded evidence-supported
+`brief`, `detail`, `whyKept`, and `nextAction` fields, propose hierarchy without
+changing `library_state`, cache allowlisted public previews, and regenerate the
+report. This enriches the decision; it does not imply acceptance.
+
 ## Enrich And Reconsider
 
 After acceptance, inspect bounded batches from the complete accepted library:
@@ -107,6 +112,12 @@ The extension is passive while OFF. While ON, it polls the authenticated loopbac
 receiver at a low rate and reads tabs only when a bounded command is waiting. The
 receiver is one-shot and is not scheduled. Capture uses already-running, paired
 browsers; do not claim or assume that TabAtlas automatically launches a browser.
+
+Pairing status includes `protocol_version`. A headerless protocol-2 worker may
+perform read-only capture for continuity. Never send a mutation through that
+compatibility path. Duplicate cleanup, archive, and archive-control cleanup all
+require protocol 4; tell the user to click **Reload** on TabAtlas Bridge in that
+browser's extension manager, refresh, and verify protocol 4 first.
 
 Revoke a capability with:
 

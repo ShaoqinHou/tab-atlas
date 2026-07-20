@@ -83,6 +83,24 @@ Cache only allowlisted public preview media during explicit enrichment. Do not
 crawl arbitrary URLs, access authenticated pages, or load remote media when the
 report opens.
 
+### Preview selection matrix
+
+| Resource type | Default card evidence | Richer evidence policy |
+| --- | --- | --- |
+| YouTube video | Public video thumbnail | Cache the allowlisted video image |
+| X status | Post metadata | Cache attached post image, video/GIF poster, or card image; reject avatars |
+| GitHub repository/page | Repository metadata | Cache an allowlisted GitHub social image |
+| Reddit post | Post metadata | Cache allowlisted attached post media when exposed |
+| PDF | Document metadata | Render or capture the first useful page on demand |
+| Public article/docs | Page metadata | Capture on demand in an isolated or user-authorized context |
+| Private conversation | Private summary | No automatic remote capture |
+| Search/browser-internal/local page | Contextual metadata | No automatic remote capture |
+
+An agent-supplied local capture has higher precedence than every automatic
+adapter, including during a refresh. Adapter failure is a normal metadata-only
+result; generic branding, profile pictures, or unrelated fallback imagery must
+not be substituted merely to increase image coverage.
+
 ## Mutation Protocols
 
 Exact-duplicate cleanup and archive-all are distinct one-shot protocols. Each

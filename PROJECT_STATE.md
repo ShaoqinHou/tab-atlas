@@ -40,9 +40,13 @@ Current ignored local data:
   document and visual retrieval, 3D production, and voxel-generation benchmarks.
 - Focus-level organization now includes the newly useful tactical-RPG,
   AI-assisted game-development, survival-systems, and traditional-joinery cuts.
-- 316 resources have cached public preview evidence.
-- The remaining accepted resources receive explicit metadata previews in the
-  report; richer local JPEG, PNG, or WebP captures can be registered on demand.
+- 378 resources have cached public preview evidence: 316 YouTube thumbnails,
+  54 X post-media previews, and 8 GitHub social previews. The bounded enrichment
+  left nine eligible pages metadata-only because they exposed no usable image on
+  the provider allowlist.
+- The remaining 276 accepted resources receive source-aware metadata previews in
+  the report. Appropriate local JPEG, PNG, or WebP captures can be registered on
+  demand, and an agent capture always outranks an automatic public preview.
 - 99 accepted resources remain unclassified because their evidence is generic,
   private, authenticated, local, or otherwise too weak for a responsible guess.
 - Schema version 7, SQLite integrity `ok`, and zero foreign-key violations.

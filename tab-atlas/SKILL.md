@@ -104,8 +104,12 @@ Use conversational retrieval without dumping raw rows:
 python scripts/tab_atlas.py query --text "..."
 ```
 
-`enrich` caches only allowlisted public visual evidence. It does not crawl every
-tab, access authenticated pages, or send private URLs to an LLM provider.
+`enrich` caches only allowlisted public visual evidence. Its adapters currently
+cover YouTube thumbnails, X post media/posters, GitHub social images, and Reddit
+post media. Provider page and image redirects must remain HTTPS and inside the
+adapter's host allowlists; X profile images are specifically rejected. It does
+not crawl every tab, access authenticated pages, or send private URLs to an LLM
+provider. Existing agent captures are never overwritten by automatic enrichment.
 Where the user requests richer evidence and capture is appropriate, register a
 locally captured image by opaque resource ID, then regenerate the report:
 

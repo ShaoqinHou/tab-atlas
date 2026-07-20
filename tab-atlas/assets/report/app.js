@@ -795,7 +795,10 @@ function previewVisual(resource, size, allowRemote) {
     image.decoding = "async";
     image.addEventListener("error", () => frame.replaceChildren(fallback));
     image.src = localImage;
-    frame.append(image, node("span", "preview-evidence-label", "Saved image"));
+    frame.append(
+      image,
+      node("span", "preview-evidence-label", preview.evidenceLabel || "Saved image")
+    );
     return frame;
   }
 
@@ -836,7 +839,11 @@ function sourceFallback(resource) {
     node("strong", "fallback-title", resourceDisplayTitle(resource)),
     node("span", "fallback-summary", summary),
     node("span", "fallback-meta", `${presentation.format || resource.kind || "Resource"} / ${presentation.intent || "Reference"}`),
-    node("span", "preview-evidence-label", "Metadata preview")
+    node(
+      "span",
+      "preview-evidence-label",
+      presentation.preview?.metadataLabel || "Metadata preview"
+    )
   );
   return fallback;
 }
@@ -882,8 +889,10 @@ function resourceCommands(resource, placement) {
   summary.title = `More actions for ${resourceDisplayTitle(resource)}`;
   menu.append(summary);
   const choices = node("div", "resource-command-choices");
-  if (!resource.presentation?.preview?.localImage) {
-    choices.append(menuCommand("Request richer preview", () => requestResourcePreview(resource)));
+  const preview = resource.presentation?.preview || {};
+  if (!preview.localImage && preview.canRequestRicher !== false) {
+    const requestLabel = preview.requestLabel || "richer preview";
+    choices.append(menuCommand(`Request ${requestLabel}`, () => requestResourcePreview(resource)));
   }
   choices.append(menuCommand("Reclassify", () => requestResourceReclassification(resource)));
   if (resource.libraryState === "accepted") {

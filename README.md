@@ -151,9 +151,16 @@ normal browser profile.
   available, cleaned title, concise brief, topic/focus signal, next action, and
   open or stored state. Missing images become explicit metadata previews rather
   than empty placeholders. The inspector exposes provenance and detail on demand.
+- Preview adapters select the decision-bearing object for each supported source:
+  a video frame for YouTube, attached image/video-poster/card media for an X post,
+  repository social art for GitHub, and attached post media for Reddit. The UI
+  names the evidence it is showing instead of presenting every image as a generic
+  screenshot.
 - Every resource exposes direct Open source and Copy link commands. More actions
-  can request a richer preview, semantic reconsideration, or recoverable removal
-  from the library.
+  can request an appropriate richer preview, semantic reconsideration, or
+  recoverable removal from the library. Private conversations, search results,
+  browser-internal pages, and local files do not offer misleading automatic
+  preview requests.
 - Discovery cards receive agent-written decision summaries and safe public video
   thumbnails before acceptance, so review is not limited to raw tab titles.
 - The first 30 matching cards render immediately. More are appended as the user

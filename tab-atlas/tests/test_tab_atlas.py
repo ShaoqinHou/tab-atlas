@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -21,6 +22,7 @@ from tab_atlas_core import (  # noqa: E402
     build_archive_cleanup_plan,
     build_archive_plan,
     build_exact_duplicate_plan,
+    cache_public_previews,
     connect,
     current_resources,
     discovery_batch,
@@ -46,6 +48,11 @@ from tab_atlas_core import (  # noqa: E402
     set_discovery_state,
     store_snapshot,
     token_hash,
+    _AllowlistedRedirectHandler,
+    _OpenGraphParser,
+    _preview_image_allowed,
+    _public_preview_candidate,
+    _public_preview_source,
 )
 from tab_atlas_receiver import (  # noqa: E402
     EXPECTED_EXTENSION_ID,
@@ -935,6 +942,40 @@ class CatalogTests(unittest.TestCase):
             presentation["preview"]["remoteImage"],
             "https://i.ytimg.com/vi/abc123XYZ00/mqdefault.jpg",
         )
+        self.assertEqual(presentation["preview"]["metadataLabel"], "Video metadata")
+        self.assertEqual(presentation["preview"]["requestLabel"], "video thumbnail")
+
+    def test_presentation_names_rich_evidence_and_suppresses_unsafe_requests(self) -> None:
+        x_post = resource_presentation({
+            "resourceId": "res_111111111111111111111111",
+            "openUrl": "https://x.com/example/status/1234567890123456789",
+            "canonicalUrl": "https://x.com/example/status/1234567890123456789",
+            "host": "x.com",
+            "kind": "web_page",
+            "title": "Example post",
+            "previewLocalPath": "previews/res_111111111111111111111111.jpg",
+            "previewSource": "x_public_video_thumbnail",
+            "collections": [],
+            "tasks": [],
+            "tabs": [],
+        })
+        conversation = resource_presentation({
+            "openUrl": "https://chatgpt.com/c/example",
+            "canonicalUrl": "https://chatgpt.com/c/example",
+            "host": "chatgpt.com",
+            "kind": "web_page",
+            "title": "Private conversation",
+            "collections": [],
+            "tasks": [],
+            "tabs": [],
+        })
+
+        self.assertEqual(x_post["preview"]["evidenceLabel"], "Video poster")
+        self.assertEqual(x_post["preview"]["metadataLabel"], "Post metadata")
+        self.assertEqual(x_post["preview"]["strategy"], "public_media")
+        self.assertEqual(conversation["format"], "Conversation")
+        self.assertEqual(conversation["preview"]["metadataLabel"], "Private summary")
+        self.assertFalse(conversation["preview"]["canRequestRicher"])
 
     def test_source_lens_uses_reliable_owner_signals_and_groups_other_sites(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1013,6 +1054,140 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(stored["previewKind"], "screenshot")
             self.assertEqual(stored["previewSource"], "agent_local_capture")
             self.assertTrue((state / stored["previewLocalPath"]).is_file())
+
+    def test_public_preview_adapters_are_source_specific_and_media_bounded(self) -> None:
+        preview_dir = Path("previews")
+        x_candidate = _public_preview_candidate({
+            "resourceId": "res_111111111111111111111111",
+            "canonicalUrl": "https://x.com/example/status/1234567890123456789",
+        }, preview_dir)
+        github_candidate = _public_preview_candidate({
+            "resourceId": "res_222222222222222222222222",
+            "canonicalUrl": "https://github.com/example/project/issues/12",
+        }, preview_dir)
+        reddit_candidate = _public_preview_candidate({
+            "resourceId": "res_333333333333333333333333",
+            "canonicalUrl": "https://www.reddit.com/r/example/comments/abc123/post/",
+        }, preview_dir)
+
+        self.assertEqual(x_candidate["provider"], "x_post")
+        self.assertEqual(github_candidate["provider"], "github")
+        self.assertEqual(reddit_candidate["provider"], "reddit_post")
+        self.assertIsNone(_public_preview_candidate({
+            "resourceId": "res_444444444444444444444444",
+            "canonicalUrl": "https://x.com/example",
+        }, preview_dir))
+        self.assertIsNone(_public_preview_candidate({
+            "resourceId": "res_555555555555555555555555",
+            "canonicalUrl": "https://user@x.com/example/status/123",
+        }, preview_dir))
+        self.assertTrue(_preview_image_allowed(
+            "x_post",
+            "https://pbs.twimg.com/amplify_video_thumb/123/img/poster.jpg",
+            ("pbs.twimg.com",),
+        ))
+        self.assertFalse(_preview_image_allowed(
+            "x_post",
+            "https://pbs.twimg.com/profile_images/123/avatar.jpg",
+            ("pbs.twimg.com",),
+        ))
+        self.assertFalse(_preview_image_allowed(
+            "x_post",
+            "https://example.com/amplify_video_thumb/123/img/poster.jpg",
+            ("pbs.twimg.com",),
+        ))
+        self.assertFalse(_preview_image_allowed(
+            "x_post",
+            "https://pbs.twimg.com:444/amplify_video_thumb/123/img/poster.jpg",
+            ("pbs.twimg.com",),
+        ))
+        self.assertEqual(
+            _public_preview_source(
+                "x_post",
+                "https://pbs.twimg.com/amplify_video_thumb/123/img/poster.jpg",
+            ),
+            "x_public_video_thumbnail",
+        )
+
+    def test_open_graph_parser_handles_attribute_order_without_page_scraping(self) -> None:
+        parser = _OpenGraphParser()
+        parser.feed("""
+            <html><head>
+              <meta content="Poster title" property="og:title">
+              <meta content="https://pbs.twimg.com/media/example.jpg" name="twitter:image">
+              <meta property="og:image:width" content="1080">
+              <meta content="1080" property="og:image:height">
+              <meta property="unrelated" content="ignored">
+            </head><body>Private page body is not parsed into fields.</body></html>
+        """)
+
+        self.assertEqual(parser.values["og:title"], "Poster title")
+        self.assertEqual(
+            parser.values["twitter:image"],
+            "https://pbs.twimg.com/media/example.jpg",
+        )
+        self.assertEqual(parser.values["og:image:width"], "1080")
+        self.assertNotIn("unrelated", parser.values)
+
+    def test_public_preview_redirects_cannot_leave_the_provider_allowlist(self) -> None:
+        handler = _AllowlistedRedirectHandler(("pbs.twimg.com",))
+        request = Request("https://pbs.twimg.com/media/example.jpg")
+
+        with self.assertRaisesRegex(ValueError, "provider allowlist"):
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "http://127.0.0.1/private",
+            )
+        with self.assertRaisesRegex(ValueError, "provider allowlist"):
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "https://example.com/unrelated.jpg",
+            )
+
+    def test_refresh_preserves_agent_captures_over_automatic_public_previews(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [{
+                        "title": "Post with a manual capture",
+                        "url": "https://x.com/example/status/1234567890123456789",
+                    }],
+                },
+                "test",
+            )
+            resource_id = library_resources(connection)[0]["resourceId"]
+            image = state / "capture.bin"
+            image.write_bytes(bytes.fromhex(
+                "89504e470d0a1a0a0000000d4948445200000001000000010804000000"
+                "b51c0c020000000b4944415478da63fcff1f0003030200efa57eea00000000"
+                "49454e44ae426082"
+            ))
+            register_local_preview(connection, state, resource_id, image)
+
+            with patch("tab_atlas_core._download_public_preview") as downloader:
+                result = cache_public_previews(connection, state, refresh=True, workers=1)
+            stored = library_resources(connection)[0]
+            connection.close()
+
+            downloader.assert_not_called()
+            self.assertEqual(result["eligible"], 1)
+            self.assertEqual(result["preservedScreenshots"], 1)
+            self.assertEqual(stored["previewKind"], "screenshot")
+            self.assertEqual(stored["previewSource"], "agent_local_capture")
 
     def test_report_keeps_duplicate_group_titles_as_distinct_groups(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

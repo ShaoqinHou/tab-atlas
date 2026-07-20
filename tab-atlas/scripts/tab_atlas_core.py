@@ -12,11 +12,12 @@ import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 SCHEMA_VERSION = 7
@@ -25,6 +26,10 @@ TABATLAS_EXTENSION_URL_PREFIX = f"chrome-extension://{TABATLAS_EXTENSION_ID}/"
 LEGACY_CAPTURE_PROTOCOL_VERSION = 2
 TARGET_HASH_PROTOCOL_VERSION = 3
 MUTATION_PROTOCOL_VERSION = 4
+PUBLIC_PREVIEW_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36 TabAtlas/0.5"
+)
 TRACKING_PARAMETERS = {
     "fbclid",
     "gclid",
@@ -1817,6 +1822,12 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
         suffix = Path(str(resource["previewLocalPath"])).suffix.casefold()
         if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
             local_preview = f"media/{resource['resourceId']}{suffix}"
+    preview_policy = _preview_policy(
+        source_group,
+        format_label,
+        url,
+        str(resource.get("previewSource") or ""),
+    )
 
     return {
         "displayTitle": _clean_display_title(title, source),
@@ -1844,7 +1855,84 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
             "localImage": local_preview,
             "remoteImage": preview_url,
             "requiresUserLoad": bool(preview_url and not local_preview),
+            **preview_policy,
         },
+    }
+
+
+def _preview_policy(
+    source_group: str,
+    format_label: str,
+    url: str,
+    preview_source: str,
+) -> dict[str, Any]:
+    evidence_labels = {
+        "youtube_public_thumbnail": "Video thumbnail",
+        "x_public_video_thumbnail": "Video poster",
+        "x_public_post_image": "Post image",
+        "x_public_card_image": "Link preview",
+        "github_public_social_image": "Repository preview",
+        "reddit_public_post_image": "Post image",
+        "agent_local_capture": "Page capture",
+    }
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        parts = urlsplit("")
+    segments = [segment for segment in parts.path.split("/") if segment]
+    is_x_post = (
+        source_group == "X"
+        and len(segments) >= 3
+        and segments[1].casefold() == "status"
+        and segments[2].isdigit()
+    )
+    is_reddit_post = source_group == "Reddit" and any(
+        segment.casefold() == "comments" for segment in segments
+    )
+
+    if source_group == "YouTube":
+        metadata_label, request_label, strategy = "Video metadata", "video thumbnail", "public_media"
+    elif is_x_post:
+        metadata_label, request_label, strategy = "Post metadata", "post media", "public_media"
+    elif source_group == "GitHub":
+        metadata_label, request_label, strategy = "Repository metadata", "repository preview", "public_social_image"
+    elif is_reddit_post:
+        metadata_label, request_label, strategy = "Post metadata", "post media", "public_media"
+    elif format_label == "PDF":
+        metadata_label, request_label, strategy = "Document metadata", "first-page preview", "local_capture"
+    elif format_label == "Conversation":
+        return {
+            "strategy": "private_summary",
+            "metadataLabel": "Private summary",
+            "evidenceLabel": evidence_labels.get(preview_source, "Private capture"),
+            "canRequestRicher": False,
+            "requestLabel": "",
+        }
+    elif format_label == "Search":
+        return {
+            "strategy": "metadata_only",
+            "metadataLabel": "Search context",
+            "evidenceLabel": evidence_labels.get(preview_source, "Saved image"),
+            "canRequestRicher": False,
+            "requestLabel": "",
+        }
+    elif source_group in {"Browser", "Local file"}:
+        return {
+            "strategy": "metadata_only",
+            "metadataLabel": "Local metadata",
+            "evidenceLabel": evidence_labels.get(preview_source, "Saved image"),
+            "canRequestRicher": False,
+            "requestLabel": "",
+        }
+    else:
+        metadata_label, request_label, strategy = "Page metadata", "page preview", "local_capture"
+
+    return {
+        "strategy": strategy,
+        "metadataLabel": metadata_label,
+        "evidenceLabel": evidence_labels.get(preview_source, "Saved image"),
+        "canRequestRicher": True,
+        "requestLabel": request_label,
     }
 
 
@@ -3204,52 +3292,113 @@ def _youtube_video_id(url: str) -> str:
     return candidate if re.fullmatch(r"[A-Za-z0-9_-]{6,32}", candidate) else ""
 
 
+class _OpenGraphParser(HTMLParser):
+    FIELDS = {
+        "og:description", "og:image", "og:image:height", "og:image:secure_url",
+        "og:image:width", "og:title", "og:type", "twitter:card",
+        "twitter:creator", "twitter:description", "twitter:image", "twitter:title",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.values: dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() != "meta":
+            return
+        values = {str(key).casefold(): str(value or "") for key, value in attrs}
+        name = str(values.get("property") or values.get("name") or "").casefold()
+        content = str(values.get("content") or "").strip()
+        if name in self.FIELDS and content:
+            self.values.setdefault(name, content)
+
+
+class _AllowlistedRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, allowed_hosts: tuple[str, ...]) -> None:
+        super().__init__()
+        self.allowed_hosts = allowed_hosts
+
+    def redirect_request(
+        self,
+        request: Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> Request | None:
+        if not _provider_url_allowed(new_url, self.allowed_hosts):
+            raise ValueError("Preview redirect left the provider allowlist")
+        return super().redirect_request(
+            request,
+            file_pointer,
+            code,
+            message,
+            headers,
+            new_url,
+        )
+
+
 def cache_public_previews(
     connection: sqlite3.Connection,
     state_dir: Path,
     refresh: bool = False,
     workers: int = 8,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     preview_dir = state_dir / "previews"
     preview_dir.mkdir(parents=True, exist_ok=True)
     resources = library_resources(connection, {"accepted", "candidate"})
-    candidates: list[tuple[str, str, Path]] = []
+    candidates: list[dict[str, Any]] = []
+    provider_stats: dict[str, Counter[str]] = defaultdict(Counter)
     cached = 0
+    preserved_screenshots = 0
     for resource in resources:
-        video_id = _youtube_video_id(str(resource.get("canonicalUrl") or ""))
-        if not video_id:
+        candidate = _public_preview_candidate(resource, preview_dir)
+        if not candidate:
             continue
-        target = preview_dir / f"{resource['resourceId']}.jpg"
-        if not refresh and resource.get("previewKind") == "thumbnail" and target.is_file():
+        provider = candidate["provider"]
+        provider_stats[provider]["eligible"] += 1
+        existing = _existing_preview_path(state_dir, str(resource.get("previewLocalPath") or ""))
+        if existing and resource.get("previewKind") == "screenshot":
             cached += 1
+            preserved_screenshots += 1
+            provider_stats[provider]["alreadyCached"] += 1
             continue
-        candidates.append((resource["resourceId"], video_id, target))
+        if existing and not refresh:
+            cached += 1
+            provider_stats[provider]["alreadyCached"] += 1
+            continue
+        candidates.append(candidate)
 
-    downloaded: list[tuple[str, Path, str]] = []
+    downloaded: list[tuple[str, dict[str, Any]]] = []
     failed = 0
     with ThreadPoolExecutor(max_workers=max(1, min(16, workers))) as executor:
         futures = {
-            executor.submit(_download_youtube_preview, video_id, target): (resource_id, target)
-            for resource_id, video_id, target in candidates
+            executor.submit(_download_public_preview, candidate): candidate
+            for candidate in candidates
         }
         for future in as_completed(futures):
-            resource_id, target = futures[future]
+            candidate = futures[future]
+            provider = candidate["provider"]
             try:
-                digest = future.result()
-            except (HTTPError, URLError, OSError, ValueError):
+                result = future.result()
+            except (HTTPError, URLError, OSError, UnicodeError, ValueError):
                 failed += 1
+                provider_stats[provider]["failed"] += 1
                 continue
-            downloaded.append((resource_id, target, digest))
+            downloaded.append((candidate["resourceId"], result))
+            provider_stats[provider]["downloaded"] += 1
 
     now = utc_now()
+    state_root = state_dir.resolve()
     with connection:
-        for resource_id, target, digest in downloaded:
+        for resource_id_value, result in downloaded:
             connection.execute(
                 """
                 INSERT INTO resource_previews(
                   resource_id, kind, local_path, source, content_sha256,
                   width, height, created_at
-                ) VALUES(?, 'thumbnail', ?, 'youtube_public_thumbnail', ?, 320, 180, ?)
+                ) VALUES(?, 'thumbnail', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(resource_id) DO UPDATE SET
                   kind=excluded.kind,
                   local_path=excluded.local_path,
@@ -3259,14 +3408,285 @@ def cache_public_previews(
                   height=excluded.height,
                   created_at=excluded.created_at
                 """,
-                (resource_id, str(target.relative_to(state_dir)), digest, now),
+                (
+                    resource_id_value,
+                    str(result["target"].relative_to(state_root)),
+                    result["source"],
+                    result["digest"],
+                    result.get("width"),
+                    result.get("height"),
+                    now,
+                ),
             )
     return {
         "eligible": cached + len(candidates),
         "alreadyCached": cached,
+        "preservedScreenshots": preserved_screenshots,
         "downloaded": len(downloaded),
         "failed": failed,
+        "providers": {
+            provider: {
+                key: int(stats.get(key, 0))
+                for key in ("eligible", "alreadyCached", "downloaded", "failed")
+            }
+            for provider, stats in sorted(provider_stats.items())
+        },
     }
+
+
+def _public_preview_candidate(
+    resource: dict[str, Any],
+    preview_dir: Path,
+) -> dict[str, Any] | None:
+    url = str(resource.get("canonicalUrl") or "")
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    host = (parts.hostname or "").casefold()
+    segments = [segment for segment in parts.path.split("/") if segment]
+    target_base = preview_dir / str(resource["resourceId"])
+
+    video_id = _youtube_video_id(url)
+    if video_id and _provider_url_allowed(url, ("youtu.be", "youtube.com")):
+        return {
+            "provider": "youtube",
+            "resourceId": resource["resourceId"],
+            "targetBase": target_base,
+            "imageUrl": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
+            "imageHosts": ("i.ytimg.com",),
+            "source": "youtube_public_thumbnail",
+            "width": 320,
+            "height": 180,
+        }
+    if (
+        _provider_url_allowed(url, ("x.com", "twitter.com"))
+        and len(segments) >= 3
+        and segments[1].casefold() == "status"
+        and segments[2].isdigit()
+    ):
+        return {
+            "provider": "x_post",
+            "resourceId": resource["resourceId"],
+            "targetBase": target_base,
+            "pageUrl": url,
+            "pageHosts": ("x.com", "twitter.com"),
+            "imageHosts": ("pbs.twimg.com",),
+        }
+    if (
+        host in {"github.com", "www.github.com"}
+        and len(segments) >= 2
+        and _provider_url_allowed(url, ("github.com",))
+    ):
+        return {
+            "provider": "github",
+            "resourceId": resource["resourceId"],
+            "targetBase": target_base,
+            "pageUrl": url,
+            "pageHosts": ("github.com",),
+            "imageHosts": (
+                "opengraph.githubassets.com",
+                "repository-images.githubusercontent.com",
+            ),
+        }
+    if (
+        _provider_url_allowed(url, ("reddit.com",))
+        and any(segment.casefold() == "comments" for segment in segments)
+    ):
+        return {
+            "provider": "reddit_post",
+            "resourceId": resource["resourceId"],
+            "targetBase": target_base,
+            "pageUrl": url,
+            "pageHosts": ("reddit.com",),
+            "imageHosts": ("preview.redd.it", "external-preview.redd.it", "i.redd.it"),
+        }
+    return None
+
+
+def _existing_preview_path(state_dir: Path, local_path: str) -> Path | None:
+    if not local_path:
+        return None
+    state_root = state_dir.resolve()
+    candidate = (state_root / local_path).resolve()
+    try:
+        candidate.relative_to(state_root)
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _download_public_preview(candidate: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, str] = {}
+    image_url = str(candidate.get("imageUrl") or "")
+    if not image_url:
+        metadata, page_url = _fetch_open_graph(
+            str(candidate["pageUrl"]),
+            tuple(candidate["pageHosts"]),
+        )
+        image_url = str(
+            metadata.get("og:image:secure_url")
+            or metadata.get("og:image")
+            or metadata.get("twitter:image")
+            or ""
+        )
+        image_url = urljoin(page_url, image_url)
+    if not _preview_image_allowed(
+        str(candidate["provider"]),
+        image_url,
+        tuple(candidate["imageHosts"]),
+    ):
+        raise ValueError("Public preview image left the provider allowlist")
+
+    data, suffix = _download_public_image(image_url, tuple(candidate["imageHosts"]))
+    target = Path(candidate["targetBase"]).with_suffix(suffix)
+    _atomic_write(target, data)
+    return {
+        "target": target,
+        "digest": hashlib.sha256(data).hexdigest(),
+        "source": str(candidate.get("source") or _public_preview_source(
+            str(candidate["provider"]), image_url
+        )),
+        "width": candidate.get("width") or _positive_int(metadata.get("og:image:width")),
+        "height": candidate.get("height") or _positive_int(metadata.get("og:image:height")),
+    }
+
+
+def _fetch_open_graph(url: str, allowed_hosts: tuple[str, ...]) -> tuple[dict[str, str], str]:
+    request = Request(
+        url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "DNT": "1",
+            "User-Agent": PUBLIC_PREVIEW_USER_AGENT,
+        },
+    )
+    with _open_allowlisted(request, allowed_hosts, timeout=15) as response:
+        final_url = response.geturl()
+        if not _provider_url_allowed(final_url, allowed_hosts):
+            raise ValueError("Preview page redirect left the allowed origin")
+        content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].casefold()
+        if content_type not in {"text/html", "application/xhtml+xml"}:
+            raise ValueError("Preview metadata response was not HTML")
+        charset = response.headers.get_content_charset() or "utf-8"
+        data = response.read(786_432)
+    parser = _OpenGraphParser()
+    parser.feed(data.decode(charset, errors="replace"))
+    return parser.values, final_url
+
+
+def _preview_image_allowed(
+    provider: str,
+    image_url: str,
+    allowed_hosts: tuple[str, ...],
+) -> bool:
+    try:
+        parts = urlsplit(image_url)
+    except ValueError:
+        return False
+    if not _provider_url_allowed(image_url, allowed_hosts):
+        return False
+    path = parts.path.casefold()
+    if provider == "x_post":
+        return path.startswith((
+            "/amplify_video_thumb/", "/card_img/", "/ext_tw_video_thumb/",
+            "/media/", "/tweet_video_thumb/",
+        ))
+    return True
+
+
+def _download_public_image(url: str, allowed_hosts: tuple[str, ...]) -> tuple[bytes, str]:
+    request = Request(
+        url,
+        headers={
+            "Accept": "image/jpeg,image/png,image/webp",
+            "DNT": "1",
+            "User-Agent": PUBLIC_PREVIEW_USER_AGENT,
+        },
+    )
+    with _open_allowlisted(request, allowed_hosts, timeout=15) as response:
+        if not _provider_url_allowed(response.geturl(), allowed_hosts):
+            raise ValueError("Preview image redirect left the allowed origin")
+        content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].casefold()
+        if content_type not in {"image/jpeg", "image/jpg", "image/png", "image/webp"}:
+            raise ValueError("Preview response was not a supported image")
+        data = response.read(5_000_001)
+    if len(data) > 5_000_000:
+        raise ValueError("Preview image exceeded 5 MB")
+    return data, _image_suffix(data)
+
+
+def _open_allowlisted(
+    request: Request,
+    allowed_hosts: tuple[str, ...],
+    timeout: int,
+) -> Any:
+    if not _provider_url_allowed(request.full_url, allowed_hosts):
+        raise ValueError("Preview request left the provider allowlist")
+    opener = build_opener(_AllowlistedRedirectHandler(allowed_hosts))
+    return opener.open(request, timeout=timeout)
+
+
+def _public_preview_source(provider: str, image_url: str) -> str:
+    path = urlsplit(image_url).path.casefold()
+    if provider == "x_post":
+        if any(value in path for value in ("video_thumb", "amplify_video_thumb")):
+            return "x_public_video_thumbnail"
+        if path.startswith("/card_img/"):
+            return "x_public_card_image"
+        return "x_public_post_image"
+    return {
+        "github": "github_public_social_image",
+        "reddit_post": "reddit_public_post_image",
+    }.get(provider, "public_social_image")
+
+
+def _host_allowed(host: str, allowed_hosts: tuple[str, ...]) -> bool:
+    return any(host == allowed or host.endswith(f".{allowed}") for allowed in allowed_hosts)
+
+
+def _provider_url_allowed(url: str, allowed_hosts: tuple[str, ...]) -> bool:
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
+    return (
+        parts.scheme.casefold() == "https"
+        and _host_allowed((parts.hostname or "").casefold(), allowed_hosts)
+        and parts.username is None
+        and parts.password is None
+        and port in {None, 443}
+    )
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(str(value or ""))
+    except ValueError:
+        return None
+    return number if 0 < number <= 100_000 else None
+
+
+def _image_suffix(data: bytes) -> str:
+    if data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"):
+        return ".jpg"
+    if (
+        len(data) >= 24
+        and data.startswith(b"\x89PNG\r\n\x1a\n")
+        and data[12:16] == b"IHDR"
+        and int.from_bytes(data[16:20], "big") > 0
+        and int.from_bytes(data[20:24], "big") > 0
+    ):
+        return ".png"
+    if (
+        len(data) >= 16
+        and data.startswith(b"RIFF")
+        and data[8:12] == b"WEBP"
+        and int.from_bytes(data[4:8], "little") + 8 <= len(data)
+    ):
+        return ".webp"
+    raise ValueError("Preview image must be JPEG, PNG, or WebP")
 
 
 def register_local_preview(
@@ -3291,25 +3711,7 @@ def register_local_preview(
     if size <= 0 or size > 8_000_000:
         raise ValueError("Preview image must be between 1 byte and 8 MB")
     data = source.read_bytes()
-    if data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"):
-        suffix = ".jpg"
-    elif (
-        len(data) >= 24
-        and data.startswith(b"\x89PNG\r\n\x1a\n")
-        and data[12:16] == b"IHDR"
-        and int.from_bytes(data[16:20], "big") > 0
-        and int.from_bytes(data[20:24], "big") > 0
-    ):
-        suffix = ".png"
-    elif (
-        len(data) >= 16
-        and data.startswith(b"RIFF")
-        and data[8:12] == b"WEBP"
-        and int.from_bytes(data[4:8], "little") + 8 <= len(data)
-    ):
-        suffix = ".webp"
-    else:
-        raise ValueError("Preview image must be JPEG, PNG, or WebP")
+    suffix = _image_suffix(data)
 
     target = state_dir.resolve() / "previews" / f"{current_resource_id}{suffix}"
     _atomic_write(target, data)
@@ -3344,25 +3746,6 @@ def register_local_preview(
         "bytes": len(data),
         "sha256": digest,
     }
-
-
-def _download_youtube_preview(video_id: str, target: Path) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", video_id):
-        raise ValueError("Invalid public video identifier")
-    url = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
-    request = Request(url, headers={"User-Agent": "TabAtlas/0.3 local-preview-cache"})
-    with urlopen(request, timeout=12) as response:
-        final = urlsplit(response.geturl())
-        if final.scheme != "https" or final.hostname != "i.ytimg.com":
-            raise ValueError("Preview redirect left the allowed origin")
-        content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].casefold()
-        if content_type not in {"image/jpeg", "image/jpg"}:
-            raise ValueError("Preview response was not JPEG")
-        data = response.read(1_000_001)
-    if len(data) > 1_000_000 or not data.startswith(b"\xff\xd8\xff"):
-        raise ValueError("Preview response failed image validation")
-    _atomic_write(target, data)
-    return hashlib.sha256(data).hexdigest()
 
 
 def _group_identifier(tab: dict[str, Any]) -> str:

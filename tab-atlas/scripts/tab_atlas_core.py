@@ -1367,6 +1367,52 @@ def set_discovery_state(
     }
 
 
+def remove_library_resources(
+    connection: sqlite3.Connection,
+    resource_ids: Iterable[str],
+) -> dict[str, Any]:
+    requested = {
+        str(value).strip()
+        for value in resource_ids
+        if str(value).strip()
+    }
+    if not requested:
+        raise ValueError("At least one resource ID is required")
+    if len(requested) > 1000:
+        raise ValueError("Library removal limit exceeded")
+
+    placeholders = ",".join("?" for _ in requested)
+    eligible = {
+        row["id"]
+        for row in connection.execute(
+            f"SELECT id FROM resources WHERE library_state='accepted' "
+            f"AND id IN ({placeholders})",
+            sorted(requested),
+        )
+    }
+    invalid = sorted(requested - eligible)
+    if invalid:
+        raise ValueError(
+            "Resources are not accepted library entries: " + ", ".join(invalid[:10])
+        )
+
+    now = utc_now()
+    with connection:
+        for batch in _chunks(sorted(eligible), 400):
+            batch_placeholders = ",".join("?" for _ in batch)
+            connection.execute(
+                f"UPDATE resources SET library_state='dismissed', dismissed_at=? "
+                f"WHERE library_state='accepted' AND id IN ({batch_placeholders})",
+                [now, *batch],
+            )
+    return {
+        "state": "dismissed",
+        "updated": len(eligible),
+        "resourceIds": sorted(eligible),
+        "recoverable": True,
+    }
+
+
 def pending_discoveries_for_browsers(
     connection: sqlite3.Connection,
     browsers: set[str],
@@ -1664,6 +1710,10 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
     kind = str(resource.get("kind") or "web_page")
     title = str(resource.get("title") or "")
     source = _source_label(host, kind, parts.scheme)
+    source_group = _source_group(source, parts.scheme)
+    publisher = _publisher_label(source, parts)
+    if not publisher and source_group == "Other websites":
+        publisher = source
     format_label = _format_label(host, kind, title, parts.path, parts.scheme)
     intent = _intent_label(str(resource.get("nextAction") or ""), format_label)
     collections = resource.get("collections") or []
@@ -1771,6 +1821,8 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
     return {
         "displayTitle": _clean_display_title(title, source),
         "source": source,
+        "sourceGroup": source_group,
+        "publisher": publisher,
         "format": format_label,
         "intent": intent,
         "queue": queue,
@@ -2931,15 +2983,89 @@ def report_collection_summaries(
     return sorted(result, key=lambda item: (-item["resourceCount"], item["name"].casefold()))
 
 
+def report_source_summaries(resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for resource in resources:
+        grouped[str(resource["presentation"]["sourceGroup"])].append(resource)
+
+    summaries = []
+    for source, members in grouped.items():
+        publisher_members: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        topic_counts: Counter[str] = Counter()
+        format_counts: Counter[str] = Counter()
+        for resource in members:
+            presentation = resource["presentation"]
+            publisher = str(presentation.get("publisher") or "")
+            if publisher:
+                publisher_members[publisher].append(resource)
+            format_counts[str(presentation["format"])] += 1
+            topic_counts.update(
+                collection["name"]
+                for collection in resource.get("collections") or []
+                if collection.get("kind") == "topic"
+            )
+
+        publishers = [
+            {
+                "id": "pub_" + hashlib.sha256(
+                    f"{source.casefold()}\n{name.casefold()}".encode("utf-8")
+                ).hexdigest()[:20],
+                "name": name,
+                "resourceCount": len(publisher_resources),
+                "resourceIds": [item["resourceId"] for item in publisher_resources],
+            }
+            for name, publisher_resources in publisher_members.items()
+        ]
+        publishers.sort(key=lambda item: (-item["resourceCount"], item["name"].casefold()))
+        preview_count = sum(
+            bool(item["presentation"]["preview"]["localImage"])
+            for item in members
+        )
+        summaries.append(
+            {
+                "id": "src_" + hashlib.sha256(source.casefold().encode("utf-8")).hexdigest()[:20],
+                "name": source,
+                "resourceCount": len(members),
+                "resourceIds": [item["resourceId"] for item in members],
+                "previewCount": preview_count,
+                "metadataPreviewCount": len(members) - preview_count,
+                "attributedCount": sum(item["resourceCount"] for item in publishers),
+                "publishers": publishers,
+                "topTopics": [
+                    {"name": name, "count": count}
+                    for name, count in topic_counts.most_common(5)
+                ],
+                "topFormats": [
+                    {"name": name, "count": count}
+                    for name, count in format_counts.most_common(3)
+                ],
+                "previewResourceIds": [
+                    item["resourceId"]
+                    for item in sorted(
+                        members,
+                        key=lambda value: (
+                            not bool(value["presentation"]["preview"]["localImage"]),
+                            value["title"].casefold(),
+                        ),
+                    )[:3]
+                ],
+            }
+        )
+    return sorted(summaries, key=lambda item: (-item["resourceCount"], item["name"].casefold()))
+
+
 def _source_label(host: str, kind: str, scheme: str) -> str:
     if scheme == "file":
         return "Local file"
+    if scheme in {"chrome", "chrome-extension", "edge", "edge-extension"}:
+        return "Browser"
     if kind == "pdf":
         return "PDF"
     if kind == "browser_internal":
         return "Browser"
     rules = (
         (("youtube.com", "youtu.be"), "YouTube"),
+        (("x.com", "twitter.com"), "X"),
         (("github.com",), "GitHub"),
         (("chatgpt.com", "chat.openai.com"), "ChatGPT"),
         (("claude.ai",), "Claude"),
@@ -2952,6 +3078,51 @@ def _source_label(host: str, kind: str, scheme: str) -> str:
         if any(suffix in host for suffix in suffixes):
             return label
     return host.removeprefix("www.") or "Unknown source"
+
+
+def _publisher_label(source: str, parts: Any) -> str:
+    segments = [segment for segment in str(parts.path or "").split("/") if segment]
+    if not segments:
+        return ""
+    first = segments[0]
+    if source == "X":
+        reserved = {
+            "compose", "explore", "home", "i", "intent", "login", "messages",
+            "notifications", "search", "settings", "share", "signup",
+        }
+        if first.casefold() not in reserved and re.fullmatch(r"[A-Za-z0-9_]{1,30}", first):
+            return f"@{first}"
+    if source == "GitHub":
+        reserved = {
+            "about", "collections", "customer-stories", "enterprise", "events",
+            "features", "login", "marketplace", "new", "notifications", "orgs",
+            "pricing", "search", "security", "settings", "signup", "sponsors",
+            "topics", "trending",
+        }
+        if first.casefold() not in reserved and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", first):
+            return first
+    if source == "Reddit" and len(segments) >= 2:
+        if first.casefold() in {"r", "u", "user"}:
+            prefix = "r" if first.casefold() == "r" else "u"
+            return f"{prefix}/{segments[1][:100]}"
+    if source == "YouTube":
+        if first.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_.-]{1,100}", first):
+            return first
+        if first.casefold() in {"c", "channel", "user"} and len(segments) >= 2:
+            return segments[1][:100]
+    return ""
+
+
+def _source_group(source: str, scheme: str) -> str:
+    grouped_sources = {
+        "Bing", "Browser", "ChatGPT", "Claude", "GitHub", "Google", "Kimi",
+        "Local file", "PDF", "Reddit", "X", "YouTube",
+    }
+    if source in grouped_sources:
+        return source
+    if scheme.casefold() in {"http", "https"}:
+        return "Other websites"
+    return source
 
 
 def _clean_display_title(title: str, source: str) -> str:
@@ -3098,6 +3269,83 @@ def cache_public_previews(
     }
 
 
+def register_local_preview(
+    connection: sqlite3.Connection,
+    state_dir: Path,
+    resource_id_value: str,
+    image_path: Path,
+) -> dict[str, Any]:
+    current_resource_id = str(resource_id_value).strip()
+    if not re.fullmatch(r"res_[0-9a-f]{24}", current_resource_id):
+        raise ValueError("Resource ID is invalid")
+    if not connection.execute(
+        "SELECT 1 FROM resources WHERE id=?",
+        (current_resource_id,),
+    ).fetchone():
+        raise ValueError(f"Unknown resource ID: {current_resource_id}")
+
+    source = image_path.resolve()
+    if not source.is_file():
+        raise ValueError(f"Preview image does not exist: {source}")
+    size = source.stat().st_size
+    if size <= 0 or size > 8_000_000:
+        raise ValueError("Preview image must be between 1 byte and 8 MB")
+    data = source.read_bytes()
+    if data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"):
+        suffix = ".jpg"
+    elif (
+        len(data) >= 24
+        and data.startswith(b"\x89PNG\r\n\x1a\n")
+        and data[12:16] == b"IHDR"
+        and int.from_bytes(data[16:20], "big") > 0
+        and int.from_bytes(data[20:24], "big") > 0
+    ):
+        suffix = ".png"
+    elif (
+        len(data) >= 16
+        and data.startswith(b"RIFF")
+        and data[8:12] == b"WEBP"
+        and int.from_bytes(data[4:8], "little") + 8 <= len(data)
+    ):
+        suffix = ".webp"
+    else:
+        raise ValueError("Preview image must be JPEG, PNG, or WebP")
+
+    target = state_dir.resolve() / "previews" / f"{current_resource_id}{suffix}"
+    _atomic_write(target, data)
+    digest = hashlib.sha256(data).hexdigest()
+    now = utc_now()
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO resource_previews(
+              resource_id, kind, local_path, source, content_sha256,
+              width, height, created_at
+            ) VALUES(?, 'screenshot', ?, 'agent_local_capture', ?, NULL, NULL, ?)
+            ON CONFLICT(resource_id) DO UPDATE SET
+              kind=excluded.kind,
+              local_path=excluded.local_path,
+              source=excluded.source,
+              content_sha256=excluded.content_sha256,
+              width=excluded.width,
+              height=excluded.height,
+              created_at=excluded.created_at
+            """,
+            (
+                current_resource_id,
+                str(target.relative_to(state_dir.resolve())),
+                digest,
+                now,
+            ),
+        )
+    return {
+        "resourceId": current_resource_id,
+        "kind": "screenshot",
+        "bytes": len(data),
+        "sha256": digest,
+    }
+
+
 def _download_youtube_preview(video_id: str, target: Path) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", video_id):
         raise ValueError("Invalid public video identifier")
@@ -3172,6 +3420,7 @@ def report_payload(connection: sqlite3.Connection) -> dict[str, Any]:
         (item for item in active_summaries if item["kind"] == "space"),
         key=lambda item: (space_order.get(item["name"], 999), item["name"].casefold()),
     )
+    source_summaries = report_source_summaries(resources)
     format_counts = Counter(item["presentation"]["format"] for item in resources)
     intent_counts = Counter(item["presentation"]["intent"] for item in resources)
     queue_counts = Counter(item["presentation"]["queue"] for item in resources)
@@ -3187,6 +3436,7 @@ def report_payload(connection: sqlite3.Connection) -> dict[str, Any]:
         "topicSummaries": [item for item in active_summaries if item["kind"] == "topic"],
         "focusSummaries": [item for item in active_summaries if item["kind"] == "focus"],
         "projectSummaries": [item for item in active_summaries if item["kind"] == "project"],
+        "sourceSummaries": source_summaries,
         "facets": {
             "formats": [{"name": name, "count": count} for name, count in format_counts.most_common()],
             "intents": [{"name": name, "count": count} for name, count in intent_counts.most_common()],
@@ -3212,6 +3462,7 @@ def generate_report(
     for resource in [*document["resources"], *document["discoveries"]]:
         if resource["resourceId"] not in available_previews:
             resource["presentation"]["preview"]["localImage"] = ""
+    document["sourceSummaries"] = report_source_summaries(document["resources"])
     payload = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
     payload = payload.replace("</", "<\\/").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
     template = """<!doctype html>

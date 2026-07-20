@@ -18,9 +18,12 @@ Windows service.
   provenance, concise summaries, previews, and last-known browser context.
 - Organizes the complete accepted library as Space -> Topic -> Focus, with
   optional cross-cutting Project collections.
+- Provides a separate Source lens for platform, domain, owner, channel, and
+  community retrieval without replacing the purpose hierarchy.
 - Generates a local decision workspace with preview crops, brief and detailed
-  views, search, browser-group filters, discovery review, duplicate review, open
-  tab review, and batched infinite scrolling.
+  views, dense metadata previews when no image exists, search, browser-group
+  filters, discovery review, duplicate review, open tab review, and batched
+  infinite scrolling.
 - Can close exact duplicate extras or every reviewed captured tab through
   separate authenticated, backed-up, post-verified operations.
 
@@ -78,6 +81,22 @@ python scripts/tab_atlas.py discoveries --state dismissed
 python scripts/tab_atlas.py accept --resource-id <id>
 ```
 
+Accepted resources can be removed from the visible library without erasing their
+URL, annotations, provenance, or preview. Restore them with `accept`:
+
+```powershell
+python scripts/tab_atlas.py remove --resource-id <id>
+python scripts/tab_atlas.py discoveries --state dismissed
+python scripts/tab_atlas.py accept --resource-id <id>
+```
+
+Codex can attach a validated local JPEG, PNG, or WebP capture to a known resource:
+
+```powershell
+python scripts/tab_atlas.py register-preview --resource-id <id> path\to\capture.png
+python scripts/tab_atlas.py report
+```
+
 The generated report is `tab-atlas/report/index.html`.
 
 ## Browser Extension
@@ -123,19 +142,26 @@ normal browser profile.
 - **Home** provides one next action and the six purpose Spaces.
 - **Spaces** drill into Topic and Focus levels, with format, browser, and captured
   group filters.
+- **Sources** groups the same resources by major platform. Reliable URL evidence
+  adds owner handles, repository owners, communities, and ordinary-site domains;
+  semantic topics remain available when publisher evidence is absent.
 - **Review** separates new discoveries, ambiguous accepted resources, exact
   duplicates, and currently open tabs.
 - Resource cards show the smallest useful decision set: visual evidence where
   available, cleaned title, concise brief, topic/focus signal, next action, and
-  open or stored state. The inspector exposes provenance and detail on demand.
+  open or stored state. Missing images become explicit metadata previews rather
+  than empty placeholders. The inspector exposes provenance and detail on demand.
+- Every resource exposes direct Open source and Copy link commands. More actions
+  can request a richer preview, semantic reconsideration, or recoverable removal
+  from the library.
 - Discovery cards receive agent-written decision summaries and safe public video
   thumbnails before acceptance, so review is not limited to raw tab titles.
 - The first 30 matching cards render immediately. More are appended as the user
   scrolls, without a manual Show more control.
 
-Report commands download privacy-safe action requests. They do not mutate the
-database or browser directly; Codex validates and executes the corresponding CLI
-operation.
+Report commands download privacy-safe action requests containing opaque resource
+IDs, not source URLs. They do not mutate the database or browser directly; Codex
+validates and executes the corresponding CLI operation.
 
 ## Safe Close Operations
 

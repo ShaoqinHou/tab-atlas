@@ -49,6 +49,14 @@ python scripts/tab_atlas.py discoveries --state dismissed
 python scripts/tab_atlas.py accept --resource-id <id>
 ```
 
+An accepted resource can also be removed from the visible library without
+destroying its retained evidence:
+
+```powershell
+python scripts/tab_atlas.py remove --resource-id <id>
+python scripts/tab_atlas.py accept --resource-id <id>
+```
+
 A canonical repeat updates live and provenance data without creating another
 discovery. Accepted resources remain in the durable library after their browser
 tabs close.
@@ -86,9 +94,9 @@ Do not invent details that the captured evidence does not support.
 ## Report And Retrieval
 
 The generated `report/index.html` is a local decision surface with Spaces,
-Topics, Focuses, Project overlays, discovery review, search, progressive detail,
-and batched infinite scrolling. Browser groups are contextual filters, not the
-primary taxonomy.
+Topics, Focuses, Project overlays, a separate Source/owner lens, discovery
+review, search, progressive detail, and batched infinite scrolling. Browser
+groups are contextual filters, not the primary taxonomy.
 
 Use conversational retrieval without dumping raw rows:
 
@@ -98,6 +106,21 @@ python scripts/tab_atlas.py query --text "..."
 
 `enrich` caches only allowlisted public visual evidence. It does not crawl every
 tab, access authenticated pages, or send private URLs to an LLM provider.
+Where the user requests richer evidence and capture is appropriate, register a
+locally captured image by opaque resource ID, then regenerate the report:
+
+```powershell
+python scripts/tab_atlas.py register-preview --resource-id <id> path\to\capture.png
+python scripts/tab_atlas.py report
+```
+
+Report action requests map as follows:
+
+- `remove_from_library`: verify the ID is accepted, then run `remove`.
+- `capture_resource_preview`: capture only with an appropriate isolated or
+  user-authorized browser context, then run `register-preview`.
+- `reconsider_resource`: inspect that resource with the complete library and
+  apply evidence-supported annotation changes through `apply`.
 
 ## Pairing And Capture
 

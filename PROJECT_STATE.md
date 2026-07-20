@@ -41,16 +41,19 @@ Current ignored local data:
 - Focus-level organization now includes the newly useful tactical-RPG,
   AI-assisted game-development, survival-systems, and traditional-joinery cuts.
 - 316 resources have cached public preview evidence.
+- The remaining accepted resources receive explicit metadata previews in the
+  report; richer local JPEG, PNG, or WebP captures can be registered on demand.
 - 99 accepted resources remain unclassified because their evidence is generic,
   private, authenticated, local, or otherwise too weak for a responsible guess.
 - Schema version 7, SQLite integrity `ok`, and zero foreign-key violations.
 
 The report now separates New discoveries, Inbox, Exact duplicates, and Open tabs.
-It exposes Space -> Topic -> Focus navigation, browser-group filters, search,
-preview crops, progressive detail, per-resource and aggregate action requests,
-and 30-item batched infinite scrolling. Group filters are derived only from the
-latest live captures; historical group provenance remains in resource details but
-cannot create a stale navigation group.
+It exposes Space -> Topic -> Focus navigation plus a Source lens with reliable
+owner/domain subgroups, browser-group filters, search, image or metadata previews,
+progressive detail, direct open/copy commands, recoverable removal and enrichment
+requests, and 30-item batched infinite scrolling. Group filters are derived only
+from the latest live captures; historical group provenance remains in resource
+details but cannot create a stale navigation group.
 
 ## Browser Safety
 
@@ -101,7 +104,7 @@ enough to submit and verify the signed cleanup result, then removes the handoff.
 
 ## Verification Checkpoint
 
-- 29 Python behavior and receiver integration tests pass.
+- 32 Python behavior and receiver integration tests pass.
 - Three independent Node protocol tests pass.
 - Normal Chrome and Edge archive: 745 planned, 745 reported closed, zero skipped,
   both post-captures verified, raw evidence retained, backup integrity `ok`, and
@@ -130,7 +133,7 @@ enough to submit and verify the signed cleanup result, then removes the handoff.
 
 ```text
 Branch: codex/ongoing-library-and-safe-archive
-Draft PR: https://github.com/ShaoqinHou/tab-atlas/pull/1
+PR: https://github.com/ShaoqinHou/tab-atlas/pull/1
 ```
 
 The ignored database, snapshots, previews, generated report, pairings, approval

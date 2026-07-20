@@ -8,6 +8,7 @@ const data = window.__TAB_ATLAS__ || {
   topicSummaries: [],
   focusSummaries: [],
   projectSummaries: [],
+  sourceSummaries: [],
   facets: {}
 };
 
@@ -22,6 +23,7 @@ const spaceSummaries = hasSpaceContract
   ? (data.spaceSummaries || [])
   : (data.collectionSummaries || []);
 const projectSummaries = data.projectSummaries || [];
+const sourceSummaries = Array.isArray(data.sourceSummaries) ? data.sourceSummaries : [];
 const galleryLoaders = new WeakMap();
 const galleryObservers = new Set();
 const galleryLoadTimers = new Set();
@@ -30,6 +32,9 @@ const state = {
   view: "home",
   search: "",
   scope: null,
+  sourceScope: null,
+  sourcePublisher: "all",
+  sourceTopic: "all",
   topic: "all",
   focus: "all",
   reviewMode: discoveries.length ? "discoveries" : "inbox",
@@ -54,6 +59,7 @@ app.innerHTML = `
   <nav id="primaryNav" class="primary-nav" aria-label="Primary views" role="tablist">
     <button type="button" role="tab" data-view="home">Home</button>
     <button type="button" role="tab" data-view="spaces">Spaces</button>
+    <button type="button" role="tab" data-view="sources">Sources</button>
     <button type="button" role="tab" data-view="review">Review <span id="navLiveCount" class="nav-count" hidden>0</span></button>
   </nav>
   <main id="screen" class="screen"></main>
@@ -97,6 +103,7 @@ function render() {
   updateNavigation();
   if (state.search) renderSearch();
   else if (state.view === "spaces") renderSpaces();
+  else if (state.view === "sources") renderSources();
   else if (state.view === "review") renderReview();
   else renderHome();
   renderDrawer();
@@ -282,6 +289,150 @@ function renderSpaces() {
     for (const summaryItem of spaceSummaries) grid.append(spaceCard(summaryItem));
     page.append(grid);
   }
+  elements.screen.replaceChildren(page);
+}
+
+function renderSources() {
+  const summary = selectedSourceSummary();
+  if (state.sourceScope && summary) {
+    renderSourceDetail(summary);
+    return;
+  }
+  if (state.sourceScope && !summary) state.sourceScope = null;
+
+  const page = node("section", "directory-page sources-page");
+  page.append(pageHeading(
+    "Sources",
+    "Browse the retained library by platform, site, owner, channel, community, and semantic topic."
+  ));
+  if (!sourceSummaries.length) {
+    page.append(emptyState("No source information is available yet."));
+  } else {
+    const list = node("div", "source-directory");
+    for (const summaryItem of sourceSummaries) list.append(sourceSummaryRow(summaryItem));
+    page.append(list);
+  }
+  elements.screen.replaceChildren(page);
+}
+
+function sourceSummaryRow(summary) {
+  const button = node("button", "source-summary-row");
+  button.type = "button";
+  const mosaic = node("span", "source-summary-mosaic");
+  const previewIds = (summary.previewResourceIds || summary.resourceIds || []).slice(0, 3);
+  for (const id of previewIds) {
+    const resource = resourceById.get(id);
+    if (resource) mosaic.append(previewVisual(resource, "mosaic", false));
+  }
+  while (mosaic.childElementCount < 3) mosaic.append(node("span", "mosaic-empty"));
+
+  const copy = node("span", "source-summary-copy");
+  copy.append(
+    node("span", "source-summary-kicker", `${formatNumber(summary.resourceCount)} resources`),
+    node("strong", "", summary.name)
+  );
+  const facets = node("span", "source-summary-facets");
+  const repeatedPublishers = (summary.publishers || []).filter(item => item.resourceCount > 1).slice(0, 3);
+  const facetValues = repeatedPublishers.length ? repeatedPublishers : (summary.topTopics || []).slice(0, 3);
+  for (const item of facetValues) facets.append(chip(`${item.name} ${formatNumber(item.resourceCount || item.count)}`));
+  if (facets.childElementCount) copy.append(facets);
+
+  const coverage = node("span", "source-summary-coverage");
+  coverage.append(
+    node("strong", "", formatNumber(summary.previewCount)),
+    node("span", "", "image previews"),
+    node("small", "", `${formatNumber(summary.metadataPreviewCount)} metadata previews`)
+  );
+  button.append(mosaic, copy, coverage);
+  button.addEventListener("click", () => openSourceScope(summary.id));
+  return button;
+}
+
+function renderSourceDetail(summary) {
+  const members = resourcesForSourceSummary(summary);
+  const publishers = summary.publishers || [];
+  const topics = scopeTopics(summary, members);
+  const validPublishers = new Set(publishers.map(item => item.name));
+  if (state.sourcePublisher !== "all"
+      && state.sourcePublisher !== "__unattributed"
+      && !validPublishers.has(state.sourcePublisher)) {
+    state.sourcePublisher = "all";
+  }
+  if (state.sourceTopic !== "all" && !topics.includes(state.sourceTopic)) state.sourceTopic = "all";
+
+  const page = node("section", "source-detail-page");
+  const head = node("header", "scope-head");
+  const copy = node("div", "scope-copy");
+  const back = node("button", "back-button", "Back to sources");
+  back.type = "button";
+  back.addEventListener("click", () => {
+    state.sourceScope = null;
+    state.sourcePublisher = "all";
+    state.sourceTopic = "all";
+    state.filters = defaultFilters();
+    state.visibleLimit = PAGE_SIZE;
+    state.selectedResource = null;
+    renderAtTop();
+  });
+  copy.append(
+    back,
+    node("p", "eyebrow", "Source lens"),
+    node("h2", "", summary.name),
+    node("p", "scope-summary", `${formatNumber(members.length)} retained resources grouped without changing their purpose spaces.`)
+  );
+  const facts = node("div", "scope-facts");
+  facts.append(
+    factChip(`${formatNumber(summary.previewCount)} image previews`),
+    factChip(`${formatNumber(summary.metadataPreviewCount)} metadata previews`)
+  );
+  head.append(copy, facts);
+  page.append(head);
+
+  const sourceControls = node("div", "source-controls");
+  if (publishers.length || summary.attributedCount < summary.resourceCount) {
+    sourceControls.append(sourceSelectControl(
+      "Owner, channel, or site",
+      ["all", ...(summary.attributedCount < summary.resourceCount ? ["__unattributed"] : []), ...publishers.map(item => item.name)],
+      state.sourcePublisher,
+      value => {
+        state.sourcePublisher = value;
+        state.visibleLimit = PAGE_SIZE;
+        state.selectedResource = null;
+        renderAtTop();
+      },
+      "All owners and sites"
+    ));
+  }
+  if (topics.length) {
+    sourceControls.append(sourceSelectControl(
+      "Topic",
+      ["all", ...topics],
+      state.sourceTopic,
+      value => {
+        state.sourceTopic = value;
+        state.visibleLimit = PAGE_SIZE;
+        state.selectedResource = null;
+        renderAtTop();
+      },
+      "All topics"
+    ));
+  }
+  if (sourceControls.childElementCount) page.append(sourceControls);
+  page.append(filterPanel(members));
+
+  const filtered = filterResources(members).filter(resource => {
+    const publisher = String(resource.presentation?.publisher || "");
+    const publisherMatches = state.sourcePublisher === "all"
+      || (state.sourcePublisher === "__unattributed" ? !publisher : publisher === state.sourcePublisher);
+    return publisherMatches
+      && (state.sourceTopic === "all" || resourceTopics(resource).includes(state.sourceTopic));
+  });
+  page.append(resourceGallery(filtered, {
+    label: state.sourcePublisher !== "all"
+      ? sourcePublisherLabel(state.sourcePublisher)
+      : (state.sourceTopic !== "all" ? state.sourceTopic : "All resources"),
+    empty: "No resources match these source and filter choices."
+  }));
   elements.screen.replaceChildren(page);
 }
 
@@ -626,7 +777,7 @@ function resourceCard(resource, options = {}) {
 
   const chips = resourceChips(resource, options.hideSpace);
   if (chips.childElementCount) body.append(chips);
-  article.append(body, resourceFooter(resource, "card"));
+  article.append(body, resourceCommands(resource, "card"), resourceFooter(resource, "card"));
   return article;
 }
 
@@ -644,7 +795,7 @@ function previewVisual(resource, size, allowRemote) {
     image.decoding = "async";
     image.addEventListener("error", () => frame.replaceChildren(fallback));
     image.src = localImage;
-    frame.append(image);
+    frame.append(image, node("span", "preview-evidence-label", "Saved image"));
     return frame;
   }
 
@@ -676,12 +827,16 @@ function previewVisual(resource, size, allowRemote) {
 
 function sourceFallback(resource) {
   const presentation = resource.presentation || {};
-  const preview = presentation.preview || {};
   const fallback = node("div", "source-fallback");
   fallback.setAttribute("aria-hidden", "true");
+  const identity = presentation.publisher || presentation.source || resource.host || "Resource";
+  const summary = resource.brief || presentation.contextCue || resource.displayUrl || "Stored page metadata";
   fallback.append(
-    node("strong", "", preview.label || initials(presentation.source || resource.host || "Resource")),
-    node("span", "", presentation.format || resource.kind || "Resource")
+    node("span", "fallback-source", identity),
+    node("strong", "fallback-title", resourceDisplayTitle(resource)),
+    node("span", "fallback-summary", summary),
+    node("span", "fallback-meta", `${presentation.format || resource.kind || "Resource"} / ${presentation.intent || "Reference"}`),
+    node("span", "preview-evidence-label", "Metadata preview")
   );
   return fallback;
 }
@@ -703,6 +858,51 @@ function resourceChips(resource, hideSpace = false) {
     chips.append(chip(`${count}${qualifier} exact ${count === 1 ? "copy" : "copies"}`, "duplicate-chip"));
   }
   return chips;
+}
+
+function resourceCommands(resource, placement) {
+  const wrapper = node("div", `resource-commands ${placement}-resource-commands`);
+  const sourceUrl = resourceSourceUrl(resource);
+  if (sourceUrl) {
+    const open = node("a", "resource-command-link", "Open source");
+    open.href = sourceUrl;
+    open.target = "_blank";
+    open.rel = "noreferrer";
+    wrapper.append(open);
+
+    const copy = node("button", "resource-command-button", "Copy link");
+    copy.type = "button";
+    copy.addEventListener("click", () => copyResourceLink(resource));
+    wrapper.append(copy);
+  }
+
+  const menu = document.createElement("details");
+  menu.className = "resource-command-menu";
+  const summary = node("summary", "", "More");
+  summary.title = `More actions for ${resourceDisplayTitle(resource)}`;
+  menu.append(summary);
+  const choices = node("div", "resource-command-choices");
+  if (!resource.presentation?.preview?.localImage) {
+    choices.append(menuCommand("Request richer preview", () => requestResourcePreview(resource)));
+  }
+  choices.append(menuCommand("Reclassify", () => requestResourceReclassification(resource)));
+  if (resource.libraryState === "accepted") {
+    choices.append(menuCommand("Remove from library", () => requestLibraryRemoval(resource), "danger"));
+  }
+  menu.append(choices);
+  wrapper.append(menu);
+  return wrapper;
+}
+
+function menuCommand(label, onClick, tone = "") {
+  const button = node("button", tone, label);
+  button.type = "button";
+  button.addEventListener("click", event => {
+    onClick();
+    const menu = event.currentTarget.closest("details");
+    if (menu) menu.open = false;
+  });
+  return button;
 }
 
 function resourceFooter(resource, placement) {
@@ -786,14 +986,7 @@ function renderDrawer() {
   const content = node("div", "drawer-content");
   const titleBlock = node("section", "detail-title");
   titleBlock.append(node("h2", "", resourceDisplayTitle(resource)));
-  const openUrl = resource.openUrl || resource.canonicalUrl || "";
-  if (/^(https?|file):/i.test(openUrl)) {
-    const link = node("a", "open-source", "Open source");
-    link.href = openUrl;
-    link.target = "_blank";
-    link.rel = "noreferrer";
-    titleBlock.append(link);
-  }
+  titleBlock.append(resourceCommands(resource, "drawer"));
   content.append(titleBlock);
 
   const glance = node("section", "detail-section");
@@ -873,6 +1066,7 @@ function metadataSection(resource) {
   const facts = node("dl", "metadata-grid");
   facts.append(
     cue("Source", resource.presentation?.source || resource.host),
+    cue("Owner/site", resource.presentation?.publisher),
     cue("Format", resource.presentation?.format || resource.kind),
     cue("Intent", resource.presentation?.intent),
     cue("Open tabs", String(openCount)),
@@ -991,6 +1185,28 @@ function selectControl(label, values, selected, onChange) {
   return wrapper;
 }
 
+function sourceSelectControl(label, values, selected, onChange, allLabel) {
+  const wrapper = node("label", "source-select-control");
+  wrapper.append(node("span", "", label));
+  const select = document.createElement("select");
+  for (const value of values) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value === "all"
+      ? allLabel
+      : sourcePublisherLabel(value);
+    option.selected = value === selected;
+    select.append(option);
+  }
+  select.addEventListener("change", () => onChange(select.value));
+  wrapper.append(select);
+  return wrapper;
+}
+
+function sourcePublisherLabel(value) {
+  return value === "__unattributed" ? "Publisher not captured" : value;
+}
+
 function filterOptionLabel(label, value) {
   if (value === "all") return `All ${label.toLocaleLowerCase()}s`;
   if (value === "__ungrouped") return "No browser group";
@@ -1002,12 +1218,39 @@ function openScope(kind, id) {
   state.search = "";
   elements.search.value = "";
   state.scope = { kind, id };
+  state.sourceScope = null;
   state.topic = "all";
   state.focus = "all";
   state.filters = defaultFilters();
   state.visibleLimit = PAGE_SIZE;
   state.selectedResource = null;
   renderAtTop();
+}
+
+function openSourceScope(id) {
+  state.view = "sources";
+  state.search = "";
+  elements.search.value = "";
+  state.scope = null;
+  state.sourceScope = id;
+  state.sourcePublisher = "all";
+  state.sourceTopic = "all";
+  state.filters = defaultFilters();
+  state.visibleLimit = PAGE_SIZE;
+  state.selectedResource = null;
+  renderAtTop();
+}
+
+function selectedSourceSummary() {
+  if (!state.sourceScope) return null;
+  return sourceSummaries.find(summary => summary.id === state.sourceScope) || null;
+}
+
+function resourcesForSourceSummary(summary) {
+  return (summary.resourceIds || [])
+    .map(id => resourceById.get(id))
+    .filter(Boolean)
+    .sort(resourceSort);
 }
 
 function selectedScopeSummary() {
@@ -1189,6 +1432,8 @@ function matchesSearch(resource) {
     resource.whyKept,
     resource.nextAction,
     resource.presentation?.source,
+    resource.presentation?.sourceGroup,
+    resource.presentation?.publisher,
     resource.presentation?.format,
     resource.presentation?.intent,
     resource.presentation?.contextCue,
@@ -1221,22 +1466,30 @@ function openReview(mode) {
   state.search = "";
   elements.search.value = "";
   state.scope = null;
+  state.sourceScope = null;
   state.visibleLimit = PAGE_SIZE;
   state.selectedResource = null;
   renderAtTop();
 }
 
 function setView(view) {
-  state.view = ["home", "spaces", "review"].includes(view) ? view : "home";
+  state.view = ["home", "spaces", "sources", "review"].includes(view) ? view : "home";
   state.search = "";
   elements.search.value = "";
   state.selectedResource = null;
   state.visibleLimit = PAGE_SIZE;
   if (state.view !== "spaces") state.scope = null;
+  if (state.view !== "sources") state.sourceScope = null;
   if (state.view === "spaces") {
     state.scope = null;
     state.topic = "all";
     state.focus = "all";
+    state.filters = defaultFilters();
+  }
+  if (state.view === "sources") {
+    state.sourceScope = null;
+    state.sourcePublisher = "all";
+    state.sourceTopic = "all";
     state.filters = defaultFilters();
   }
   renderAtTop();
@@ -1302,6 +1555,56 @@ function requestDuplicateClose(resource = null) {
     matchingResources,
     safeDuplicateCandidates
   }, resource ? [resource.resourceId] : []);
+}
+
+function requestLibraryRemoval(resource) {
+  if (!resource || resource.libraryState !== "accepted") return;
+  downloadActionRequest("remove_from_library", {
+    libraryResources: libraryResourceCount(),
+    selectedResources: 1
+  }, [resource.resourceId]);
+}
+
+function requestResourcePreview(resource) {
+  if (!resource) return;
+  downloadActionRequest("capture_resource_preview", {
+    selectedResources: 1,
+    existingImagePreviews: resource.presentation?.preview?.localImage ? 1 : 0
+  }, [resource.resourceId]);
+}
+
+function requestResourceReclassification(resource) {
+  if (!resource) return;
+  downloadActionRequest("reconsider_resource", {
+    selectedResources: 1,
+    libraryResources: libraryResourceCount()
+  }, [resource.resourceId]);
+}
+
+function resourceSourceUrl(resource) {
+  const value = String(resource?.openUrl || resource?.canonicalUrl || "");
+  return /^(https?|file):/i.test(value) ? value : "";
+}
+
+async function copyResourceLink(resource) {
+  const value = resourceSourceUrl(resource);
+  if (!value) return;
+  let copied = false;
+  try {
+    await navigator.clipboard.writeText(value);
+    copied = true;
+  } catch {
+    const input = document.createElement("textarea");
+    input.value = value;
+    input.setAttribute("readonly", "");
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.append(input);
+    input.select();
+    copied = document.execCommand("copy");
+    input.remove();
+  }
+  elements.actionStatus.textContent = copied ? "Source link copied." : "The source link could not be copied.";
 }
 
 function downloadActionRequest(action, counts, resourceIds = []) {
@@ -1395,11 +1698,6 @@ function node(tag, className = "", text = "") {
   if (className) element.className = className;
   if (text !== "") element.textContent = text;
   return element;
-}
-
-function initials(value) {
-  const parts = String(value || "?").split(/[.\-_\s]+/).filter(Boolean);
-  return parts.slice(0, 2).map(part => part[0]).join("").toUpperCase() || "?";
 }
 
 function capitalize(value) {

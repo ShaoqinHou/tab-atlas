@@ -38,6 +38,8 @@ from tab_atlas_core import (  # noqa: E402
     report_payload,
     record_archive_plan,
     record_mutation_plan,
+    remove_library_resources,
+    register_local_preview,
     resource_presentation,
     revoke_pairing,
     save_pairing,
@@ -254,6 +256,45 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(restored["updated"], 1)
             self.assertEqual(plan["summary"]["dismissedOpenResourceCount"], 0)
             self.assertEqual(plan["summary"]["plannedClosures"], 1)
+
+    def test_library_removal_is_recoverable_and_preserves_resource_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [{
+                        "id": 7,
+                        "windowId": 1,
+                        "index": 0,
+                        "title": "Retained evidence",
+                        "url": "https://example.com/remove-me",
+                    }],
+                },
+                "extension_live",
+            )
+            resource = library_resources(connection)[0]
+            apply_annotations(
+                connection,
+                [{"resourceId": resource["resourceId"], "brief": "Useful retained context."}],
+            )
+
+            removed = remove_library_resources(connection, {resource["resourceId"]})
+            dismissed = library_resources(connection, {"dismissed"})[0]
+            restored = set_discovery_state(connection, "accepted", {resource["resourceId"]})
+            accepted = library_resources(connection)[0]
+            connection.close()
+
+            self.assertTrue(removed["recoverable"])
+            self.assertEqual(removed["updated"], 1)
+            self.assertEqual(dismissed["brief"], "Useful retained context.")
+            self.assertEqual(dismissed["canonicalUrl"], "https://example.com/remove-me")
+            self.assertEqual(restored["updated"], 1)
+            self.assertEqual(accepted["resourceId"], resource["resourceId"])
 
     def test_close_plans_bind_to_explicit_fresh_capture_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -885,6 +926,8 @@ class CatalogTests(unittest.TestCase):
 
         self.assertEqual(presentation["format"], "Video")
         self.assertEqual(presentation["displayTitle"], "Example video")
+        self.assertEqual(presentation["sourceGroup"], "YouTube")
+        self.assertEqual(presentation["publisher"], "")
         self.assertEqual(presentation["intent"], "Watch")
         self.assertEqual(presentation["queue"], "needs_context")
         self.assertTrue(presentation["preview"]["requiresUserLoad"])
@@ -892,6 +935,84 @@ class CatalogTests(unittest.TestCase):
             presentation["preview"]["remoteImage"],
             "https://i.ytimg.com/vi/abc123XYZ00/mqdefault.jpg",
         )
+
+    def test_source_lens_uses_reliable_owner_signals_and_groups_other_sites(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "edge",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {"title": "Post A", "url": "https://x.com/example_dev/status/100"},
+                        {"title": "Post B", "url": "https://x.com/example_dev/status/200"},
+                        {"title": "Guide", "url": "https://docs.example.test/guide"},
+                        {"title": "Repository", "url": "https://github.com/example-owner/project"},
+                    ],
+                },
+                "test",
+            )
+
+            payload = report_payload(connection)
+            connection.close()
+
+            summaries = {item["name"]: item for item in payload["sourceSummaries"]}
+            x_summary = summaries["X"]
+            other_summary = summaries["Other websites"]
+            github_resource = next(
+                item for item in payload["resources"]
+                if item["presentation"]["source"] == "GitHub"
+            )
+            browser_presentation = resource_presentation({
+                "openUrl": "chrome-extension://efaidnbmnnnibpcajpcglclefindmkaj/index.html",
+                "host": "efaidnbmnnnibpcajpcglclefindmkaj",
+                "kind": "web_page",
+                "title": "Document viewer",
+                "collections": [],
+                "tasks": [],
+                "tabs": [],
+            })
+
+            self.assertEqual(x_summary["resourceCount"], 2)
+            self.assertEqual(x_summary["publishers"][0]["name"], "@example_dev")
+            self.assertEqual(x_summary["publishers"][0]["resourceCount"], 2)
+            self.assertEqual(other_summary["publishers"][0]["name"], "docs.example.test")
+            self.assertEqual(github_resource["presentation"]["publisher"], "example-owner")
+            self.assertEqual(browser_presentation["sourceGroup"], "Browser")
+
+    def test_local_preview_registration_validates_and_persists_private_image_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [{"title": "Preview target", "url": "https://example.com/preview"}],
+                },
+                "test",
+            )
+            resource_id = library_resources(connection)[0]["resourceId"]
+            image = state / "capture.bin"
+            image.write_bytes(bytes.fromhex(
+                "89504e470d0a1a0a0000000d4948445200000001000000010804000000"
+                "b51c0c020000000b4944415478da63fcff1f0003030200efa57eea00000000"
+                "49454e44ae426082"
+            ))
+
+            result = register_local_preview(connection, state, resource_id, image)
+            stored = library_resources(connection)[0]
+            connection.close()
+
+            self.assertEqual(result["kind"], "screenshot")
+            self.assertEqual(stored["previewKind"], "screenshot")
+            self.assertEqual(stored["previewSource"], "agent_local_capture")
+            self.assertTrue((state / stored["previewLocalPath"]).is_file())
 
     def test_report_keeps_duplicate_group_titles_as_distinct_groups(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

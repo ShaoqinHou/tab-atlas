@@ -29,6 +29,8 @@ from tab_atlas_core import (
     record_archive_cleanup_result,
     record_archive_plan,
     record_mutation_plan,
+    remove_library_resources,
+    register_local_preview,
     revoke_pairing,
     set_discovery_state,
     utc_now,
@@ -119,6 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
     dismiss_parser.add_argument("--all", action="store_true", dest="all_discoveries")
     dismiss_parser.add_argument("--resource-id", action="append", default=[])
 
+    remove_parser = subparsers.add_parser(
+        "remove",
+        help="Remove accepted resources from the library while retaining recoverable evidence",
+    )
+    remove_parser.add_argument("--resource-id", action="append", required=True)
+
     batch_parser = subparsers.add_parser("batch", help="Emit a bounded resource batch for Codex")
     batch_parser.add_argument(
         "--state",
@@ -146,6 +154,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     enrich_parser.add_argument("--refresh", action="store_true")
     enrich_parser.add_argument("--workers", type=int, default=8)
+
+    preview_parser = subparsers.add_parser(
+        "register-preview",
+        help="Validate and store a local screenshot for one known resource",
+    )
+    preview_parser.add_argument("--resource-id", required=True)
+    preview_parser.add_argument("path", type=Path)
 
     dedupe_parser = subparsers.add_parser(
         "dedupe",
@@ -345,6 +360,12 @@ def main(argv: list[str] | None = None) -> int:
             output(result)
             return 0
 
+        if args.command == "remove":
+            result = remove_library_resources(connection, args.resource_id)
+            result["inventory"] = inventory(connection)
+            output(result)
+            return 0
+
         if args.command == "batch":
             limit = max(1, min(100, args.limit))
             offset = max(0, args.offset)
@@ -379,6 +400,17 @@ def main(argv: list[str] | None = None) -> int:
                     state_dir,
                     refresh=args.refresh,
                     workers=max(1, min(16, args.workers)),
+                )
+            )
+            return 0
+
+        if args.command == "register-preview":
+            output(
+                register_local_preview(
+                    connection,
+                    state_dir,
+                    args.resource_id,
+                    args.path,
                 )
             )
             return 0

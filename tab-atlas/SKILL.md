@@ -98,6 +98,20 @@ Topics, Focuses, Project overlays, a separate Source/owner lens, discovery
 review, search, progressive detail, and batched infinite scrolling. Browser
 groups are contextual filters, not the primary taxonomy.
 
+For the interactive report, generate and start the on-demand read-only loopback
+viewer. It is not scheduled and stops with `Ctrl+C`:
+
+```powershell
+python scripts/tab_atlas.py view --port 8790 --open
+```
+
+The localhost viewer preserves the HTTP referrer required by privacy-enhanced
+YouTube embeds. Supported video cards stream one muted preview only after hover
+or an explicit play action and tear it down when attention moves away. With
+reduced-motion or data-saver enabled, use the play button because automatic hover
+playback is suppressed. Do not replace this bounded viewer with a background
+service.
+
 Use conversational retrieval without dumping raw rows:
 
 ```powershell
@@ -106,10 +120,13 @@ python scripts/tab_atlas.py query --text "..."
 
 `enrich` caches only allowlisted public visual evidence. Its adapters currently
 cover YouTube thumbnails, X post media/posters, GitHub social images, and Reddit
-post media. Provider page and image redirects must remain HTTPS and inside the
-adapter's host allowlists; X profile images are specifically rejected. It does
-not crawl every tab, access authenticated pages, or send private URLs to an LLM
-provider. Existing agent captures are never overwritten by automatic enrichment.
+post media. It may retain an allowlisted public X `video.twimg.com` MP4 URL as
+motion metadata, but it never downloads the video bytes; YouTube motion uses the
+video ID already present in the canonical URL. Provider page and image redirects
+must remain HTTPS and inside the adapter's host allowlists; X profile images are
+specifically rejected. It does not crawl every tab, access authenticated pages,
+or send private URLs to an LLM provider. Existing agent captures are never
+overwritten by automatic enrichment.
 Where the user requests richer evidence and capture is appropriate, register a
 locally captured image by opaque resource ID, then regenerate the report:
 

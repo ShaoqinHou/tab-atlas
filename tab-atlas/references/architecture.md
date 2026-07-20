@@ -14,7 +14,7 @@ one-shot receiver -> raw capture -> SQLite catalog
                                       |-- staged discoveries
                                       |-- durable accepted library
                                       |-- bounded Codex batches
-                                      `-- static local report
+                                      `-- generated report + on-demand viewer
 ```
 
 The agent-operated cycle is:
@@ -79,16 +79,19 @@ Presentation evidence has three layers:
 3. Selective source inspection when the first two layers cannot support a useful
    decision.
 
-Cache only allowlisted public preview media during explicit enrichment. Do not
+Cache only allowlisted public preview images during explicit enrichment. Do not
 crawl arbitrary URLs, access authenticated pages, or load remote media when the
-report opens.
+report opens. The optional loopback viewer is read-only and starts only for an
+interactive session. A supported video loads remotely only after a short hover
+dwell or explicit play action; one active player is torn down on leave, scroll,
+Escape, page hide, or replacement. Video bytes are never persisted.
 
 ### Preview selection matrix
 
 | Resource type | Default card evidence | Richer evidence policy |
 | --- | --- | --- |
-| YouTube video | Public video thumbnail | Cache the allowlisted video image |
-| X status | Post metadata | Cache attached post image, video/GIF poster, or card image; reject avatars |
+| YouTube video | Public video thumbnail | Cache the allowlisted image; derive a privacy-enhanced live embed from its video ID on interaction |
+| X status | Post metadata | Cache attached post image, video/GIF poster, or card image; retain only a strictly allowlisted public MP4 URL for interaction; reject avatars |
 | GitHub repository/page | Repository metadata | Cache an allowlisted GitHub social image |
 | Reddit post | Post metadata | Cache allowlisted attached post media when exposed |
 | PDF | Document metadata | Render or capture the first useful page on demand |

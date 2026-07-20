@@ -44,6 +44,7 @@ from tab_atlas_receiver import (
     run_pairing,
     run_revocation,
 )
+from tab_atlas_report import DEFAULT_REPORT_PORT, create_report_server
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -147,6 +148,14 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser = subparsers.add_parser("report", help="Generate the local read-only HTML report")
     report_parser.add_argument("--output", type=Path, default=DEFAULT_REPORT)
     report_parser.add_argument("--open", action="store_true", dest="open_report")
+
+    view_parser = subparsers.add_parser(
+        "view",
+        help="Generate and serve the report from a read-only loopback viewer",
+    )
+    view_parser.add_argument("--output", type=Path, default=DEFAULT_REPORT)
+    view_parser.add_argument("--port", type=int, default=DEFAULT_REPORT_PORT)
+    view_parser.add_argument("--open", action="store_true", dest="open_report")
 
     enrich_parser = subparsers.add_parser(
         "enrich",
@@ -720,6 +729,23 @@ def main(argv: list[str] | None = None) -> int:
             output({"report": str(report_path), "resources": len(library_resources(connection))})
             if args.open_report:
                 webbrowser.open(report_path.as_uri())
+            return 0
+
+        if args.command == "view":
+            output_dir = args.output.resolve()
+            report_path = generate_report(connection, output_dir, REPORT_ASSETS, state_dir)
+            connection.close()
+            server, url = create_report_server(report_path.parent, args.port)
+            output({"report": str(report_path), "url": url, "readOnly": True})
+            sys.stdout.flush()
+            if args.open_report:
+                webbrowser.open(url)
+            try:
+                server.serve_forever(poll_interval=0.25)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                server.server_close()
             return 0
     finally:
         try:

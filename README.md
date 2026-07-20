@@ -69,6 +69,7 @@ python scripts/tab_atlas.py discoveries
 python scripts/tab_atlas.py accept --all
 python scripts/tab_atlas.py enrich
 python scripts/tab_atlas.py report
+python scripts/tab_atlas.py view --open
 ```
 
 Selected discoveries can be accepted or dismissed by opaque resource ID.
@@ -97,7 +98,9 @@ python scripts/tab_atlas.py register-preview --resource-id <id> path\to\capture.
 python scripts/tab_atlas.py report
 ```
 
-The generated report is `tab-atlas/report/index.html`.
+The generated report is `tab-atlas/report/index.html`. `view` regenerates it and
+serves it through a read-only `127.0.0.1` viewer until `Ctrl+C`. Use that viewer
+for all live video previews; the plain file remains the static fallback.
 
 ## Browser Extension
 
@@ -156,6 +159,14 @@ normal browser profile.
   repository social art for GitHub, and attached post media for Reddit. The UI
   names the evidence it is showing instead of presenting every image as a generic
   screenshot.
+- Supported YouTube and public X video cards can play a muted live preview after
+  a short hover dwell or an explicit play-button click. Only one player exists at
+  a time, and it is discarded on pointer leave, scroll, Escape, page hide, or
+  replacement. Reduced-motion and data-saver settings disable hover autoplay but
+  leave the play button available.
+- Live previews stream from the provider only while active. TabAtlas does not
+  download video files into SQLite or the report; it retains a YouTube video ID
+  or an allowlisted public X MP4 URL alongside the cached poster.
 - Every resource exposes direct Open source and Copy link commands. More actions
   can request an appropriate richer preview, semantic reconsideration, or
   recoverable removal from the library. Private conversations, search results,

@@ -40,24 +40,26 @@ Current ignored local data:
   document and visual retrieval, 3D production, and voxel-generation benchmarks.
 - Focus-level organization now includes the newly useful tactical-RPG,
   AI-assisted game-development, survival-systems, and traditional-joinery cuts.
-- 378 resources have cached public preview evidence: 316 YouTube thumbnails,
-  54 X post-media previews, and 8 GitHub social previews. The bounded enrichment
-  left nine eligible pages metadata-only because they exposed no usable image on
-  the provider allowlist.
-- The remaining 276 accepted resources receive source-aware metadata previews in
+- 379 resources have cached public preview evidence: 316 YouTube thumbnails,
+  54 X post-media previews, and 9 GitHub social previews. Live motion is available
+  for 366 resources: 316 YouTube IDs and 50 strictly allowlisted public X MP4
+  links. No video bytes are stored in SQLite or the report.
+- The remaining 275 accepted resources receive source-aware metadata previews in
   the report. Appropriate local JPEG, PNG, or WebP captures can be registered on
   demand, and an agent capture always outranks an automatic public preview.
 - 99 accepted resources remain unclassified because their evidence is generic,
   private, authenticated, local, or otherwise too weak for a responsible guess.
-- Schema version 7, SQLite integrity `ok`, and zero foreign-key violations.
+- Schema version 8, SQLite integrity `ok`, and zero foreign-key violations.
 
 The report now separates New discoveries, Inbox, Exact duplicates, and Open tabs.
 It exposes Space -> Topic -> Focus navigation plus a Source lens with reliable
 owner/domain subgroups, browser-group filters, search, image or metadata previews,
 progressive detail, direct open/copy commands, recoverable removal and enrichment
-requests, and 30-item batched infinite scrolling. Group filters are derived only
-from the latest live captures; historical group provenance remains in resource
-details but cannot create a stale navigation group.
+requests, and 30-item batched infinite scrolling. The on-demand read-only viewer
+adds one-at-a-time muted YouTube and X motion previews without preloading or
+persisting video files. Group filters are derived only from the latest live
+captures; historical group provenance remains in resource details but cannot
+create a stale navigation group.
 
 ## Browser Safety
 
@@ -108,7 +110,7 @@ enough to submit and verify the signed cleanup result, then removes the handoff.
 
 ## Verification Checkpoint
 
-- 32 Python behavior and receiver integration tests pass.
+- 39 Python behavior, report, and receiver integration tests pass.
 - Three independent Node protocol tests pass.
 - Normal Chrome and Edge archive: 745 planned, 745 reported closed, zero skipped,
   both post-captures verified, raw evidence retained, backup integrity `ok`, and

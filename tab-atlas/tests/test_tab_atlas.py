@@ -53,6 +53,8 @@ from tab_atlas_core import (  # noqa: E402
     _preview_image_allowed,
     _public_preview_candidate,
     _public_preview_source,
+    _x_motion_from_json_ld,
+    _x_motion_url_allowed,
 )
 from tab_atlas_receiver import (  # noqa: E402
     EXPECTED_EXTENSION_ID,
@@ -62,6 +64,7 @@ from tab_atlas_receiver import (  # noqa: E402
     run_pairing,
     run_revocation,
 )
+from tab_atlas_report import create_report_server  # noqa: E402
 from tab_atlas import (  # noqa: E402
     DEFAULT_STATE,
     _load_archive_approval,
@@ -419,6 +422,13 @@ class CatalogTests(unittest.TestCase):
 
         self.assertEqual(args.state, DEFAULT_STATE)
         self.assertEqual(args.batch_state, "all")
+
+    def test_view_command_uses_the_read_only_loopback_viewer(self) -> None:
+        args = build_parser().parse_args(["view", "--port", "9876", "--open"])
+
+        self.assertEqual(args.command, "view")
+        self.assertEqual(args.port, 9876)
+        self.assertTrue(args.open_report)
 
     def test_standing_duplicate_approval_is_private_and_revocable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -944,6 +954,11 @@ class CatalogTests(unittest.TestCase):
         )
         self.assertEqual(presentation["preview"]["metadataLabel"], "Video metadata")
         self.assertEqual(presentation["preview"]["requestLabel"], "video thumbnail")
+        self.assertEqual(presentation["preview"]["motion"], {
+            "kind": "youtube",
+            "videoId": "abc123XYZ00",
+            "label": "Play video preview",
+        })
 
     def test_presentation_names_rich_evidence_and_suppresses_unsafe_requests(self) -> None:
         x_post = resource_presentation({
@@ -955,6 +970,11 @@ class CatalogTests(unittest.TestCase):
             "title": "Example post",
             "previewLocalPath": "previews/res_111111111111111111111111.jpg",
             "previewSource": "x_public_video_thumbnail",
+            "motionKind": "x_mp4",
+            "motionUrl": (
+                "https://video.twimg.com/amplify_video/123/vid/avc1/"
+                "720x720/example.mp4?tag=1"
+            ),
             "collections": [],
             "tasks": [],
             "tabs": [],
@@ -973,6 +993,12 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(x_post["preview"]["evidenceLabel"], "Video poster")
         self.assertEqual(x_post["preview"]["metadataLabel"], "Post metadata")
         self.assertEqual(x_post["preview"]["strategy"], "public_media")
+        self.assertEqual(x_post["preview"]["motion"]["kind"], "x_mp4")
+        self.assertEqual(
+            x_post["preview"]["motion"]["url"],
+            "https://video.twimg.com/amplify_video/123/vid/avc1/"
+            "720x720/example.mp4?tag=1",
+        )
         self.assertEqual(conversation["format"], "Conversation")
         self.assertEqual(conversation["preview"]["metadataLabel"], "Private summary")
         self.assertFalse(conversation["preview"]["canRequestRicher"])
@@ -1118,6 +1144,9 @@ class CatalogTests(unittest.TestCase):
               <meta property="og:image:width" content="1080">
               <meta content="1080" property="og:image:height">
               <meta property="unrelated" content="ignored">
+              <script type="application/ld+json">
+                {"@type":"VideoObject","contentUrl":"https://video.twimg.com/amplify_video/123/vid/avc1/720x720/example.mp4?tag=1"}
+              </script>
             </head><body>Private page body is not parsed into fields.</body></html>
         """)
 
@@ -1128,6 +1157,26 @@ class CatalogTests(unittest.TestCase):
         )
         self.assertEqual(parser.values["og:image:width"], "1080")
         self.assertNotIn("unrelated", parser.values)
+        self.assertEqual(
+            _x_motion_from_json_ld(parser.json_ld),
+            {
+                "kind": "x_mp4",
+                "url": (
+                    "https://video.twimg.com/amplify_video/123/vid/avc1/"
+                    "720x720/example.mp4?tag=1"
+                ),
+                "source": "x_public_json_ld_video",
+            },
+        )
+        self.assertFalse(_x_motion_url_allowed(
+            "https://video.twimg.com/profile_images/123/example.mp4"
+        ))
+        self.assertFalse(_x_motion_url_allowed(
+            "http://127.0.0.1/amplify_video/123/example.mp4"
+        ))
+        self.assertFalse(_x_motion_url_allowed(
+            "https://sub.video.twimg.com/amplify_video/123/example.mp4"
+        ))
 
     def test_public_preview_redirects_cannot_leave_the_provider_allowlist(self) -> None:
         handler = _AllowlistedRedirectHandler(("pbs.twimg.com",))
@@ -1178,16 +1227,68 @@ class CatalogTests(unittest.TestCase):
             ))
             register_local_preview(connection, state, resource_id, image)
 
-            with patch("tab_atlas_core._download_public_preview") as downloader:
+            motion_url = (
+                "https://video.twimg.com/amplify_video/123/vid/avc1/"
+                "720x720/example.mp4?tag=1"
+            )
+            with patch(
+                "tab_atlas_core._download_public_preview",
+                return_value={
+                    "preview": None,
+                    "previewFailed": False,
+                    "motionChecked": True,
+                    "motion": {
+                        "kind": "x_mp4",
+                        "url": motion_url,
+                        "source": "x_public_json_ld_video",
+                    },
+                },
+            ) as downloader:
                 result = cache_public_previews(connection, state, refresh=True, workers=1)
             stored = library_resources(connection)[0]
             connection.close()
 
-            downloader.assert_not_called()
+            downloader.assert_called_once()
             self.assertEqual(result["eligible"], 1)
             self.assertEqual(result["preservedScreenshots"], 1)
+            self.assertEqual(result["downloaded"], 0)
+            self.assertEqual(result["motionResolved"], 1)
             self.assertEqual(stored["previewKind"], "screenshot")
             self.assertEqual(stored["previewSource"], "agent_local_capture")
+            self.assertEqual(stored["motionKind"], "x_mp4")
+            self.assertEqual(stored["motionUrl"], motion_url)
+
+    def test_report_server_is_loopback_read_only_and_sends_safe_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report"
+            report.mkdir()
+            for name, content in (
+                ("index.html", "<!doctype html><title>TabAtlas</title>"),
+                ("app.js", "void 0;"),
+                ("app.css", "body {}"),
+            ):
+                (report / name).write_text(content, encoding="utf-8")
+            server, url = create_report_server(report, 0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urlopen(url, timeout=3) as response:
+                    body = response.read().decode("utf-8")
+                    self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+                    self.assertEqual(
+                        response.headers["Referrer-Policy"],
+                        "strict-origin-when-cross-origin",
+                    )
+                self.assertIn("TabAtlas", body)
+                self.assertEqual(server.server_address[0], "127.0.0.1")
+                request = Request(url, data=b"write", method="POST")
+                with self.assertRaises(HTTPError) as rejected:
+                    urlopen(request, timeout=3)
+                self.assertEqual(rejected.exception.code, 405)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
 
     def test_report_keeps_duplicate_group_titles_as_distinct_groups(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -20,7 +20,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 TABATLAS_EXTENSION_ID = "ohgpplkophdikjnbefigdhikdooehmkh"
 TABATLAS_EXTENSION_URL_PREFIX = f"chrome-extension://{TABATLAS_EXTENSION_ID}/"
 LEGACY_CAPTURE_PROTOCOL_VERSION = 2
@@ -209,6 +209,14 @@ CREATE TABLE IF NOT EXISTS resource_previews (
   width INTEGER,
   height INTEGER,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS resource_motion_previews (
+  resource_id TEXT PRIMARY KEY REFERENCES resources(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('none', 'x_mp4')),
+  remote_url TEXT,
+  source TEXT NOT NULL,
+  refreshed_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS mutation_audits (
@@ -906,11 +914,14 @@ def _resources_for_capture_ids(
                r.library_state, r.accepted_at, r.dismissed_at,
                p.kind AS preview_kind, p.local_path AS preview_local_path,
                p.source AS preview_source, p.content_sha256 AS preview_sha256,
-               p.width AS preview_width, p.height AS preview_height
+               p.width AS preview_width, p.height AS preview_height,
+               m.kind AS motion_kind, m.remote_url AS motion_url,
+               m.source AS motion_source, m.refreshed_at AS motion_refreshed_at
         FROM tab_instances t
         JOIN captures c ON c.id=t.capture_id
         JOIN resources r ON r.id=t.resource_id
         LEFT JOIN resource_previews p ON p.resource_id=r.id
+        LEFT JOIN resource_motion_previews m ON m.resource_id=r.id
         WHERE t.capture_id IN ({placeholders})
           {extension_filter}
         ORDER BY t.browser, t.window_id, t.position
@@ -967,6 +978,10 @@ def _resources_for_capture_ids(
                 "previewSha256": row["preview_sha256"] or "",
                 "previewWidth": row["preview_width"],
                 "previewHeight": row["preview_height"],
+                "motionKind": row["motion_kind"] or "",
+                "motionUrl": row["motion_url"] or "",
+                "motionSource": row["motion_source"] or "",
+                "motionRefreshedAt": row["motion_refreshed_at"] or "",
                 "collections": collections[row["resource_id"]],
                 "tasks": tasks[row["resource_id"]],
                 "tabs": [],
@@ -1040,9 +1055,12 @@ def library_resources(
         f"""
         SELECT r.*, p.kind AS preview_kind, p.local_path AS preview_local_path,
                p.source AS preview_source, p.content_sha256 AS preview_sha256,
-               p.width AS preview_width, p.height AS preview_height
+               p.width AS preview_width, p.height AS preview_height,
+               m.kind AS motion_kind, m.remote_url AS motion_url,
+               m.source AS motion_source, m.refreshed_at AS motion_refreshed_at
         FROM resources r
         LEFT JOIN resource_previews p ON p.resource_id=r.id
+        LEFT JOIN resource_motion_previews m ON m.resource_id=r.id
         WHERE r.canonical_url NOT LIKE ?
           AND r.library_state IN ({state_placeholders})
         ORDER BY r.title, r.id
@@ -1089,6 +1107,10 @@ def library_resources(
             "previewSha256": row["preview_sha256"] or "",
             "previewWidth": row["preview_width"],
             "previewHeight": row["preview_height"],
+            "motionKind": row["motion_kind"] or "",
+            "motionUrl": row["motion_url"] or "",
+            "motionSource": row["motion_source"] or "",
+            "motionRefreshedAt": row["motion_refreshed_at"] or "",
             "collections": collections[resource_id_value],
             "tasks": tasks[resource_id_value],
             "tabs": [],
@@ -1828,6 +1850,7 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
         url,
         str(resource.get("previewSource") or ""),
     )
+    motion_preview = _motion_preview(resource, video_id)
 
     return {
         "displayTitle": _clean_display_title(title, source),
@@ -1855,6 +1878,7 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
             "localImage": local_preview,
             "remoteImage": preview_url,
             "requiresUserLoad": bool(preview_url and not local_preview),
+            "motion": motion_preview,
             **preview_policy,
         },
     }
@@ -1934,6 +1958,23 @@ def _preview_policy(
         "canRequestRicher": True,
         "requestLabel": request_label,
     }
+
+
+def _motion_preview(resource: dict[str, Any], youtube_video_id: str) -> dict[str, str]:
+    if youtube_video_id:
+        return {
+            "kind": "youtube",
+            "videoId": youtube_video_id,
+            "label": "Play video preview",
+        }
+    motion_url = str(resource.get("motionUrl") or "")
+    if resource.get("motionKind") == "x_mp4" and _x_motion_url_allowed(motion_url):
+        return {
+            "kind": "x_mp4",
+            "url": motion_url,
+            "label": "Play post video preview",
+        }
+    return {}
 
 
 def exact_duplicate_summary(resource: dict[str, Any]) -> dict[str, int]:
@@ -3302,15 +3343,39 @@ class _OpenGraphParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.values: dict[str, str] = {}
+        self.json_ld: list[Any] = []
+        self._json_ld_parts: list[str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.casefold() != "meta":
-            return
+        tag_name = tag.casefold()
         values = {str(key).casefold(): str(value or "") for key, value in attrs}
+        if tag_name == "script":
+            if values.get("type", "").casefold() == "application/ld+json":
+                self._json_ld_parts = []
+            return
+        if tag_name != "meta":
+            return
         name = str(values.get("property") or values.get("name") or "").casefold()
         content = str(values.get("content") or "").strip()
         if name in self.FIELDS and content:
             self.values.setdefault(name, content)
+
+    def handle_data(self, data: str) -> None:
+        if self._json_ld_parts is not None:
+            self._json_ld_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() != "script" or self._json_ld_parts is None:
+            return
+        raw = "".join(self._json_ld_parts).strip()
+        self._json_ld_parts = None
+        if not raw or len(raw) > 262_144:
+            return
+        try:
+            document = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeError):
+            return
+        self.json_ld.append(document)
 
 
 class _AllowlistedRedirectHandler(HTTPRedirectHandler):
@@ -3350,6 +3415,7 @@ def cache_public_previews(
     resources = library_resources(connection, {"accepted", "candidate"})
     candidates: list[dict[str, Any]] = []
     provider_stats: dict[str, Counter[str]] = defaultdict(Counter)
+    eligible = 0
     cached = 0
     preserved_screenshots = 0
     for resource in resources:
@@ -3357,20 +3423,27 @@ def cache_public_previews(
         if not candidate:
             continue
         provider = candidate["provider"]
+        eligible += 1
         provider_stats[provider]["eligible"] += 1
         existing = _existing_preview_path(state_dir, str(resource.get("previewLocalPath") or ""))
-        if existing and resource.get("previewKind") == "screenshot":
+        protected_screenshot = bool(existing and resource.get("previewKind") == "screenshot")
+        if existing:
             cached += 1
+            provider_stats[provider]["alreadyCached"] += 1
+        if protected_screenshot:
             preserved_screenshots += 1
-            provider_stats[provider]["alreadyCached"] += 1
+        needs_image = not existing or (refresh and not protected_screenshot)
+        needs_motion = (
+            provider == "x_post"
+            and (refresh or not resource.get("motionRefreshedAt"))
+        )
+        if not needs_image and not needs_motion:
             continue
-        if existing and not refresh:
-            cached += 1
-            provider_stats[provider]["alreadyCached"] += 1
-            continue
+        candidate["downloadImage"] = needs_image
         candidates.append(candidate)
 
     downloaded: list[tuple[str, dict[str, Any]]] = []
+    motion_updates: list[tuple[str, dict[str, str] | None]] = []
     failed = 0
     with ThreadPoolExecutor(max_workers=max(1, min(16, workers))) as executor:
         futures = {
@@ -3386,8 +3459,17 @@ def cache_public_previews(
                 failed += 1
                 provider_stats[provider]["failed"] += 1
                 continue
-            downloaded.append((candidate["resourceId"], result))
-            provider_stats[provider]["downloaded"] += 1
+            if result.get("preview"):
+                downloaded.append((candidate["resourceId"], result["preview"]))
+                provider_stats[provider]["downloaded"] += 1
+            elif result.get("previewFailed"):
+                failed += 1
+                provider_stats[provider]["failed"] += 1
+            if result.get("motionChecked"):
+                motion_updates.append((candidate["resourceId"], result.get("motion")))
+                provider_stats[provider]["motionChecked"] += 1
+                if result.get("motion"):
+                    provider_stats[provider]["motionResolved"] += 1
 
     now = utc_now()
     state_root = state_dir.resolve()
@@ -3418,16 +3500,41 @@ def cache_public_previews(
                     now,
                 ),
             )
+        for resource_id_value, motion in motion_updates:
+            connection.execute(
+                """
+                INSERT INTO resource_motion_previews(
+                  resource_id, kind, remote_url, source, refreshed_at
+                ) VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(resource_id) DO UPDATE SET
+                  kind=excluded.kind,
+                  remote_url=excluded.remote_url,
+                  source=excluded.source,
+                  refreshed_at=excluded.refreshed_at
+                """,
+                (
+                    resource_id_value,
+                    str(motion.get("kind") if motion else "none"),
+                    str(motion.get("url") if motion else "") or None,
+                    str(motion.get("source") if motion else "x_public_no_motion"),
+                    now,
+                ),
+            )
     return {
-        "eligible": cached + len(candidates),
+        "eligible": eligible,
         "alreadyCached": cached,
         "preservedScreenshots": preserved_screenshots,
         "downloaded": len(downloaded),
+        "motionChecked": len(motion_updates),
+        "motionResolved": sum(1 for _, motion in motion_updates if motion),
         "failed": failed,
         "providers": {
             provider: {
                 key: int(stats.get(key, 0))
-                for key in ("eligible", "alreadyCached", "downloaded", "failed")
+                for key in (
+                    "eligible", "alreadyCached", "downloaded", "motionChecked",
+                    "motionResolved", "failed",
+                )
             }
             for provider, stats in sorted(provider_stats.items())
         },
@@ -3518,9 +3625,10 @@ def _existing_preview_path(state_dir: Path, local_path: str) -> Path | None:
 
 def _download_public_preview(candidate: dict[str, Any]) -> dict[str, Any]:
     metadata: dict[str, str] = {}
+    json_ld: list[Any] = []
     image_url = str(candidate.get("imageUrl") or "")
     if not image_url:
-        metadata, page_url = _fetch_open_graph(
+        metadata, json_ld, page_url = _fetch_open_graph(
             str(candidate["pageUrl"]),
             tuple(candidate["pageHosts"]),
         )
@@ -3531,28 +3639,43 @@ def _download_public_preview(candidate: dict[str, Any]) -> dict[str, Any]:
             or ""
         )
         image_url = urljoin(page_url, image_url)
-    if not _preview_image_allowed(
-        str(candidate["provider"]),
-        image_url,
-        tuple(candidate["imageHosts"]),
-    ):
-        raise ValueError("Public preview image left the provider allowlist")
+    provider = str(candidate["provider"])
+    result: dict[str, Any] = {
+        "preview": None,
+        "previewFailed": False,
+        "motionChecked": provider == "x_post",
+        "motion": _x_motion_from_json_ld(json_ld) if provider == "x_post" else None,
+    }
+    if not candidate.get("downloadImage", True):
+        return result
+    try:
+        if not _preview_image_allowed(
+            provider,
+            image_url,
+            tuple(candidate["imageHosts"]),
+        ):
+            raise ValueError("Public preview image left the provider allowlist")
+        data, suffix = _download_public_image(image_url, tuple(candidate["imageHosts"]))
+    except (HTTPError, URLError, OSError, UnicodeError, ValueError):
+        result["previewFailed"] = True
+        return result
 
-    data, suffix = _download_public_image(image_url, tuple(candidate["imageHosts"]))
     target = Path(candidate["targetBase"]).with_suffix(suffix)
     _atomic_write(target, data)
-    return {
+    result["preview"] = {
         "target": target,
         "digest": hashlib.sha256(data).hexdigest(),
-        "source": str(candidate.get("source") or _public_preview_source(
-            str(candidate["provider"]), image_url
-        )),
+        "source": str(candidate.get("source") or _public_preview_source(provider, image_url)),
         "width": candidate.get("width") or _positive_int(metadata.get("og:image:width")),
         "height": candidate.get("height") or _positive_int(metadata.get("og:image:height")),
     }
+    return result
 
 
-def _fetch_open_graph(url: str, allowed_hosts: tuple[str, ...]) -> tuple[dict[str, str], str]:
+def _fetch_open_graph(
+    url: str,
+    allowed_hosts: tuple[str, ...],
+) -> tuple[dict[str, str], list[Any], str]:
     request = Request(
         url,
         headers={
@@ -3572,7 +3695,42 @@ def _fetch_open_graph(url: str, allowed_hosts: tuple[str, ...]) -> tuple[dict[st
         data = response.read(786_432)
     parser = _OpenGraphParser()
     parser.feed(data.decode(charset, errors="replace"))
-    return parser.values, final_url
+    return parser.values, parser.json_ld, final_url
+
+
+def _x_motion_from_json_ld(documents: list[Any]) -> dict[str, str] | None:
+    pending = list(documents)
+    while pending:
+        value = pending.pop()
+        if isinstance(value, list):
+            pending.extend(value)
+            continue
+        if not isinstance(value, dict):
+            continue
+        schema_type = value.get("@type")
+        types = schema_type if isinstance(schema_type, list) else [schema_type]
+        if any(str(item).casefold() == "videoobject" for item in types):
+            motion_url = str(value.get("contentUrl") or "")
+            if _x_motion_url_allowed(motion_url):
+                return {
+                    "kind": "x_mp4",
+                    "url": motion_url,
+                    "source": "x_public_json_ld_video",
+                }
+        pending.extend(value.values())
+    return None
+
+
+def _x_motion_url_allowed(url: str) -> bool:
+    if not _provider_url_allowed(url, ("video.twimg.com",)):
+        return False
+    parts = urlsplit(url)
+    if (parts.hostname or "").casefold() != "video.twimg.com":
+        return False
+    path = parts.path.casefold()
+    return path.startswith((
+        "/amplify_video/", "/ext_tw_video/", "/tweet_video/",
+    )) and path.endswith(".mp4")
 
 
 def _preview_image_allowed(

@@ -8,8 +8,10 @@ const data = window.__TAB_ATLAS__ || {
   topicSummaries: [],
   focusSummaries: [],
   projectSummaries: [],
+  actionListSummaries: [],
   sourceSummaries: [],
-  facets: {}
+  facets: {},
+  workspace: {}
 };
 
 const PAGE_SIZE = 30;
@@ -23,6 +25,7 @@ const spaceSummaries = hasSpaceContract
   ? (data.spaceSummaries || [])
   : (data.collectionSummaries || []);
 const projectSummaries = data.projectSummaries || [];
+let actionListSummaries = data.actionListSummaries || [];
 const sourceSummaries = Array.isArray(data.sourceSummaries) ? data.sourceSummaries : [];
 const galleryLoaders = new WeakMap();
 const galleryObservers = new Set();
@@ -31,8 +34,22 @@ const motionLoadTimers = new Set();
 const connectionHints = new Set();
 let activeMotionPreview = null;
 
+const workspace = {
+  interactive: false,
+  csrfToken: "",
+  agent: {},
+  noteCache: new Map(),
+  noteLoads: new Map(),
+  requestPolls: new Map(),
+  latestAuditByResource: new Map(),
+  messages: [],
+  recording: null,
+  previousView: null
+};
+
 const state = {
   view: "home",
+  libraryLens: "purpose",
   search: "",
   scope: null,
   sourceScope: null,
@@ -44,7 +61,8 @@ const state = {
   filters: defaultFilters(),
   visibleLimit: PAGE_SIZE,
   selectedResource: null,
-  lastFocus: null
+  lastFocus: null,
+  agentOpen: false
 };
 
 const app = document.getElementById("app");
@@ -61,12 +79,28 @@ app.innerHTML = `
   </header>
   <nav id="primaryNav" class="primary-nav" aria-label="Primary views" role="tablist">
     <button type="button" role="tab" data-view="home">Home</button>
-    <button type="button" role="tab" data-view="spaces">Spaces</button>
-    <button type="button" role="tab" data-view="sources">Sources</button>
+    <button type="button" role="tab" data-view="library">Library</button>
     <button type="button" role="tab" data-view="review">Review <span id="navLiveCount" class="nav-count" hidden>0</span></button>
   </nav>
   <main id="screen" class="screen"></main>
   <div id="drawerHost"></div>
+  <button id="agentToggle" class="agent-toggle" type="button" aria-expanded="false" aria-controls="agentPanel" hidden>Ask Codex <span id="agentPending" class="agent-pending" hidden>0</span></button>
+  <aside id="agentPanel" class="agent-panel" aria-label="TabAtlas Codex assistant" hidden>
+    <header class="agent-panel-head">
+      <div><strong>Codex</strong><span id="agentStatus">On demand</span></div>
+      <button id="agentClose" class="agent-close" type="button" aria-label="Close Codex panel">&times;</button>
+    </header>
+    <p id="agentScope" class="agent-scope"></p>
+    <div id="agentMessages" class="agent-messages" aria-live="polite"></div>
+    <form id="agentForm" class="agent-form">
+      <label class="sr-only" for="agentInput">Ask Codex about this library</label>
+      <textarea id="agentInput" rows="3" maxlength="32768" placeholder="Ask about this resource or library"></textarea>
+      <div class="agent-form-actions">
+        <button id="agentOwnership" class="secondary-command" type="button">Open in Codex</button>
+        <button class="primary-command" type="submit">Send</button>
+      </div>
+    </form>
+  </aside>
   <div id="actionStatus" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>`;
 
 const elements = {
@@ -78,6 +112,16 @@ const elements = {
   navLiveCount: document.getElementById("navLiveCount"),
   screen: document.getElementById("screen"),
   drawerHost: document.getElementById("drawerHost"),
+  agentToggle: document.getElementById("agentToggle"),
+  agentPending: document.getElementById("agentPending"),
+  agentPanel: document.getElementById("agentPanel"),
+  agentClose: document.getElementById("agentClose"),
+  agentStatus: document.getElementById("agentStatus"),
+  agentScope: document.getElementById("agentScope"),
+  agentMessages: document.getElementById("agentMessages"),
+  agentForm: document.getElementById("agentForm"),
+  agentInput: document.getElementById("agentInput"),
+  agentOwnership: document.getElementById("agentOwnership"),
   actionStatus: document.getElementById("actionStatus")
 };
 
@@ -92,6 +136,10 @@ elements.primaryNav.addEventListener("click", event => {
   const button = event.target.closest("button[data-view]");
   if (button) setView(button.dataset.view);
 });
+elements.agentToggle.addEventListener("click", () => setAgentPanel(true));
+elements.agentClose.addEventListener("click", () => setAgentPanel(false));
+elements.agentForm.addEventListener("submit", submitAgentRequest);
+elements.agentOwnership.addEventListener("click", toggleAgentOwnership);
 document.addEventListener("keydown", event => {
   if (event.key !== "Escape") return;
   if (activeMotionPreview) stopActiveMotionPreview();
@@ -105,6 +153,7 @@ window.addEventListener("scroll", () => stopActiveMotionPreview(), { passive: tr
 
 renderFreshness();
 render();
+initializeWorkspace();
 
 function render() {
   stopActiveMotionPreview();
@@ -117,6 +166,7 @@ function render() {
   else if (state.view === "review") renderReview();
   else renderHome();
   renderDrawer();
+  renderAgentPanel();
   connectGalleryObservers();
 }
 
@@ -172,7 +222,10 @@ function renderFreshness() {
 
 function updateNavigation() {
   for (const button of elements.primaryNav.querySelectorAll("button[data-view]")) {
-    const selected = !state.search && button.dataset.view === state.view;
+    const selected = !state.search && (
+      button.dataset.view === state.view
+      || (button.dataset.view === "library" && ["spaces", "sources"].includes(state.view))
+    );
     button.classList.toggle("active", selected);
     button.setAttribute("aria-selected", String(selected));
   }
@@ -214,6 +267,15 @@ function renderHome() {
   );
   attention.append(attentionRow);
   fragment.append(attention);
+
+  if (actionListSummaries.length) {
+    const actionLists = node("section", "section-block action-lists-section");
+    actionLists.append(sectionHeading("Action lists", "Resources with an explicit follow-through state."));
+    const list = node("div", "action-list-directory");
+    for (const summary of actionListSummaries.slice(0, 6)) list.append(actionListRow(summary));
+    actionLists.append(list);
+    fragment.append(actionLists);
+  }
 
   const spacesSection = node("section", "section-block");
   spacesSection.append(sectionHeading(
@@ -296,6 +358,7 @@ function renderSpaces() {
   if (state.scope && !summary) state.scope = null;
 
   const page = node("section", "directory-page");
+  page.append(libraryLensControl());
   page.append(pageHeading("Purpose spaces", "Open a space to see its topics and the resources most relevant to that kind of work."));
   if (!spaceSummaries.length) {
     page.append(emptyState("No purpose spaces have been assigned yet."));
@@ -316,6 +379,7 @@ function renderSources() {
   if (state.sourceScope && !summary) state.sourceScope = null;
 
   const page = node("section", "directory-page sources-page");
+  page.append(libraryLensControl());
   page.append(pageHeading(
     "Sources",
     "Browse the retained library by platform, site, owner, channel, community, and semantic topic."
@@ -378,7 +442,7 @@ function renderSourceDetail(summary) {
   const page = node("section", "source-detail-page");
   const head = node("header", "scope-head");
   const copy = node("div", "scope-copy");
-  const back = node("button", "back-button", "Back to sources");
+  const back = node("button", "back-button", "Back to library");
   back.type = "button";
   back.addEventListener("click", () => {
     state.sourceScope = null;
@@ -454,7 +518,7 @@ function renderSourceDetail(summary) {
 function renderScopeDetail(summary) {
   const members = resourcesForSummary(summary);
   const topics = scopeTopics(summary, members);
-  const returnsHome = state.scope.kind === "project";
+  const returnsHome = state.scope.kind === "project" || state.scope.kind === "action_list";
   if (state.topic !== "all" && !topics.includes(state.topic)) {
     state.topic = "all";
     state.focus = "all";
@@ -465,7 +529,7 @@ function renderScopeDetail(summary) {
   const page = node("section", "scope-page");
   const head = node("header", "scope-head");
   const copy = node("div", "scope-copy");
-  const back = node("button", "back-button", returnsHome ? "Back to home" : "Back to spaces");
+  const back = node("button", "back-button", returnsHome ? "Back to home" : "Back to library");
   back.type = "button";
   back.addEventListener("click", () => {
     if (returnsHome) state.view = "home";
@@ -479,7 +543,7 @@ function renderScopeDetail(summary) {
   });
   copy.append(
     back,
-    node("p", "eyebrow", state.scope.kind === "project" ? "Active workspace" : "Purpose space"),
+    node("p", "eyebrow", state.scope.kind === "project" ? "Active workspace" : (state.scope.kind === "action_list" ? "Action list" : "Purpose space")),
     node("h2", "", summary.name),
     node("p", "scope-summary", summary.objective || summary.description || "Resources grouped around this purpose.")
   );
@@ -1083,11 +1147,14 @@ function resourceChips(resource, hideSpace = false) {
   const topics = resourceTopics(resource);
   const focuses = resourceFocuses(resource);
   const projects = resourceProjects(resource);
+  const actionLists = resourceActionLists(resource);
   const duplicate = duplicateSummary(resource);
   if (!hideSpace && space) chips.append(chip(space, "space-chip"));
   if (topics[0]) chips.append(chip(topics[0], "topic-chip"));
   if (focuses[0]) chips.append(chip(focuses[0], "focus-chip"));
   else if (projects[0]) chips.append(chip(projects[0], "project-chip"));
+  if (actionLists[0]) chips.append(chip(actionLists[0], "action-chip"));
+  if (Number(resource.noteCount || 0)) chips.append(chip("Your note", "note-chip"));
   if (duplicate.sets) {
     const count = duplicate.safeCloseCandidates || duplicate.instances;
     const qualifier = duplicate.safeCloseCandidates ? "" : " protected";
@@ -1227,6 +1294,13 @@ function renderDrawer() {
   titleBlock.append(resourceCommands(resource, "drawer"));
   content.append(titleBlock);
 
+  content.append(resourceNoteSection(resource));
+  if (workspace.interactive && !workspace.noteCache.has(resource.resourceId)) {
+    loadResourceWorkspaceState(resource.resourceId);
+  }
+  const actionProgress = resourceActionProgressSection(resource);
+  if (actionProgress) content.append(actionProgress);
+
   const glance = node("section", "detail-section");
   glance.append(node("h3", "", "At a glance"), node("p", "detail-brief", resource.brief || "No concise description yet."));
   const cues = node("dl", "cue-list");
@@ -1259,12 +1333,404 @@ function renderDrawer() {
   requestAnimationFrame(() => close.focus({ preventScroll: true }));
 }
 
+function resourceNoteSection(resource) {
+  const section = node("section", "detail-section resource-notes");
+  const heading = node("div", "note-heading");
+  heading.append(node("h3", "", "Your note"));
+  if (Number(resource.noteCount || 0)) heading.append(node("span", "note-count", formatNumber(resource.noteCount)));
+  section.append(heading);
+
+  if (!workspace.interactive) {
+    section.append(node("p", "detail-note", Number(resource.noteCount || 0) ? "Notes are protected in the interactive workspace." : "No note recorded."));
+    return section;
+  }
+
+  const notes = workspace.noteCache.get(resource.resourceId);
+  if (!notes) {
+    section.append(node("p", "note-loading", "Loading notes"));
+    return section;
+  }
+  if (notes.length) {
+    const list = node("div", "note-list");
+    for (const note of notes) list.append(noteEntry(note));
+    section.append(list);
+  }
+
+  const form = node("form", "note-form");
+  const textarea = document.createElement("textarea");
+  textarea.rows = 3;
+  textarea.maxLength = 32768;
+  textarea.placeholder = "What matters about this resource?";
+  textarea.setAttribute("aria-label", `Add a note to ${resourceDisplayTitle(resource)}`);
+  const actions = node("div", "note-form-actions");
+  const record = node("button", "secondary-command note-record", workspace.recording?.resourceId === resource.resourceId ? "Stop recording" : "Record voice");
+  record.type = "button";
+  record.addEventListener("click", () => toggleVoiceRecording(resource.resourceId));
+  const save = node("button", "primary-command", "Save note");
+  save.type = "submit";
+  actions.append(record, save);
+  form.append(textarea, actions);
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    const text = textarea.value;
+    if (!text.trim()) return;
+    save.disabled = true;
+    try {
+      const result = await workspaceRequest(`/api/v1/resources/${resource.resourceId}/notes`, {
+        method: "POST",
+        json: { text }
+      });
+      textarea.value = "";
+      resource.noteCount = Number(resource.noteCount || 0) + 1;
+      workspace.noteCache.delete(resource.resourceId);
+      await loadResourceWorkspaceState(resource.resourceId, true);
+      pollAgentRequest(result.agentRequestId, resource.resourceId);
+      elements.actionStatus.textContent = "Note saved locally; Codex interpretation queued.";
+    } catch (error) {
+      showWorkspaceError(error, "The note could not be saved.");
+    } finally {
+      save.disabled = false;
+    }
+  });
+  section.append(form);
+
+  const auditId = workspace.latestAuditByResource.get(resource.resourceId);
+  if (auditId) {
+    const undo = node("button", "text-command note-undo", "Undo latest organization");
+    undo.type = "button";
+    undo.addEventListener("click", () => undoSemanticChange(resource.resourceId, auditId, undo));
+    section.append(undo);
+  }
+  return section;
+}
+
+function noteEntry(note) {
+  const entry = node("article", "note-entry");
+  const meta = node("div", "note-meta");
+  meta.append(node("strong", "", note.kind === "audio" ? "Voice note" : "Note"), node("time", "", formatDate(note.createdAt, true)));
+  const remove = node("button", "text-command note-remove", "Remove note");
+  remove.type = "button";
+  remove.addEventListener("click", () => retractNote(note));
+  meta.append(remove);
+  entry.append(meta);
+  if (note.kind === "text") entry.append(node("p", "note-body", note.text));
+  if (note.kind === "audio") {
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.preload = "metadata";
+    audio.src = `/api/v1/notes/${note.id}/audio`;
+    entry.append(audio);
+    const transcript = note.processing?.transcription;
+    if (transcript?.state === "succeeded" && transcript.outputText) {
+      entry.append(detailText("Transcript", transcript.outputText));
+    } else {
+      const transcriptForm = node("form", "transcript-form");
+      const input = document.createElement("textarea");
+      input.rows = 2;
+      input.maxLength = 32768;
+      input.placeholder = "Add or dictate the transcript";
+      input.setAttribute("aria-label", "Voice note transcript");
+      const submit = node("button", "secondary-command", "Use transcript");
+      submit.type = "submit";
+      transcriptForm.append(input, submit);
+      transcriptForm.addEventListener("submit", async event => {
+        event.preventDefault();
+        if (!input.value.trim()) return;
+        submit.disabled = true;
+        try {
+          const result = await workspaceRequest(`/api/v1/notes/${note.id}/transcript`, {
+            method: "POST",
+            json: { text: input.value }
+          });
+          await loadResourceWorkspaceState(note.resourceId, true);
+          pollAgentRequest(result.agentRequestId, note.resourceId);
+        } catch (error) {
+          showWorkspaceError(error, "The transcript could not be saved.");
+        } finally {
+          submit.disabled = false;
+        }
+      });
+      entry.append(transcriptForm);
+    }
+  }
+  const interpretation = note.processing?.interpretation;
+  if (interpretation?.state === "succeeded" && interpretation.outputText) {
+    const meaning = node("div", "note-meaning");
+    meaning.append(node("strong", "", "Meaning"), node("p", "", interpretation.outputText));
+    entry.append(meaning);
+  } else if (interpretation?.state === "queued" || interpretation?.state === "running") {
+    entry.append(node("p", "note-processing", "Codex interpretation queued"));
+  } else if (interpretation?.state === "failed") {
+    entry.append(node("p", "note-processing is-error", "Interpretation pending a later Codex session"));
+  }
+  return entry;
+}
+
+function resourceActionProgressSection(resource) {
+  const memberships = (resource.collections || []).filter(item => item.kind === "action_list");
+  if (!memberships.length) return null;
+  const byCollection = new Map((resource.actionItems || []).map(item => [item.collectionId, item]));
+  const section = node("section", "detail-section action-progress-section");
+  section.append(node("h3", "", "Action progress"));
+  for (const membership of memberships) {
+    const existing = byCollection.get(membership.id) || {};
+    const item = {
+      collectionId: membership.id,
+      collectionName: membership.name,
+      workflowKind: membership.workflowKind || "none",
+      state: existing.state || "queued",
+      priority: Number(existing.priority || 3),
+      completedUnits: Number(existing.completedUnits || 0),
+      totalUnits: existing.totalUnits == null ? null : Number(existing.totalUnits),
+      dueAt: existing.dueAt || "",
+      revision: Number(existing.revision || 0)
+    };
+    section.append(actionProgressEditor(resource, item));
+  }
+  return section;
+}
+
+function actionProgressEditor(resource, item) {
+  const form = node("form", "action-progress-editor");
+  const heading = node("div", "action-progress-heading");
+  heading.append(
+    node("strong", "", item.collectionName),
+    node("span", "", actionProgressSummary(item))
+  );
+  form.append(heading);
+
+  const fields = node("div", "action-progress-fields");
+  const statusLabel = node("label", "action-progress-field");
+  statusLabel.append(node("span", "", "Status"));
+  const status = document.createElement("select");
+  for (const [value, label] of [
+    ["queued", "Queued"],
+    ["in_progress", "In progress"],
+    ["completed", "Completed"],
+    ["snoozed", "Snoozed"],
+    ["skipped", "Skipped"]
+  ]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    option.selected = item.state === value;
+    status.append(option);
+  }
+  statusLabel.append(status);
+
+  const priorityLabel = node("label", "action-progress-field");
+  priorityLabel.append(node("span", "", "Priority"));
+  const priority = document.createElement("select");
+  for (let value = 1; value <= 5; value += 1) {
+    const option = document.createElement("option");
+    option.value = String(value);
+    option.textContent = value === 1 ? "1 / highest" : String(value);
+    option.selected = item.priority === value;
+    priority.append(option);
+  }
+  priorityLabel.append(priority);
+
+  const unitName = ["watch_queue", "reading_queue"].includes(item.workflowKind) ? "Minutes" : "Completed";
+  const completedLabel = node("label", "action-progress-field");
+  completedLabel.append(node("span", "", unitName));
+  const completed = document.createElement("input");
+  completed.type = "number";
+  completed.min = "0";
+  completed.max = "100000";
+  completed.step = "1";
+  completed.value = String(item.completedUnits);
+  completedLabel.append(completed);
+
+  const totalLabel = node("label", "action-progress-field");
+  totalLabel.append(node("span", "", "Total"));
+  const total = document.createElement("input");
+  total.type = "number";
+  total.min = "0";
+  total.max = "100000";
+  total.step = "1";
+  total.placeholder = "Optional";
+  if (item.totalUnits != null) total.value = String(item.totalUnits);
+  totalLabel.append(total);
+  fields.append(statusLabel, priorityLabel, completedLabel, totalLabel);
+  form.append(fields);
+
+  if (workspace.interactive) {
+    const save = node("button", "secondary-command action-progress-save", "Save progress");
+    save.type = "submit";
+    form.append(save);
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      save.disabled = true;
+      try {
+        const totalUnits = total.value === "" ? null : Number(total.value);
+        let completedUnits = Number(completed.value || 0);
+        if (status.value === "completed" && totalUnits != null) completedUnits = totalUnits;
+        const result = await workspaceRequest(
+          `/api/v1/resources/${resource.resourceId}/action-lists/${item.collectionId}/progress`,
+          {
+            method: "POST",
+            json: {
+              state: status.value,
+              priority: Number(priority.value),
+              completedUnits,
+              totalUnits,
+              dueAt: item.dueAt,
+              expectedRevision: item.revision
+            }
+          }
+        );
+        if (result.auditId) workspace.latestAuditByResource.set(resource.resourceId, result.auditId);
+        await loadResourceWorkspaceState(resource.resourceId, true);
+        await refreshWorkspaceSession();
+        elements.actionStatus.textContent = "Action progress saved.";
+        render();
+      } catch (error) {
+        showWorkspaceError(error, "Action progress could not be saved.");
+      } finally {
+        save.disabled = false;
+      }
+    });
+  } else {
+    for (const control of fields.querySelectorAll("select,input")) control.disabled = true;
+  }
+  return form;
+}
+
+function actionProgressSummary(item) {
+  const label = ({ queued: "Queued", in_progress: "In progress", completed: "Completed", snoozed: "Snoozed", skipped: "Skipped" })[item.state] || "Queued";
+  if (item.totalUnits == null) return label;
+  return `${label} / ${formatNumber(item.completedUnits)} of ${formatNumber(item.totalUnits)}`;
+}
+
+async function retractNote(note) {
+  if (!window.confirm("Remove this note from active use? Its local audit evidence will be retained.")) return;
+  try {
+    await workspaceRequest(`/api/v1/notes/${note.id}/retract`, { method: "POST" });
+    const resource = resourceById.get(note.resourceId);
+    if (resource) resource.noteCount = Math.max(0, Number(resource.noteCount || 0) - 1);
+    workspace.noteCache.delete(note.resourceId);
+    await loadResourceWorkspaceState(note.resourceId, true);
+    elements.actionStatus.textContent = "Note removed from active use.";
+    render();
+  } catch (error) {
+    showWorkspaceError(error, "The note could not be removed.");
+  }
+}
+
+async function loadResourceWorkspaceState(resourceId, force = false) {
+  if (!workspace.interactive) return null;
+  if (!force && workspace.noteLoads.has(resourceId)) return workspace.noteLoads.get(resourceId);
+  const request = workspaceRequest(`/api/v1/resources/${resourceId}/workspace-state`)
+    .then(result => {
+      const resource = resourceById.get(resourceId);
+      if (resource) {
+        resource.noteCount = result.noteCount;
+        resource.semanticRevision = result.semanticRevision;
+        resource.collections = result.collections || [];
+        resource.actionItems = result.actionItems || [];
+        syncResourcePresentation(resource);
+      }
+      workspace.noteCache.set(resourceId, result.notes || []);
+      if (state.selectedResource === resourceId) renderDrawer();
+      return result;
+    })
+    .catch(error => {
+      showWorkspaceError(error, "Resource notes could not be loaded.");
+      return null;
+    })
+    .finally(() => workspace.noteLoads.delete(resourceId));
+  workspace.noteLoads.set(resourceId, request);
+  return request;
+}
+
+function syncResourcePresentation(resource) {
+  if (!resource.presentation) resource.presentation = {};
+  const ordered = [...(resource.collections || [])].sort((left, right) => authorityRank(left.authority) - authorityRank(right.authority) || String(left.name).localeCompare(String(right.name)));
+  resource.presentation.space = ordered.find(item => item.kind === "space")?.name || "";
+  resource.presentation.topics = ordered.filter(item => item.kind === "topic").slice(0, 2).map(item => item.name);
+  resource.presentation.focuses = ordered.filter(item => item.kind === "focus").slice(0, 2).map(item => item.name);
+  resource.presentation.projects = ordered.filter(item => item.kind === "project").map(item => item.name);
+  resource.presentation.actionLists = ordered.filter(item => item.kind === "action_list").map(item => item.name);
+}
+
+function authorityRank(value) {
+  return ({ user_locked: 0, user_note: 1, accepted_stable: 2, legacy_effective: 3, agent_inference: 4, metadata: 5 })[value] ?? 6;
+}
+
+async function toggleVoiceRecording(resourceId) {
+  if (workspace.recording) {
+    if (workspace.recording.resourceId !== resourceId) return;
+    workspace.recording.recorder.stop();
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== "function") {
+    elements.actionStatus.textContent = "Voice recording is not available in this browser.";
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"]
+      .find(value => MediaRecorder.isTypeSupported(value)) || "";
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    const chunks = [];
+    const startedAt = performance.now();
+    const stopTimer = window.setTimeout(() => {
+      if (recorder.state === "recording") recorder.stop();
+    }, 590000);
+    workspace.recording = { resourceId, recorder, stream, chunks, startedAt, stopTimer };
+    recorder.addEventListener("dataavailable", event => {
+      if (event.data.size) chunks.push(event.data);
+    });
+    recorder.addEventListener("stop", async () => {
+      workspace.recording = null;
+      window.clearTimeout(stopTimer);
+      for (const track of stream.getTracks()) track.stop();
+      const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+      try {
+        await workspaceRequest(`/api/v1/resources/${resourceId}/voice-notes`, {
+          method: "POST",
+          body: blob,
+          contentType: blob.type || "audio/webm",
+          headers: { "X-TabAtlas-Audio-Duration-Ms": String(Math.round(performance.now() - startedAt)) }
+        });
+        const resource = resourceById.get(resourceId);
+        if (resource) resource.noteCount = Number(resource.noteCount || 0) + 1;
+        await loadResourceWorkspaceState(resourceId, true);
+        elements.actionStatus.textContent = "Voice note saved locally.";
+      } catch (error) {
+        showWorkspaceError(error, "The voice note could not be saved.");
+      }
+      if (state.selectedResource === resourceId) renderDrawer();
+    });
+    recorder.start(1000);
+    renderDrawer();
+  } catch (error) {
+    showWorkspaceError(error, "Microphone access was not granted.");
+  }
+}
+
+async function undoSemanticChange(resourceId, auditId, button) {
+  button.disabled = true;
+  try {
+    await workspaceRequest(`/api/v1/audits/${auditId}/undo`, { method: "POST" });
+    workspace.latestAuditByResource.delete(resourceId);
+    await loadResourceWorkspaceState(resourceId, true);
+    elements.actionStatus.textContent = "Latest organization change undone.";
+    render();
+  } catch (error) {
+    showWorkspaceError(error, "The organization change could not be undone.");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function detailCategories(resource) {
   const values = [
     ["Space", resourceSpace(resource)],
     ["Topics", resourceTopics(resource).join(", ")],
     ["Focus", resourceFocuses(resource).join(", ")],
     ["Projects", resourceProjects(resource).join(", ")],
+    ["Action lists", resourceActionLists(resource).join(", ")],
     ["Browser groups", contextGroupTitles(resource).join(", ")]
   ].filter(item => item[1]);
   if (!values.length) return null;
@@ -1387,6 +1853,28 @@ function workspaceRow(summary) {
   return button;
 }
 
+function actionListRow(summary) {
+  const button = node("button", "action-list-row");
+  button.type = "button";
+  const queued = Number(summary.stateCounts?.queued || 0);
+  const active = Number(summary.stateCounts?.in_progress || 0);
+  const completed = Number(summary.stateCounts?.completed || 0);
+  const copy = node("span", "workspace-copy");
+  copy.append(
+    node("strong", "", summary.name),
+    node("span", "", `${formatNumber(queued)} queued / ${formatNumber(active)} active / ${formatNumber(completed)} done`)
+  );
+  const meta = node("span", "workspace-meta");
+  meta.append(node("strong", "", formatNumber(summary.resourceCount || summary.resourceIds?.length || 0)), node("small", "", "resources"));
+  button.append(copy, meta);
+  button.addEventListener("click", () => openActionList(summary));
+  return button;
+}
+
+function openActionList(summary) {
+  openScope("action_list", summary.id);
+}
+
 function sectionHeading(title, summary, actionLabel = "", onAction = null) {
   const header = node("header", "section-heading");
   const copy = node("div");
@@ -1445,6 +1933,24 @@ function sourcePublisherLabel(value) {
   return value === "__unattributed" ? "Publisher not captured" : value;
 }
 
+function libraryLensControl() {
+  const control = node("div", "library-lens");
+  control.setAttribute("aria-label", "Library lens");
+  for (const [lens, label] of [["purpose", "Purpose"], ["source", "Source"]]) {
+    const button = node("button", state.libraryLens === lens ? "active" : "", label);
+    button.type = "button";
+    button.setAttribute("aria-pressed", String(state.libraryLens === lens));
+    button.addEventListener("click", () => openLibraryLens(lens));
+    control.append(button);
+  }
+  return control;
+}
+
+function openLibraryLens(lens) {
+  state.libraryLens = lens === "source" ? "source" : "purpose";
+  setView(state.libraryLens === "source" ? "sources" : "spaces");
+}
+
 function filterOptionLabel(label, value) {
   if (value === "all") return `All ${label.toLocaleLowerCase()}s`;
   if (value === "__ungrouped") return "No browser group";
@@ -1453,6 +1959,7 @@ function filterOptionLabel(label, value) {
 
 function openScope(kind, id) {
   state.view = "spaces";
+  state.libraryLens = "purpose";
   state.search = "";
   elements.search.value = "";
   state.scope = { kind, id };
@@ -1467,6 +1974,7 @@ function openScope(kind, id) {
 
 function openSourceScope(id) {
   state.view = "sources";
+  state.libraryLens = "source";
   state.search = "";
   elements.search.value = "";
   state.scope = null;
@@ -1493,7 +2001,9 @@ function resourcesForSourceSummary(summary) {
 
 function selectedScopeSummary() {
   if (!state.scope) return null;
-  const summaries = state.scope.kind === "project" ? projectSummaries : spaceSummaries;
+  const summaries = state.scope.kind === "project"
+    ? projectSummaries
+    : (state.scope.kind === "action_list" ? actionListSummaries : spaceSummaries);
   return summaries.find(summary => summary.id === state.scope.id) || null;
 }
 
@@ -1503,6 +2013,9 @@ function resourcesForSummary(summary) {
   }
   if (state.scope?.kind === "project") {
     return resources.filter(resource => resourceProjects(resource).includes(summary.name)).sort(resourceSort);
+  }
+  if (state.scope?.kind === "action_list") {
+    return resources.filter(resource => resourceActionLists(resource).includes(summary.name)).sort(resourceSort);
   }
   return resources.filter(resource => resourceSpace(resource) === summary.name).sort(resourceSort);
 }
@@ -1654,6 +2167,13 @@ function resourceProjects(resource) {
   return (resource.collections || []).filter(value => value.kind === "project").map(value => value.name);
 }
 
+function resourceActionLists(resource) {
+  if (Array.isArray(resource.presentation?.actionLists) && resource.presentation.actionLists.length) {
+    return resource.presentation.actionLists;
+  }
+  return (resource.collections || []).filter(value => value.kind === "action_list").map(value => value.name);
+}
+
 function resourceSort(a, b) {
   const previewDifference = Number(Boolean(b.presentation?.preview?.localImage)) - Number(Boolean(a.presentation?.preview?.localImage));
   if (previewDifference) return previewDifference;
@@ -1679,6 +2199,7 @@ function matchesSearch(resource) {
     ...resourceTopics(resource),
     ...resourceFocuses(resource),
     ...resourceProjects(resource),
+    ...resourceActionLists(resource),
     ...contextGroupTitles(resource)
   ].join("\n").toLocaleLowerCase();
   return value.includes(state.search);
@@ -1711,7 +2232,10 @@ function openReview(mode) {
 }
 
 function setView(view) {
+  if (view === "library") view = state.libraryLens === "source" ? "sources" : "spaces";
   state.view = ["home", "spaces", "sources", "review"].includes(view) ? view : "home";
+  if (state.view === "spaces") state.libraryLens = "purpose";
+  if (state.view === "sources") state.libraryLens = "source";
   state.search = "";
   elements.search.value = "";
   state.selectedResource = null;
@@ -1746,6 +2270,7 @@ function openDetails(resourceId, trigger) {
   state.selectedResource = resourceId;
   state.lastFocus = trigger || document.activeElement;
   renderDrawer();
+  renderAgentPanel();
 }
 
 function closeDetails() {
@@ -1753,6 +2278,7 @@ function closeDetails() {
   state.selectedResource = null;
   state.lastFocus = null;
   renderDrawer();
+  renderAgentPanel();
   if (restore && restore.isConnected) requestAnimationFrame(() => restore.focus({ preventScroll: true }));
 }
 
@@ -1795,8 +2321,19 @@ function requestDuplicateClose(resource = null) {
   }, resource ? [resource.resourceId] : []);
 }
 
-function requestLibraryRemoval(resource) {
+async function requestLibraryRemoval(resource) {
   if (!resource || resource.libraryState !== "accepted") return;
+  if (workspace.interactive) {
+    if (!window.confirm("Remove this resource from the visible library? It remains recoverable and no browser tab will be changed.")) return;
+    try {
+      await workspaceRequest(`/api/v1/resources/${resource.resourceId}/remove`, { method: "POST" });
+      elements.actionStatus.textContent = "Resource removed from the visible library.";
+      window.location.reload();
+    } catch (error) {
+      showWorkspaceError(error, "The resource could not be removed.");
+    }
+    return;
+  }
   downloadActionRequest("remove_from_library", {
     libraryResources: libraryResourceCount(),
     selectedResources: 1
@@ -1813,6 +2350,14 @@ function requestResourcePreview(resource) {
 
 function requestResourceReclassification(resource) {
   if (!resource) return;
+  if (workspace.interactive) {
+    state.selectedResource = resource.resourceId;
+    renderDrawer();
+    setAgentPanel(true);
+    elements.agentInput.placeholder = "Describe what this resource means to you";
+    elements.actionStatus.textContent = "Codex is scoped to this resource.";
+    return;
+  }
   downloadActionRequest("reconsider_resource", {
     selectedResources: 1,
     libraryResources: libraryResourceCount()
@@ -1862,6 +2407,325 @@ function downloadActionRequest(action, counts, resourceIds = []) {
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
   elements.actionStatus.textContent = "Action request downloaded. No browser tabs were changed.";
+}
+
+async function initializeWorkspace() {
+  if (!/^https?:$/.test(window.location.protocol)) return;
+  try {
+    const response = await fetch("/api/v1/session", { credentials: "same-origin", cache: "no-store" });
+    if (!response.ok) return;
+    const session = await response.json();
+    workspace.interactive = Boolean(session.interactive);
+    workspace.csrfToken = String(session.csrfToken || "");
+    mergeWorkspaceSession(session);
+    elements.agentToggle.hidden = !workspace.interactive;
+    render();
+  } catch (_error) {
+    workspace.interactive = false;
+    elements.agentToggle.hidden = true;
+  }
+}
+
+function mergeWorkspaceSession(session) {
+  workspace.agent = session.agent || {};
+  actionListSummaries = Array.isArray(session.actionLists) ? session.actionLists : actionListSummaries;
+  for (const [resourceId, count] of Object.entries(session.resourceNoteCounts || {})) {
+    const resource = resourceById.get(resourceId);
+    if (resource) resource.noteCount = Number(count || 0);
+  }
+  workspace.latestAuditByResource.clear();
+  for (const audit of session.recentAudits || []) {
+    if (!audit.undoneAt && !workspace.latestAuditByResource.has(audit.resourceId)) {
+      workspace.latestAuditByResource.set(audit.resourceId, audit.id);
+    }
+  }
+  for (const request of session.pendingRequests || []) {
+    pollAgentRequest(request.id, request.resourceId || "");
+  }
+  for (const proposal of session.pendingProposals || []) {
+    if (workspace.messages.some(message => message.proposalId === proposal.id)) continue;
+    workspace.messages.push({
+      role: "assistant",
+      text: proposal.message,
+      proposalId: proposal.id,
+      decision: "",
+      resourceId: proposal.resourceId
+    });
+  }
+}
+
+async function refreshWorkspaceSession() {
+  if (!workspace.interactive) return;
+  const session = await workspaceRequest("/api/v1/session");
+  mergeWorkspaceSession(session);
+}
+
+async function workspaceRequest(path, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const headers = new Headers(options.headers || {});
+  let body = options.body;
+  if (Object.prototype.hasOwnProperty.call(options, "json")) {
+    body = JSON.stringify(options.json);
+    headers.set("Content-Type", "application/json");
+  } else if (options.contentType) {
+    headers.set("Content-Type", options.contentType);
+  }
+  if (method !== "GET" && method !== "HEAD") {
+    headers.set("X-TabAtlas-CSRF", workspace.csrfToken);
+    headers.set("Idempotency-Key", options.idempotencyKey || workspaceIdempotencyKey());
+  }
+  const response = await fetch(path, {
+    method,
+    headers,
+    body,
+    credentials: "same-origin",
+    cache: "no-store"
+  });
+  const contentType = response.headers.get("Content-Type") || "";
+  const payload = contentType.includes("application/json") ? await response.json() : null;
+  if (!response.ok) {
+    const error = new Error(payload?.error || `Workspace request failed (${response.status})`);
+    error.code = payload?.code || `http_${response.status}`;
+    throw error;
+  }
+  return payload;
+}
+
+function workspaceIdempotencyKey() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `workspace-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function setAgentPanel(open) {
+  if (!workspace.interactive) return;
+  state.agentOpen = Boolean(open);
+  renderAgentPanel();
+  if (state.agentOpen) requestAnimationFrame(() => elements.agentInput.focus({ preventScroll: true }));
+}
+
+function renderAgentPanel() {
+  elements.agentPanel.hidden = !state.agentOpen || !workspace.interactive;
+  elements.agentToggle.setAttribute("aria-expanded", String(state.agentOpen));
+  if (!workspace.interactive) return;
+  const pendingCount = workspace.messages.filter(message => message.proposalId && !message.decision).length;
+  elements.agentPending.textContent = String(pendingCount);
+  elements.agentPending.hidden = pendingCount === 0;
+  const selected = state.selectedResource ? resourceById.get(state.selectedResource) : null;
+  elements.agentScope.textContent = selected ? resourceDisplayTitle(selected) : "Whole library";
+  elements.agentInput.placeholder = selected
+    ? "Describe what this resource means to you"
+    : "Ask about this resource library";
+  const ownership = workspace.agent.ownership || "workspace";
+  elements.agentStatus.textContent = ownership === "codex_desktop"
+    ? "Open in Codex desktop"
+    : (workspace.agent.running ? workspace.agent.model || "Connected" : "Starts when asked");
+  elements.agentOwnership.textContent = ownership === "codex_desktop" ? "Reclaim here" : "Open in Codex";
+  elements.agentMessages.replaceChildren();
+  if (!workspace.messages.length) {
+    elements.agentMessages.append(node("p", "agent-empty", selected ? "Ask about the selected resource." : "Ask across the retained library."));
+  }
+  for (const message of workspace.messages) {
+    const item = node("div", `agent-message ${message.role}`);
+    item.append(node("p", "", message.text));
+    const actions = node("div", "agent-message-actions");
+    if (message.proposalId && !message.decision) {
+      const apply = node("button", "secondary-command", "Apply");
+      apply.type = "button";
+      apply.addEventListener("click", () => decideAgentProposal(message, true, apply));
+      const dismiss = node("button", "text-command", "Dismiss");
+      dismiss.type = "button";
+      dismiss.addEventListener("click", () => decideAgentProposal(message, false, dismiss));
+      actions.append(apply, dismiss);
+    }
+    if (message.auditId) {
+      const undo = node("button", "text-command", "Undo");
+      undo.type = "button";
+      undo.addEventListener("click", () => undoSemanticChange(message.resourceId, message.auditId, undo));
+      actions.append(undo);
+    }
+    if (actions.childElementCount) item.append(actions);
+    elements.agentMessages.append(item);
+  }
+  if (workspace.previousView) {
+    const back = node("button", "agent-back", "Back before Codex navigation");
+    back.type = "button";
+    back.addEventListener("click", restoreAgentNavigation);
+    elements.agentMessages.append(back);
+  }
+  elements.agentMessages.scrollTop = elements.agentMessages.scrollHeight;
+}
+
+async function submitAgentRequest(event) {
+  event.preventDefault();
+  const message = elements.agentInput.value;
+  if (!message.trim()) return;
+  const send = elements.agentForm.querySelector('button[type="submit"]');
+  send.disabled = true;
+  const resourceId = state.selectedResource || "";
+  workspace.messages.push({ role: "user", text: message.trim() });
+  elements.agentInput.value = "";
+  renderAgentPanel();
+  try {
+    const request = await workspaceRequest("/api/v1/agent-requests", {
+      method: "POST",
+      json: { message, resourceId }
+    });
+    workspace.messages.push({ role: "status", text: "Codex is considering the current scope." });
+    renderAgentPanel();
+    pollAgentRequest(request.id, resourceId);
+  } catch (error) {
+    showWorkspaceError(error, "Codex request could not be queued.");
+  } finally {
+    send.disabled = false;
+  }
+}
+
+function pollAgentRequest(requestId, resourceId = "") {
+  if (!requestId || workspace.requestPolls.has(requestId)) return;
+  let deferredChecks = 0;
+  const poll = async () => {
+    try {
+      const request = await workspaceRequest(`/api/v1/agent-requests/${requestId}`);
+      if (request.status === "queued" && request.errorCode) {
+        deferredChecks += 1;
+        if (deferredChecks >= 6) {
+          workspace.messages.push({ role: "status", text: "Saved for the next available Codex session." });
+          workspace.requestPolls.delete(requestId);
+          renderAgentPanel();
+          return;
+        }
+      }
+      if (request.status === "failed") {
+        workspace.messages.push({ role: "assistant", text: "The note remains saved, but Codex could not interpret it in this session." });
+        workspace.requestPolls.delete(requestId);
+        renderAgentPanel();
+        return;
+      }
+      if (request.status !== "completed") {
+        const timer = window.setTimeout(poll, request.errorCode ? 2500 : 1200);
+        workspace.requestPolls.set(requestId, timer);
+        return;
+      }
+      workspace.requestPolls.delete(requestId);
+      workspace.messages = workspace.messages.filter(message => !(message.role === "status" && message.text === "Codex is considering the current scope."));
+      const response = request.response || {};
+      workspace.messages.push({
+        role: "assistant",
+        text: response.message || response.interpretation || "Codex completed the request.",
+        proposalId: request.proposalId,
+        decision: request.decision,
+        auditId: request.auditId,
+        resourceId: request.resourceId || resourceId
+      });
+      if (request.auditId && request.resourceId) workspace.latestAuditByResource.set(request.resourceId, request.auditId);
+      if (request.resourceId) await loadResourceWorkspaceState(request.resourceId, true);
+      await refreshWorkspaceSession();
+      applyAgentNavigation(response.navigation);
+      render();
+    } catch (error) {
+      workspace.requestPolls.delete(requestId);
+      showWorkspaceError(error, "Codex status could not be read.");
+    }
+  };
+  const timer = window.setTimeout(poll, 500);
+  workspace.requestPolls.set(requestId, timer);
+}
+
+async function decideAgentProposal(message, accept, button) {
+  button.disabled = true;
+  try {
+    const action = accept ? "accept" : "reject";
+    const result = await workspaceRequest(`/api/v1/proposals/${message.proposalId}/${action}`, { method: "POST" });
+    message.decision = result.decision;
+    message.auditId = result.auditId;
+    if (result.auditId && result.resourceId) workspace.latestAuditByResource.set(result.resourceId, result.auditId);
+    if (result.resourceId) await loadResourceWorkspaceState(result.resourceId, true);
+    await refreshWorkspaceSession();
+    render();
+  } catch (error) {
+    showWorkspaceError(error, "The proposal decision could not be saved.");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function applyAgentNavigation(navigation) {
+  if (!navigation || navigation.command === "none") return;
+  workspace.previousView = {
+    view: state.view,
+    search: state.search,
+    scope: state.scope ? { ...state.scope } : null,
+    sourceScope: state.sourceScope,
+    sourcePublisher: state.sourcePublisher,
+    sourceTopic: state.sourceTopic,
+    reviewMode: state.reviewMode,
+    filters: { ...state.filters },
+    selectedResource: state.selectedResource
+  };
+  if (navigation.command === "open_resource" && resourceById.has(navigation.resourceId)) {
+    state.selectedResource = navigation.resourceId;
+    render();
+    highlightResource(navigation.resourceId);
+  } else if (navigation.command === "show_collection" && navigation.collectionName) {
+    const summary = [...spaceSummaries, ...projectSummaries, ...actionListSummaries]
+      .find(item => item.name === navigation.collectionName);
+    if (summary) {
+      const kind = actionListSummaries.includes(summary) ? "action_list" : (projectSummaries.includes(summary) ? "project" : "space");
+      openScope(kind, summary.id);
+    }
+  } else if (navigation.command === "set_filter" && navigation.filter) {
+    state.search = navigation.filter.toLocaleLowerCase();
+    elements.search.value = navigation.filter;
+    renderAtTop();
+  }
+  elements.actionStatus.textContent = "Codex changed the current view.";
+}
+
+function restoreAgentNavigation() {
+  const previous = workspace.previousView;
+  if (!previous) return;
+  workspace.previousView = null;
+  Object.assign(state, previous);
+  elements.search.value = previous.search;
+  renderAtTop();
+}
+
+function highlightResource(resourceId) {
+  requestAnimationFrame(() => {
+    const card = document.querySelector(`[data-resource-id="${CSS.escape(resourceId)}"]`);
+    if (!card) return;
+    card.classList.add("agent-highlight");
+    card.scrollIntoView({ block: "center", behavior: "smooth" });
+    window.setTimeout(() => card.classList.remove("agent-highlight"), 2400);
+  });
+}
+
+async function toggleAgentOwnership() {
+  elements.agentOwnership.disabled = true;
+  try {
+    if (workspace.agent.ownership === "codex_desktop") {
+      const status = await workspaceRequest("/api/v1/agent/reclaim", { method: "POST" });
+      workspace.agent = status;
+      workspace.agent.ownership = "workspace";
+    } else {
+      const handoff = await workspaceRequest("/api/v1/agent/handoff", { method: "POST" });
+      workspace.agent.ownership = handoff.ownership;
+      renderAgentPanel();
+      if (handoff.deepLink) window.location.href = handoff.deepLink;
+    }
+    renderAgentPanel();
+  } catch (error) {
+    showWorkspaceError(error, "Codex ownership could not be changed.");
+  } finally {
+    elements.agentOwnership.disabled = false;
+  }
+}
+
+function showWorkspaceError(error, fallback) {
+  const message = error?.message || fallback;
+  elements.actionStatus.textContent = message;
+  workspace.messages.push({ role: "assistant", text: message });
+  renderAgentPanel();
 }
 
 function factChip(value) {

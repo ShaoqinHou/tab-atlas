@@ -98,8 +98,25 @@ Topics, Focuses, Project overlays, a separate Source/owner lens, discovery
 review, search, progressive detail, and batched infinite scrolling. Browser
 groups are contextual filters, not the primary taxonomy.
 
-For the interactive report, generate and start the on-demand read-only loopback
-viewer. It is not scheduled and stops with `Ctrl+C`:
+For normal use, start the authenticated on-demand workspace. It is not scheduled,
+does not start with Windows, and stops with `Ctrl+C`:
+
+```powershell
+python scripts/tab_atlas.py workspace --port 8790 --open
+```
+
+The workspace adds private typed and voice notes, editable transcripts, Action
+List progress, audited proposal decisions, Undo, and a scoped **Ask Codex** panel.
+It uses the existing ChatGPT sign-in through a dedicated persistent Codex task;
+it never asks for an API key. Codex starts only when a request needs it. A saved
+note remains durable and queued if Codex is unavailable. The child stops after
+two idle minutes; there is no heartbeat or background model turn.
+
+**Open in Codex** is an explicit single-writer handoff: the workspace stops its
+app-server child before opening that same dedicated task in Codex desktop. Use
+**Reclaim here** before sending another request from the workspace.
+
+For a read-only HTTP presentation, use:
 
 ```powershell
 python scripts/tab_atlas.py view --port 8790 --open
@@ -135,7 +152,10 @@ python scripts/tab_atlas.py register-preview --resource-id <id> path\to\capture.
 python scripts/tab_atlas.py report
 ```
 
-Report action requests map as follows:
+In the authenticated workspace, Reclassify opens the resource-scoped Codex panel,
+remove-from-library is recoverable and immediate after confirmation, and Action
+List progress is revision-checked and undoable. In a static report, action
+requests map as follows:
 
 - `remove_from_library`: verify the ID is accepted, then run `remove`.
 - `capture_resource_preview`: capture only with an appropriate isolated or

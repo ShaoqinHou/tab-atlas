@@ -20,7 +20,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 TABATLAS_EXTENSION_ID = "ohgpplkophdikjnbefigdhikdooehmkh"
 TABATLAS_EXTENSION_URL_PREFIX = f"chrome-extension://{TABATLAS_EXTENSION_ID}/"
 LEGACY_CAPTURE_PROTOCOL_VERSION = 2
@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS resources (
   library_state TEXT NOT NULL DEFAULT 'accepted'
     CHECK (library_state IN ('accepted', 'candidate', 'dismissed')),
   accepted_at TEXT,
-  dismissed_at TEXT
+  dismissed_at TEXT,
+  semantic_revision INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tab_instances (
@@ -172,6 +173,8 @@ CREATE TABLE IF NOT EXISTS collections (
   objective TEXT,
   parent_id TEXT REFERENCES collections(id) ON DELETE SET NULL,
   status TEXT NOT NULL DEFAULT 'active',
+  workflow_kind TEXT NOT NULL DEFAULT 'none',
+  config_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -184,6 +187,8 @@ CREATE TABLE IF NOT EXISTS resource_collections (
   confidence REAL,
   origin TEXT NOT NULL DEFAULT 'codex',
   accepted INTEGER NOT NULL DEFAULT 0,
+  authority TEXT NOT NULL DEFAULT 'legacy_effective',
+  applied_decision_id TEXT,
   created_at TEXT NOT NULL,
   PRIMARY KEY (resource_id, collection_id)
 );
@@ -219,6 +224,137 @@ CREATE TABLE IF NOT EXISTS resource_motion_previews (
   refreshed_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS resource_notes (
+  id TEXT PRIMARY KEY,
+  resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('text', 'audio')),
+  text_body TEXT,
+  audio_relpath TEXT,
+  audio_mime TEXT,
+  audio_sha256 TEXT,
+  audio_bytes INTEGER,
+  audio_duration_ms INTEGER,
+  language_hint TEXT,
+  source_surface TEXT NOT NULL DEFAULT 'workspace',
+  supersedes_note_id TEXT REFERENCES resource_notes(id) ON DELETE SET NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  CHECK (
+    (kind='text' AND text_body IS NOT NULL AND audio_relpath IS NULL)
+    OR
+    (kind='audio' AND text_body IS NULL AND audio_relpath IS NOT NULL)
+  )
+);
+
+CREATE INDEX IF NOT EXISTS resource_notes_resource_time
+ON resource_notes(resource_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS note_events (
+  id TEXT PRIMARY KEY,
+  note_id TEXT NOT NULL REFERENCES resource_notes(id) ON DELETE CASCADE,
+  event TEXT NOT NULL CHECK (event IN ('retract', 'restore')),
+  actor TEXT NOT NULL,
+  request_id TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS note_processing_events (
+  id TEXT PRIMARY KEY,
+  note_id TEXT NOT NULL REFERENCES resource_notes(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL,
+  stage TEXT NOT NULL CHECK (stage IN ('transcription', 'interpretation')),
+  state TEXT NOT NULL CHECK (
+    state IN ('queued', 'running', 'succeeded', 'failed', 'not_required', 'stale')
+  ),
+  sequence INTEGER NOT NULL,
+  input_hash TEXT NOT NULL,
+  output_text TEXT,
+  output_json TEXT,
+  engine TEXT,
+  model TEXT,
+  prompt_version TEXT,
+  error_code TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE(note_id, run_id, stage, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS note_processing_latest
+ON note_processing_events(note_id, stage, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_requests (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('interpret_note', 'workspace_chat')),
+  resource_id TEXT REFERENCES resources(id) ON DELETE CASCADE,
+  note_id TEXT REFERENCES resource_notes(id) ON DELETE CASCADE,
+  request_text TEXT,
+  status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+  response_json TEXT,
+  error_code TEXT,
+  thread_id TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS semantic_proposals (
+  id TEXT PRIMARY KEY,
+  resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+  note_id TEXT REFERENCES resource_notes(id) ON DELETE SET NULL,
+  request_id TEXT REFERENCES agent_requests(id) ON DELETE SET NULL,
+  base_revision INTEGER NOT NULL,
+  proposer TEXT NOT NULL,
+  model TEXT,
+  thread_id TEXT,
+  rationale TEXT,
+  operations_json TEXT NOT NULL,
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  input_hash TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS semantic_audits (
+  id TEXT PRIMARY KEY,
+  resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+  proposal_id TEXT REFERENCES semantic_proposals(id) ON DELETE SET NULL,
+  before_json TEXT NOT NULL,
+  after_json TEXT NOT NULL,
+  before_hash TEXT NOT NULL,
+  after_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  undone_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS semantic_decisions (
+  id TEXT PRIMARY KEY,
+  proposal_id TEXT NOT NULL UNIQUE REFERENCES semantic_proposals(id) ON DELETE CASCADE,
+  decision TEXT NOT NULL CHECK (decision IN ('accepted', 'rejected', 'partial')),
+  accepted_operations_json TEXT NOT NULL DEFAULT '[]',
+  actor TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  applied_revision INTEGER,
+  audit_id TEXT REFERENCES semantic_audits(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS resource_collection_progress (
+  resource_id TEXT NOT NULL,
+  collection_id TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'queued'
+    CHECK (state IN ('queued', 'in_progress', 'completed', 'snoozed', 'skipped')),
+  priority INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5),
+  completed_units INTEGER NOT NULL DEFAULT 0 CHECK (completed_units >= 0),
+  total_units INTEGER CHECK (total_units IS NULL OR total_units >= 0),
+  due_at TEXT,
+  revision INTEGER NOT NULL DEFAULT 0,
+  applied_decision_id TEXT REFERENCES semantic_decisions(id) ON DELETE SET NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (resource_id, collection_id),
+  FOREIGN KEY (resource_id, collection_id)
+    REFERENCES resource_collections(resource_id, collection_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS mutation_audits (
   id TEXT PRIMARY KEY,
   action TEXT NOT NULL,
@@ -246,6 +382,7 @@ def utc_now() -> str:
 
 def connect(database_path: Path) -> sqlite3.Connection:
     database_path.parent.mkdir(parents=True, exist_ok=True)
+    _backup_before_schema_upgrade(database_path)
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -287,6 +424,10 @@ def connect(database_path: Path) -> sqlite3.Connection:
         connection.execute("ALTER TABLE resources ADD COLUMN accepted_at TEXT")
     if "dismissed_at" not in resource_columns:
         connection.execute("ALTER TABLE resources ADD COLUMN dismissed_at TEXT")
+    if "semantic_revision" not in resource_columns:
+        connection.execute(
+            "ALTER TABLE resources ADD COLUMN semantic_revision INTEGER NOT NULL DEFAULT 0"
+        )
     connection.execute(
         "UPDATE resources SET accepted_at=COALESCE(accepted_at, first_seen_at) "
         "WHERE library_state='accepted'"
@@ -297,6 +438,27 @@ def connect(database_path: Path) -> sqlite3.Connection:
     if "parent_id" not in collection_columns:
         connection.execute(
             "ALTER TABLE collections ADD COLUMN parent_id TEXT REFERENCES collections(id)"
+        )
+    if "workflow_kind" not in collection_columns:
+        connection.execute(
+            "ALTER TABLE collections ADD COLUMN workflow_kind TEXT NOT NULL DEFAULT 'none'"
+        )
+    if "config_json" not in collection_columns:
+        connection.execute(
+            "ALTER TABLE collections ADD COLUMN config_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    membership_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(resource_collections)").fetchall()
+    }
+    if "authority" not in membership_columns:
+        connection.execute(
+            "ALTER TABLE resource_collections "
+            "ADD COLUMN authority TEXT NOT NULL DEFAULT 'legacy_effective'"
+        )
+    if "applied_decision_id" not in membership_columns:
+        connection.execute(
+            "ALTER TABLE resource_collections ADD COLUMN applied_decision_id TEXT"
         )
     for topic_name, space_name in TOPIC_PARENT_DEFAULTS.items():
         connection.execute(
@@ -317,6 +479,44 @@ def connect(database_path: Path) -> sqlite3.Connection:
     )
     connection.commit()
     return connection
+
+
+def _backup_before_schema_upgrade(database_path: Path) -> None:
+    if not database_path.is_file() or database_path.stat().st_size == 0:
+        return
+    source = sqlite3.connect(f"file:{database_path.resolve().as_posix()}?mode=ro", uri=True)
+    try:
+        row = source.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        try:
+            current_version = int(row[0]) if row else 0
+        except (TypeError, ValueError):
+            current_version = 0
+        if current_version >= SCHEMA_VERSION:
+            return
+        backup_dir = database_path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        destination = backup_dir / f"pre-schema-v{current_version}-{timestamp}.sqlite"
+        temporary = destination.with_suffix(".sqlite.tmp")
+        target = sqlite3.connect(temporary)
+        try:
+            source.backup(target)
+            integrity = target.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or integrity[0] != "ok":
+                raise ValueError("Pre-migration database backup failed integrity_check")
+            target.commit()
+        finally:
+            target.close()
+        os.replace(temporary, destination)
+        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        _atomic_write(
+            destination.with_suffix(".sqlite.sha256"),
+            f"{digest}  {destination.name}\n".encode("ascii"),
+        )
+    finally:
+        source.close()
 
 
 def token_hash(token: str) -> str:
@@ -912,6 +1112,7 @@ def _resources_for_capture_ids(
                r.first_seen_at, r.last_seen_at, r.brief, r.detail, r.why_kept,
                r.next_action, r.status, r.confidence, r.archived_at,
                r.library_state, r.accepted_at, r.dismissed_at,
+               r.semantic_revision,
                p.kind AS preview_kind, p.local_path AS preview_local_path,
                p.source AS preview_source, p.content_sha256 AS preview_sha256,
                p.width AS preview_width, p.height AS preview_height,
@@ -933,8 +1134,10 @@ def _resources_for_capture_ids(
     for row in connection.execute(
         """
         SELECT rc.resource_id, c.id, c.name, c.kind, c.description,
+               c.workflow_kind AS workflowKind, c.config_json AS configJson,
                c.parent_id AS parentId, parent.name AS parentName, rc.role,
-               rc.reason, rc.confidence, rc.origin, rc.accepted
+               rc.reason, rc.confidence, rc.origin, rc.accepted,
+               rc.authority, rc.applied_decision_id AS appliedDecisionId
         FROM resource_collections rc
         JOIN collections c ON c.id=rc.collection_id
         LEFT JOIN collections parent ON parent.id=c.parent_id
@@ -947,6 +1150,9 @@ def _resources_for_capture_ids(
     for row in connection.execute("SELECT * FROM tasks ORDER BY status, created_at"):
         if row["resource_id"]:
             tasks[row["resource_id"]].append(dict(row))
+
+    action_items = _action_items_by_resource(connection)
+    note_count_by_resource = _active_note_counts(connection)
 
     resources: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -972,6 +1178,8 @@ def _resources_for_capture_ids(
                 "libraryState": row["library_state"],
                 "acceptedAt": row["accepted_at"] or "",
                 "dismissedAt": row["dismissed_at"] or "",
+                "semanticRevision": int(row["semantic_revision"] or 0),
+                "noteCount": note_count_by_resource.get(row["resource_id"], 0),
                 "previewKind": row["preview_kind"] or "",
                 "previewLocalPath": row["preview_local_path"] or "",
                 "previewSource": row["preview_source"] or "",
@@ -984,6 +1192,7 @@ def _resources_for_capture_ids(
                 "motionRefreshedAt": row["motion_refreshed_at"] or "",
                 "collections": collections[row["resource_id"]],
                 "tasks": tasks[row["resource_id"]],
+                "actionItems": action_items[row["resource_id"]],
                 "tabs": [],
             }
             resources[row["resource_id"]] = resource
@@ -996,6 +1205,47 @@ def current_resources(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         connection,
         [item["id"] for item in latest_capture_rows(connection)],
     )
+
+
+def _active_note_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    return {
+        row["resource_id"]: int(row["note_count"])
+        for row in connection.execute(
+            """
+            SELECT n.resource_id, COUNT(*) AS note_count
+            FROM resource_notes n
+            WHERE COALESCE(
+              (
+                SELECT e.event FROM note_events e
+                WHERE e.note_id=n.id
+                ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1
+              ),
+              'restore'
+            )='restore'
+            GROUP BY n.resource_id
+            """
+        )
+    }
+
+
+def _action_items_by_resource(
+    connection: sqlite3.Connection,
+) -> dict[str, list[dict[str, Any]]]:
+    result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in connection.execute(
+        """
+        SELECT p.resource_id, p.collection_id AS collectionId,
+               c.name AS collectionName, c.workflow_kind AS workflowKind,
+               p.state, p.priority, p.completed_units AS completedUnits,
+               p.total_units AS totalUnits, p.due_at AS dueAt,
+               p.revision, p.updated_at AS updatedAt
+        FROM resource_collection_progress p
+        JOIN collections c ON c.id=p.collection_id
+        ORDER BY p.priority, c.name COLLATE NOCASE
+        """
+    ):
+        result[row["resource_id"]].append(dict(row))
+    return result
 
 
 def library_resources(
@@ -1016,8 +1266,10 @@ def library_resources(
     for row in connection.execute(
         """
         SELECT rc.resource_id, c.id, c.name, c.kind, c.description,
+               c.workflow_kind AS workflowKind, c.config_json AS configJson,
                c.parent_id AS parentId, parent.name AS parentName, rc.role,
-               rc.reason, rc.confidence, rc.origin, rc.accepted
+               rc.reason, rc.confidence, rc.origin, rc.accepted,
+               rc.authority, rc.applied_decision_id AS appliedDecisionId
         FROM resource_collections rc
         JOIN collections c ON c.id=rc.collection_id
         LEFT JOIN collections parent ON parent.id=c.parent_id
@@ -1029,6 +1281,8 @@ def library_resources(
     for row in connection.execute("SELECT * FROM tasks ORDER BY status, created_at"):
         if row["resource_id"]:
             tasks[row["resource_id"]].append(dict(row))
+    action_items = _action_items_by_resource(connection)
+    note_count_by_resource = _active_note_counts(connection)
 
     context_rows = connection.execute(
         """
@@ -1073,6 +1327,8 @@ def library_resources(
         if resource_id_value in current:
             current[resource_id_value]["contexts"] = resource_contexts
             current[resource_id_value]["openTabCount"] = len(current[resource_id_value]["tabs"])
+            current[resource_id_value]["noteCount"] = note_count_by_resource.get(resource_id_value, 0)
+            current[resource_id_value]["actionItems"] = action_items[resource_id_value]
             continue
         latest_context = max(
             resource_contexts,
@@ -1101,6 +1357,8 @@ def library_resources(
             "libraryState": row["library_state"],
             "acceptedAt": row["accepted_at"] or "",
             "dismissedAt": row["dismissed_at"] or "",
+            "semanticRevision": int(row["semantic_revision"] or 0),
+            "noteCount": note_count_by_resource.get(resource_id_value, 0),
             "previewKind": row["preview_kind"] or "",
             "previewLocalPath": row["preview_local_path"] or "",
             "previewSource": row["preview_source"] or "",
@@ -1113,6 +1371,7 @@ def library_resources(
             "motionRefreshedAt": row["motion_refreshed_at"] or "",
             "collections": collections[resource_id_value],
             "tasks": tasks[resource_id_value],
+            "actionItems": action_items[resource_id_value],
             "tabs": [],
             "contexts": resource_contexts,
             "openTabCount": 0,
@@ -1727,6 +1986,17 @@ def display_url(url: str) -> str:
     return url[:240]
 
 
+def _collection_authority_rank(authority: str) -> int:
+    return {
+        "user_locked": 0,
+        "user_note": 1,
+        "accepted_stable": 2,
+        "legacy_effective": 3,
+        "agent_inference": 4,
+        "metadata": 5,
+    }.get(authority, 6)
+
+
 def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
     url = str(resource.get("openUrl") or resource.get("canonicalUrl") or "")
     try:
@@ -1743,11 +2013,20 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
         publisher = source
     format_label = _format_label(host, kind, title, parts.path, parts.scheme)
     intent = _intent_label(str(resource.get("nextAction") or ""), format_label)
-    collections = resource.get("collections") or []
+    collections = sorted(
+        resource.get("collections") or [],
+        key=lambda item: (
+            _collection_authority_rank(str(item.get("authority") or "")),
+            str(item.get("name") or "").casefold(),
+        ),
+    )
     spaces = [collection for collection in collections if collection.get("kind") == "space"]
     topics = [collection for collection in collections if collection.get("kind") == "topic"]
     focuses = [collection for collection in collections if collection.get("kind") == "focus"]
     projects = [collection for collection in collections if collection.get("kind") == "project"]
+    action_lists = [
+        collection for collection in collections if collection.get("kind") == "action_list"
+    ]
     tabs = resource.get("tabs") or []
     context_tabs = resource.get("contexts") or tabs
     tasks = resource.get("tasks") or []
@@ -1774,6 +2053,10 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
     elif any(str(task.get("status") or "") == "open" for task in tasks):
         queue = "task"
         decision_label = "Task attached"
+        decision_tone = "action"
+    elif action_lists:
+        queue = "action_list"
+        decision_label = action_lists[0]["name"]
         decision_tone = "action"
     elif not spaces:
         queue = "needs_context"
@@ -1806,7 +2089,9 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
         decision_cue = "Keep as a reference."
 
     why_kept = str(resource.get("whyKept") or "").strip()
-    if why_kept:
+    if int(resource.get("noteCount") or 0):
+        context_cue = "Your note has priority over inferred context."
+    elif why_kept:
         context_cue = _sentence(why_kept)
     elif group_titles:
         context_cue = f"Browser group context: {group_titles[0]}."
@@ -1869,6 +2154,7 @@ def resource_presentation(resource: dict[str, Any]) -> dict[str, Any]:
         "topics": [collection["name"] for collection in topics[:2]],
         "focuses": [collection["name"] for collection in focuses[:2]],
         "projects": [collection["name"] for collection in projects],
+        "actionLists": [collection["name"] for collection in action_lists],
         "openTabCount": len(tabs),
         "stored": status in {"saved", "archived"},
         "duplicates": duplicate,
@@ -3956,6 +4242,18 @@ def report_payload(connection: sqlite3.Connection) -> dict[str, Any]:
     groups = report_group_summaries(resources)
     collection_summaries = report_collection_summaries(resources, collections)
     active_summaries = [item for item in collection_summaries if item["resourceCount"]]
+    action_list_summaries = []
+    for item in active_summaries:
+        if item["kind"] != "action_list":
+            continue
+        states = Counter(
+            row["state"]
+            for row in connection.execute(
+                "SELECT state FROM resource_collection_progress WHERE collection_id=?",
+                (item["id"],),
+            )
+        )
+        action_list_summaries.append({**item, "stateCounts": dict(states)})
     space_order = {name: index for index, name in enumerate(SPACE_DEFINITIONS)}
     space_summaries = sorted(
         (item for item in active_summaries if item["kind"] == "space"),
@@ -3977,6 +4275,7 @@ def report_payload(connection: sqlite3.Connection) -> dict[str, Any]:
         "topicSummaries": [item for item in active_summaries if item["kind"] == "topic"],
         "focusSummaries": [item for item in active_summaries if item["kind"] == "focus"],
         "projectSummaries": [item for item in active_summaries if item["kind"] == "project"],
+        "actionListSummaries": action_list_summaries,
         "sourceSummaries": source_summaries,
         "facets": {
             "formats": [{"name": name, "count": count} for name, count in format_counts.most_common()],
@@ -3984,6 +4283,25 @@ def report_payload(connection: sqlite3.Connection) -> dict[str, Any]:
             "queues": dict(queue_counts),
         },
         "tasks": tasks,
+        "workspace": {
+            "pendingAgentRequests": connection.execute(
+                "SELECT COUNT(*) AS count FROM agent_requests WHERE status IN ('queued', 'running')"
+            ).fetchone()["count"],
+            "recentAudits": [
+                {
+                    "id": row["id"],
+                    "resourceId": row["resource_id"],
+                    "createdAt": row["created_at"],
+                    "undoneAt": row["undone_at"] or "",
+                }
+                for row in connection.execute(
+                    """
+                    SELECT id, resource_id, created_at, undone_at
+                    FROM semantic_audits ORDER BY created_at DESC, rowid DESC LIMIT 20
+                    """
+                )
+            ],
+        },
     }
 
 

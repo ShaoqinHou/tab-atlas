@@ -2,27 +2,34 @@
 
 ## Product Boundary
 
-The user operates TabAtlas by talking to Codex. The workspace supplies local,
-deterministic capabilities; it does not embed a model runtime.
+The user can operate TabAtlas through Codex or through one on-demand local
+workspace. The workspace owns durable state and deterministic mutations. A
+dedicated Codex task is an optional interpretation and navigation layer; it is
+not the database and does not apply changes directly.
 
 ```text
 Chrome / Edge extension
         |
         | authenticated loopback command
         v
-one-shot receiver -> raw capture -> SQLite catalog
+one-shot receiver -> raw capture -> SQLite catalog -> on-demand workspace
                                       |-- staged discoveries
                                       |-- durable accepted library
-                                      |-- bounded Codex batches
-                                      `-- generated report + on-demand viewer
+                                      |-- authoritative user notes
+                                      |-- audited proposals and undo
+                                      |-- action lists and progress
+                                      `-- generated read-only report
 ```
 
-The agent-operated cycle is:
+The ongoing cycle is:
 
 ```text
 refresh -> review discoveries -> accept or dismiss -> enrich and reconsider
-        -> report -> optionally run a verified archive
+        -> annotate or ask Codex -> optionally run a verified archive
 ```
+
+The authority, agent, voice, and interaction contracts are defined in
+`references/interaction-architecture.md`.
 
 ## Browser Extension And Receiver
 
@@ -65,7 +72,9 @@ not churn without evidence.
 
 ## Presentation
 
-Generate a self-contained local HTML report. It supports discovery review,
+Generate a self-contained local HTML report as a read-only export. The on-demand
+workspace serves the same presentation with authenticated local write APIs. It
+supports discovery review,
 purpose-first navigation, hierarchy filters, Project overlays, global search,
 and progressive resource detail. Resource lists append in bounded batches through
 infinite scrolling so large libraries remain responsive. Browser groups preserve

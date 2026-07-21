@@ -45,6 +45,7 @@ from tab_atlas_receiver import (
     run_revocation,
 )
 from tab_atlas_report import DEFAULT_REPORT_PORT, create_report_server
+from tab_atlas_workspace_server import DEFAULT_WORKSPACE_PORT, create_workspace_server
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -156,6 +157,14 @@ def build_parser() -> argparse.ArgumentParser:
     view_parser.add_argument("--output", type=Path, default=DEFAULT_REPORT)
     view_parser.add_argument("--port", type=int, default=DEFAULT_REPORT_PORT)
     view_parser.add_argument("--open", action="store_true", dest="open_report")
+
+    workspace_parser = subparsers.add_parser(
+        "workspace",
+        help="Start the authenticated, writable TabAtlas workspace on demand",
+    )
+    workspace_parser.add_argument("--output", type=Path, default=DEFAULT_REPORT)
+    workspace_parser.add_argument("--port", type=int, default=DEFAULT_WORKSPACE_PORT)
+    workspace_parser.add_argument("--open", action="store_true", dest="open_report")
 
     enrich_parser = subparsers.add_parser(
         "enrich",
@@ -737,6 +746,37 @@ def main(argv: list[str] | None = None) -> int:
             connection.close()
             server, url = create_report_server(report_path.parent, args.port)
             output({"report": str(report_path), "url": url, "readOnly": True})
+            sys.stdout.flush()
+            if args.open_report:
+                webbrowser.open(url)
+            try:
+                server.serve_forever(poll_interval=0.25)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                server.server_close()
+            return 0
+
+        if args.command == "workspace":
+            output_dir = args.output.resolve()
+            report_path = generate_report(connection, output_dir, REPORT_ASSETS, state_dir)
+            connection.close()
+            server, url = create_workspace_server(
+                ROOT,
+                state_dir,
+                database_path,
+                report_path.parent,
+                REPORT_ASSETS,
+                args.port,
+            )
+            output(
+                {
+                    "report": str(report_path),
+                    "url": url,
+                    "readOnly": False,
+                    "agent": "on_demand_chatgpt_login",
+                }
+            )
             sys.stdout.flush()
             if args.open_report:
                 webbrowser.open(url)

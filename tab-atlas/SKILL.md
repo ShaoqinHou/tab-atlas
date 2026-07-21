@@ -105,11 +105,13 @@ does not start with Windows, and stops with `Ctrl+C`:
 python scripts/tab_atlas.py workspace --port 8790 --open
 ```
 
-The workspace adds private typed and voice notes, editable transcripts, Action
-List progress, audited proposal decisions, Undo, and a scoped **Ask Codex** panel.
+The workspace adds private typed and voice notes, automatic local Whisper
+transcripts with correction, Action List progress, audited proposal decisions,
+Undo, and a scoped **Ask Codex** panel.
 It uses the existing ChatGPT sign-in through a dedicated persistent Codex task;
-it never asks for an API key. Codex starts only when a request needs it. A saved
-note remains durable and queued if Codex is unavailable. The child stops after
+it never asks for an API key. Saving a note does not start Codex; the note-level
+review button does. Every organization proposal requires an explicit user
+acceptance. A saved note remains durable if Codex is unavailable. The child stops after
 two idle minutes; there is no heartbeat or background model turn.
 
 **Open in Codex** is an explicit single-writer handoff: the workspace stops its

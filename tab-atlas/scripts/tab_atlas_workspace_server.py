@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import mimetypes
 import os
@@ -8,7 +7,10 @@ import queue
 import re
 import secrets
 import sqlite3
+import subprocess
+import sys
 import threading
+import time
 from contextlib import contextmanager
 from functools import partial
 from http import HTTPStatus
@@ -41,22 +43,28 @@ from tab_atlas_workspace import (
     add_audio_transcript,
     agent_request_detail,
     apply_semantic_proposal,
+    audio_note_source,
+    complete_audio_transcription,
     complete_agent_request,
     create_audio_note,
+    create_note_analysis_request,
     create_text_note,
     create_workspace_chat_request,
     defer_agent_request,
+    fail_audio_transcription,
+    mark_audio_transcription_running,
     mark_agent_request_failed,
     mark_agent_request_running,
     note_counts,
-    note_detail,
-    proposal_can_auto_apply,
+    proposal_is_current,
+    queued_audio_transcriptions,
     queued_agent_requests,
     reject_semantic_proposal,
     resource_notes,
     set_note_active,
     undo_semantic_audit,
     update_action_progress,
+    workspace_directory_summaries,
 )
 
 
@@ -64,6 +72,7 @@ WORKSPACE_HOST = "127.0.0.1"
 DEFAULT_WORKSPACE_PORT = 8790
 MAX_JSON_BYTES = 64 * 1024
 AGENT_IDLE_SECONDS = 120
+TRANSCRIPTION_TIMEOUT_SECONDS = 15 * 60
 COOKIE_NAME = "tabatlas_workspace"
 RESOURCE_ID_PATTERN = r"res_[a-f0-9]{24}"
 OPAQUE_ID_PATTERN = r"[a-z]+_[a-f0-9]{24}"
@@ -105,6 +114,9 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
         self._request_queue: queue.Queue[str | None] = queue.Queue()
         self._queued_ids: set[str] = set()
         self._queued_lock = threading.Lock()
+        self._transcription_queue: queue.Queue[str | None] = queue.Queue()
+        self._transcription_ids: set[str] = set()
+        self._transcription_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._worker = threading.Thread(
             target=self._agent_worker,
@@ -112,9 +124,17 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
             daemon=True,
         )
         self._worker.start()
+        self._transcription_worker = threading.Thread(
+            target=self._audio_transcription_worker,
+            name="tabatlas-transcription-worker",
+            daemon=True,
+        )
+        self._transcription_worker.start()
         with self.database() as connection:
             for request in queued_agent_requests(connection, 100):
                 self.enqueue_agent_request(request["id"])
+            for note in queued_audio_transcriptions(connection, 100):
+                self.enqueue_audio_transcription(note["id"])
 
     @contextmanager
     def database(self) -> Iterator[sqlite3.Connection]:
@@ -132,6 +152,13 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
             self._queued_ids.add(request_id)
         self._request_queue.put(request_id)
 
+    def enqueue_audio_transcription(self, note_id: str) -> None:
+        with self._transcription_lock:
+            if note_id in self._transcription_ids:
+                return
+            self._transcription_ids.add(note_id)
+        self._transcription_queue.put(note_id)
+
     def regenerate_report(self) -> None:
         with self._report_lock, self.database() as connection:
             generate_report(connection, self.report_dir, self.report_assets, self.state_dir)
@@ -140,6 +167,7 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
         self._stop_event.set()
         self._cancel_agent_idle_stop()
         self._request_queue.put(None)
+        self._transcription_queue.put(None)
         self.agent.stop()
         super().server_close()
         self.lease.close()
@@ -170,6 +198,7 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
                 )
             ]
             action_lists = action_list_summaries(connection)
+            directories = workspace_directory_summaries(connection)
             recent_audits = [
                 {
                     "id": row["id"],
@@ -195,6 +224,8 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
                 ORDER BY p.created_at DESC, p.rowid DESC LIMIT 50
                 """
             ):
+                if not proposal_is_current(connection, row["id"]):
+                    continue
                 try:
                     response = json.loads(row["response_json"] or "{}")
                 except json.JSONDecodeError:
@@ -208,6 +239,7 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
                             or response.get("interpretation")
                             or "Codex proposed an organization change."
                         )[:1200],
+                        "response": response,
                     }
                 )
         agent = self.agent.status()
@@ -224,11 +256,14 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
             "failedAgentRequests": failed,
             "resourceNoteCounts": counts,
             "actionLists": action_lists,
+            "spaceSummaries": directories["spaces"],
+            "projectSummaries": directories["projects"],
             "recentAudits": recent_audits,
             "pendingProposals": pending_proposals,
             "voice": {
                 "recording": True,
-                "automaticTranscription": False,
+                "automaticTranscription": True,
+                "engine": "local_whisper",
                 "editableTranscript": True,
             },
         }
@@ -258,6 +293,88 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
                 self.enqueue_agent_request(request["id"])
         self._schedule_agent_idle_stop()
         return {**status, "ownership": "workspace"}
+
+    def _audio_transcription_worker(self) -> None:
+        while not self._stop_event.is_set():
+            note_id = self._transcription_queue.get()
+            if note_id is None:
+                return
+            try:
+                self._process_audio_transcription(note_id)
+            finally:
+                with self._transcription_lock:
+                    self._transcription_ids.discard(note_id)
+
+    def _process_audio_transcription(self, note_id: str) -> None:
+        try:
+            with self.database() as connection:
+                note = mark_audio_transcription_running(connection, note_id)
+                if note.get("processing", {}).get("transcription", {}).get("state") == "succeeded":
+                    return
+                source = audio_note_source(connection, self.state_dir, note_id)
+            result = self._run_local_transcriber(source["path"])
+            with self.database() as connection:
+                complete_audio_transcription(
+                    connection,
+                    note_id,
+                    result["text"],
+                    result["model"],
+                )
+        except Exception as error:
+            if self._stop_event.is_set():
+                return
+            with self.database() as connection:
+                try:
+                    fail_audio_transcription(connection, note_id, _safe_error_code(error))
+                except ValueError:
+                    pass
+
+    def _run_local_transcriber(self, audio_path: Path) -> dict[str, str]:
+        script = self.workspace_root / "scripts" / "tab_atlas_transcribe.py"
+        if not script.is_file():
+            raise RuntimeError("local_transcriber_missing")
+        environment = os.environ.copy()
+        environment.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        environment.setdefault("TOKENIZERS_PARALLELISM", "false")
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        process = subprocess.Popen(
+            [sys.executable, str(script), str(audio_path)],
+            cwd=str(self.workspace_root),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            creationflags=creation_flags,
+        )
+        deadline = time.monotonic() + TRANSCRIPTION_TIMEOUT_SECONDS
+        while process.poll() is None:
+            if self._stop_event.wait(0.25):
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                raise RuntimeError("workspace_stopped")
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.wait(timeout=5)
+                raise RuntimeError("local_transcription_timeout")
+        stdout, _stderr = process.communicate()
+        try:
+            payload = json.loads(stdout or "{}")
+        except json.JSONDecodeError as error:
+            raise RuntimeError("local_transcriber_invalid_output") from error
+        if process.returncode or not isinstance(payload, dict) or not payload.get("text"):
+            code = str(payload.get("error") or "local_transcription_failed")
+            raise RuntimeError(code)
+        return {
+            "text": str(payload["text"]),
+            "model": str(payload.get("model") or "local_whisper"),
+        }
 
     def _agent_worker(self) -> None:
         while not self._stop_event.is_set():
@@ -341,22 +458,13 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
         try:
             response = self.agent.turn(prompt)
             with self.database() as connection:
-                result = complete_agent_request(
+                complete_agent_request(
                     connection,
                     request_id,
                     response,
                     self.agent.thread_id,
                     self.agent.model,
                 )
-                proposal_id = result.get("proposalId") or ""
-                if proposal_id and request["kind"] == "interpret_note":
-                    if proposal_can_auto_apply(connection, proposal_id):
-                        apply_semantic_proposal(
-                            connection,
-                            proposal_id,
-                            "delegated_user_note",
-                            f"auto:{request_id}",
-                        )
             self.regenerate_report()
         except (AgentUnavailable, AgentBusy) as error:
             self.agent.stop()
@@ -457,7 +565,6 @@ class TabAtlasWorkspaceHandler(SimpleHTTPRequestHandler):
                         self._idempotency_key(),
                         supersedes_note_id=document.get("supersedesNoteId") or None,
                     )
-                self.workspace_server.enqueue_agent_request(result["agentRequestId"])
                 self._send_json(result, HTTPStatus.CREATED)
                 return
             match = re.fullmatch(rf"/api/v1/resources/({RESOURCE_ID_PATTERN})/voice-notes", path)
@@ -475,6 +582,7 @@ class TabAtlasWorkspaceHandler(SimpleHTTPRequestHandler):
                         duration,
                         self._idempotency_key(),
                     )
+                self.workspace_server.enqueue_audio_transcription(result["id"])
                 self._send_json(result, HTTPStatus.CREATED)
                 return
             match = re.fullmatch(rf"/api/v1/notes/({OPAQUE_ID_PATTERN})/transcript", path)
@@ -487,8 +595,19 @@ class TabAtlasWorkspaceHandler(SimpleHTTPRequestHandler):
                         document.get("text"),
                         self._idempotency_key(),
                     )
-                self.workspace_server.enqueue_agent_request(result["agentRequestId"])
                 self._send_json(result)
+                return
+            match = re.fullmatch(rf"/api/v1/notes/({OPAQUE_ID_PATTERN})/analyze", path)
+            if match:
+                self._read_empty_body()
+                with self.workspace_server.database() as connection:
+                    result = create_note_analysis_request(
+                        connection,
+                        match.group(1),
+                        self._idempotency_key(),
+                    )
+                self.workspace_server.enqueue_agent_request(result["id"])
+                self._send_json(result, HTTPStatus.ACCEPTED)
                 return
             match = re.fullmatch(rf"/api/v1/notes/({OPAQUE_ID_PATTERN})/retract", path)
             if match:
@@ -853,6 +972,49 @@ def _workspace_agent_context(
         }
         for item in action_list_summaries(connection)
     ]
+    selected_notes = []
+    selected_proposals = []
+    if selected_resource_id:
+        for note in resource_notes(connection, selected_resource_id)[:6]:
+            transcript = note.get("processing", {}).get("transcription", {})
+            interpretation = note.get("processing", {}).get("interpretation", {})
+            selected_notes.append(
+                {
+                    "noteId": note["id"],
+                    "kind": note["kind"],
+                    "text": (
+                        note["text"]
+                        if note["kind"] == "text"
+                        else str(transcript.get("outputText") or "")
+                    )[:3000],
+                    "interpretation": str(interpretation.get("outputText") or "")[:2000],
+                }
+            )
+        for row in connection.execute(
+            """
+            SELECT p.id, p.operations_json
+            FROM semantic_proposals p
+            LEFT JOIN semantic_decisions d ON d.proposal_id=p.id
+            WHERE p.resource_id=? AND d.id IS NULL
+            ORDER BY p.created_at DESC, p.rowid DESC LIMIT 5
+            """,
+            (selected_resource_id,),
+        ):
+            if not proposal_is_current(connection, row["id"]):
+                continue
+            try:
+                operations = json.loads(row["operations_json"] or "{}")
+            except json.JSONDecodeError:
+                operations = {}
+            selected_proposals.append(
+                {
+                    "proposalId": row["id"],
+                    "message": str(operations.get("message") or "")[:1200],
+                    "interpretation": str(operations.get("interpretation") or "")[:2000],
+                    "memberships": (operations.get("memberships") or [])[:12],
+                    "actionItem": operations.get("actionItem"),
+                }
+            )
     return {
         "inventory": inventory(connection),
         "selectedResource": _bounded_resource_context(selected) if selected else None,
@@ -863,6 +1025,8 @@ def _workspace_agent_context(
         "resourceIndexMatched": len(index),
         "libraryResourceCount": len(resources),
         "resourceIndexTruncated": len(resources) > len(index),
+        "selectedUserNotes": selected_notes,
+        "selectedPendingProposals": selected_proposals,
     }
 
 

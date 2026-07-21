@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -18,16 +19,25 @@ from tab_atlas_core import connect, generate_report, utc_now  # noqa: E402
 from tab_atlas_workspace import (  # noqa: E402
     ConflictError,
     add_audio_transcript,
+    agent_request_detail,
     apply_semantic_proposal,
+    complete_audio_transcription,
     complete_agent_request,
     create_audio_note,
+    create_note_analysis_request,
     create_text_note,
+    create_workspace_chat_request,
+    fail_audio_transcription,
+    mark_audio_transcription_running,
     mark_agent_request_running,
     note_detail,
-    proposal_can_auto_apply,
+    proposal_is_current,
+    queued_audio_transcriptions,
+    reject_semantic_proposal,
     set_note_active,
     undo_semantic_audit,
     update_action_progress,
+    workspace_directory_summaries,
 )
 import tab_atlas_workspace_server as workspace_server_module  # noqa: E402
 from tab_atlas_workspace_server import (  # noqa: E402
@@ -168,15 +178,21 @@ class WorkspaceDataTests(unittest.TestCase):
         )
         self.assertTrue((self.state / "notes" / "audio" / f"{note['id']}.wav").is_file())
         self.assertEqual(note["processing"]["transcription"]["state"], "queued")
-        transcript = add_audio_transcript(
+        add_audio_transcript(
             self.connection,
             note["id"],
             "Learn the math behind language models.",
             "transcript-idempotency-01",
         )
-        self.assertTrue(transcript["agentRequestId"])
         detail = note_detail(self.connection, note["id"])
         self.assertEqual(detail["processing"]["transcription"]["state"], "succeeded")
+        self.assertIsNone(detail["analysis"])
+        request = create_note_analysis_request(
+            self.connection,
+            note["id"],
+            "analysis-idempotency-voice-01",
+        )
+        self.assertEqual(request["status"], "queued")
         with self.assertRaises(ConflictError):
             add_audio_transcript(
                 self.connection,
@@ -203,6 +219,11 @@ class WorkspaceDataTests(unittest.TestCase):
             "This is private durable evidence.",
             "note-idempotency-retract-01",
         )
+        request = create_note_analysis_request(
+            self.connection,
+            note["id"],
+            "analysis-idempotency-retract-01",
+        )
         retracted = set_note_active(
             self.connection,
             note["id"],
@@ -213,7 +234,7 @@ class WorkspaceDataTests(unittest.TestCase):
         self.assertEqual(note_detail(self.connection, note["id"])["text"], note["text"])
         request = self.connection.execute(
             "SELECT status, error_code FROM agent_requests WHERE id=?",
-            (note["agentRequestId"],),
+            (request["id"],),
         ).fetchone()
         self.assertEqual(tuple(request), ("failed", "note_retracted"))
 
@@ -224,7 +245,11 @@ class WorkspaceDataTests(unittest.TestCase):
             "Must watch this to learn LLM mathematics.",
             "note-idempotency-0002",
         )
-        request_id = note["agentRequestId"]
+        request_id = create_note_analysis_request(
+            self.connection,
+            note["id"],
+            "analysis-idempotency-0002",
+        )["id"]
         mark_agent_request_running(self.connection, request_id)
         completed = complete_agent_request(
             self.connection,
@@ -238,11 +263,15 @@ class WorkspaceDataTests(unittest.TestCase):
             self.connection.execute("SELECT COUNT(*) FROM resource_collections").fetchone()[0],
             0,
         )
-        self.assertTrue(proposal_can_auto_apply(self.connection, proposal_id))
+        self.assertTrue(proposal_is_current(self.connection, proposal_id))
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM semantic_decisions").fetchone()[0],
+            0,
+        )
         decision = apply_semantic_proposal(
             self.connection,
             proposal_id,
-            "delegated_user_note",
+            "workspace_user",
             "decision-idempotency-01",
         )
         names = {
@@ -257,6 +286,10 @@ class WorkspaceDataTests(unittest.TestCase):
             )
         }
         self.assertEqual(names, {"Understand AI Models", "Models & Evaluation", "Must Watch"})
+        self.assertFalse(note_detail(self.connection, note["id"])["analysis"]["inputCurrent"])
+        directories = workspace_directory_summaries(self.connection)
+        self.assertEqual(directories["spaces"][0]["name"], "Understand AI Models")
+        self.assertEqual(directories["spaces"][0]["resourceIds"], [RESOURCE_ID])
         progress = self.connection.execute(
             "SELECT state, total_units FROM resource_collection_progress"
         ).fetchone()
@@ -275,10 +308,15 @@ class WorkspaceDataTests(unittest.TestCase):
             "Must watch this to learn LLM mathematics.",
             "note-idempotency-progress-01",
         )
-        mark_agent_request_running(self.connection, note["agentRequestId"])
+        request_id = create_note_analysis_request(
+            self.connection,
+            note["id"],
+            "analysis-idempotency-progress-01",
+        )["id"]
+        mark_agent_request_running(self.connection, request_id)
         completed = complete_agent_request(
             self.connection,
-            note["agentRequestId"],
+            request_id,
             agent_response(),
             "00000000-0000-0000-0000-000000000003",
             "gpt-test",
@@ -286,7 +324,7 @@ class WorkspaceDataTests(unittest.TestCase):
         apply_semantic_proposal(
             self.connection,
             completed["proposalId"],
-            "delegated_user_note",
+            "workspace_user",
             "decision-idempotency-progress-01",
         )
         item = self.connection.execute(
@@ -327,7 +365,7 @@ class WorkspaceDataTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(restored), ("queued", 2, 0, 120, 0))
 
-    def test_low_confidence_note_proposal_requires_review(self) -> None:
+    def test_low_confidence_note_proposal_remains_current_and_inert(self) -> None:
         note = create_text_note(
             self.connection,
             RESOURCE_ID,
@@ -336,15 +374,35 @@ class WorkspaceDataTests(unittest.TestCase):
         )
         response = agent_response()
         response["confidence"] = 0.6
-        mark_agent_request_running(self.connection, note["agentRequestId"])
+        request_id = create_note_analysis_request(
+            self.connection,
+            note["id"],
+            "analysis-idempotency-confidence-01",
+        )["id"]
+        mark_agent_request_running(self.connection, request_id)
         completed = complete_agent_request(
             self.connection,
-            note["agentRequestId"],
+            request_id,
             response,
             "00000000-0000-0000-0000-000000000004",
             "gpt-test",
         )
-        self.assertFalse(proposal_can_auto_apply(self.connection, completed["proposalId"]))
+        self.assertTrue(proposal_is_current(self.connection, completed["proposalId"]))
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM semantic_decisions").fetchone()[0],
+            0,
+        )
+        rejected = reject_semantic_proposal(
+            self.connection,
+            completed["proposalId"],
+            "workspace_user",
+            "decision-idempotency-reject-01",
+        )
+        self.assertEqual(rejected["decision"], "rejected")
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM resource_collections").fetchone()[0],
+            0,
+        )
 
     def test_workspace_context_retrieves_a_bounded_relevant_subset(self) -> None:
         now = utc_now()
@@ -375,10 +433,15 @@ class WorkspaceDataTests(unittest.TestCase):
             "Maybe watch this.",
             "note-idempotency-0003",
         )
-        mark_agent_request_running(self.connection, note["agentRequestId"])
+        request_id = create_note_analysis_request(
+            self.connection,
+            note["id"],
+            "analysis-idempotency-0003",
+        )["id"]
+        mark_agent_request_running(self.connection, request_id)
         completed = complete_agent_request(
             self.connection,
-            note["agentRequestId"],
+            request_id,
             agent_response(),
             "00000000-0000-0000-0000-000000000002",
             "gpt-test",
@@ -389,6 +452,7 @@ class WorkspaceDataTests(unittest.TestCase):
             "This is not relevant to my work.",
             "note-idempotency-0004",
         )
+        self.assertFalse(agent_request_detail(self.connection, request_id)["proposalCurrent"])
         with self.assertRaises(ConflictError):
             apply_semantic_proposal(
                 self.connection,
@@ -396,6 +460,129 @@ class WorkspaceDataTests(unittest.TestCase):
                 "workspace_user",
                 "decision-idempotency-02",
             )
+
+    def test_local_transcription_queue_completes_without_starting_codex(self) -> None:
+        wav = b"RIFF" + (36).to_bytes(4, "little") + b"WAVE" + b"fmt " + b"\x00" * 24
+        note = create_audio_note(
+            self.connection,
+            self.state,
+            RESOURCE_ID,
+            wav,
+            "audio/wav",
+            1500,
+            "audio-idempotency-queue-01",
+        )
+        self.assertEqual([item["id"] for item in queued_audio_transcriptions(self.connection)], [note["id"]])
+        running = mark_audio_transcription_running(self.connection, note["id"])
+        self.assertEqual(running["processing"]["transcription"]["state"], "running")
+        completed = complete_audio_transcription(
+            self.connection,
+            note["id"],
+            "Reorganize this as an animation production reference.",
+            "openai/whisper-base",
+        )
+        self.assertEqual(completed["processing"]["transcription"]["state"], "succeeded")
+        self.assertEqual(completed["processing"]["interpretation"]["state"], "not_required")
+        self.assertEqual(queued_audio_transcriptions(self.connection), [])
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM agent_requests").fetchone()[0],
+            0,
+        )
+
+        second = create_audio_note(
+            self.connection,
+            self.state,
+            RESOURCE_ID,
+            wav + b"\x00",
+            "audio/wav",
+            1500,
+            "audio-idempotency-queue-02",
+        )
+        failed = fail_audio_transcription(
+            self.connection,
+            second["id"],
+            "local_whisper_dependencies_missing",
+        )
+        self.assertEqual(failed["processing"]["transcription"]["state"], "failed")
+
+    def test_transcript_correction_invalidates_pending_proposal(self) -> None:
+        wav = b"RIFF" + (36).to_bytes(4, "little") + b"WAVE" + b"fmt " + b"\x00" * 24
+        note = create_audio_note(
+            self.connection,
+            self.state,
+            RESOURCE_ID,
+            wav,
+            "audio/wav",
+            1500,
+            "audio-idempotency-stale-01",
+        )
+        add_audio_transcript(
+            self.connection,
+            note["id"],
+            "Put this in my AI model learning queue.",
+            "transcript-idempotency-stale-01",
+        )
+        request_id = create_note_analysis_request(
+            self.connection,
+            note["id"],
+            "analysis-idempotency-stale-01",
+        )["id"]
+        mark_agent_request_running(self.connection, request_id)
+        completed = complete_agent_request(
+            self.connection,
+            request_id,
+            agent_response(),
+            "00000000-0000-0000-0000-000000000005",
+            "gpt-test",
+        )
+        self.assertTrue(proposal_is_current(self.connection, completed["proposalId"]))
+        add_audio_transcript(
+            self.connection,
+            note["id"],
+            "This is actually a visual animation reference, not an AI course.",
+            "transcript-idempotency-stale-02",
+        )
+        self.assertFalse(proposal_is_current(self.connection, completed["proposalId"]))
+        with self.assertRaisesRegex(ConflictError, "transcript changed"):
+            apply_semantic_proposal(
+                self.connection,
+                completed["proposalId"],
+                "workspace_user",
+                "decision-idempotency-stale-01",
+            )
+
+    def test_discussed_proposal_is_bound_to_latest_authoritative_note(self) -> None:
+        note = create_text_note(
+            self.connection,
+            RESOURCE_ID,
+            "Treat this as an animation-production learning reference.",
+            "note-idempotency-discussion-01",
+        )
+        request = create_workspace_chat_request(
+            self.connection,
+            "Refine the pending suggestion.",
+            RESOURCE_ID,
+        )
+        mark_agent_request_running(self.connection, request["id"])
+        completed = complete_agent_request(
+            self.connection,
+            request["id"],
+            agent_response(),
+            "00000000-0000-0000-0000-000000000006",
+            "gpt-test",
+        )
+        proposal = self.connection.execute(
+            "SELECT note_id FROM semantic_proposals WHERE id=?",
+            (completed["proposalId"],),
+        ).fetchone()
+        self.assertEqual(proposal["note_id"], note["id"])
+        create_text_note(
+            self.connection,
+            RESOURCE_ID,
+            "This is no longer relevant.",
+            "note-idempotency-discussion-02",
+        )
+        self.assertFalse(proposal_is_current(self.connection, completed["proposalId"]))
 
     def test_schema_upgrade_creates_integrity_checked_backup(self) -> None:
         self.connection.execute(
@@ -416,6 +603,56 @@ class WorkspaceDataTests(unittest.TestCase):
 
 
 class WorkspaceServerTests(unittest.TestCase):
+    def test_server_transcription_worker_persists_local_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            database = state / "atlas.sqlite"
+            report = root / "report"
+            connection = connect(database)
+            seed_resource(connection)
+            generate_report(connection, report, ROOT / "assets" / "report", state)
+            connection.close()
+            server, _url = create_workspace_server(
+                ROOT,
+                state,
+                database,
+                report,
+                ROOT / "assets" / "report",
+                0,
+            )
+            server._run_local_transcriber = lambda _path: {
+                "text": "A locally transcribed animation production note.",
+                "model": "test-whisper",
+            }
+            try:
+                wav = b"RIFF" + (36).to_bytes(4, "little") + b"WAVE" + b"fmt " + b"\x00" * 24
+                with server.database() as connection:
+                    note = create_audio_note(
+                        connection,
+                        state,
+                        RESOURCE_ID,
+                        wav,
+                        "audio/wav",
+                        1500,
+                        "audio-worker-idempotency-01",
+                    )
+                server.enqueue_audio_transcription(note["id"])
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    with server.database() as connection:
+                        detail = note_detail(connection, note["id"])
+                    if detail["processing"]["transcription"]["state"] == "succeeded":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(
+                    detail["processing"]["transcription"]["outputText"],
+                    "A locally transcribed animation production note.",
+                )
+                self.assertIsNone(detail["analysis"])
+            finally:
+                server.server_close()
+
     def test_idle_agent_child_stops_without_a_heartbeat(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -531,6 +768,19 @@ class WorkspaceServerTests(unittest.TestCase):
                     "Idempotency-Key": "server-idempotency-retract-01",
                     "Content-Length": "0",
                 }
+                empty_headers["Idempotency-Key"] = "server-idempotency-analyze-01"
+                client.request(
+                    "POST",
+                    f"/api/v1/notes/{document['id']}/analyze",
+                    b"",
+                    empty_headers,
+                )
+                response = client.getresponse()
+                analysis = json.loads(response.read())
+                self.assertEqual(response.status, 202)
+                self.assertEqual(analysis["status"], "queued")
+
+                empty_headers["Idempotency-Key"] = "server-idempotency-retract-01"
                 client.request(
                     "POST",
                     f"/api/v1/notes/{document['id']}/retract",

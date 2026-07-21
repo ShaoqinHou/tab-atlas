@@ -1229,6 +1229,22 @@ a:focus-visible {
 .note-form-actions button,
 .transcript-form button,
 .agent-form-actions button { min-height: 36px; }
+.transcript-label {
+  color: #53636d;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+.note-review-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 11px;
+  border-top: 1px solid var(--line);
+}
+.note-review-controls button { flex: 0 0 auto; min-height: 36px; }
+.note-review-hint { color: var(--muted); font-size: 10px; line-height: 1.35; }
 .note-undo { margin-top: 11px; }
 
 .action-progress-editor { display: grid; gap: 10px; margin-top: 12px; }
@@ -1353,6 +1369,19 @@ a:focus-visible {
 .agent-message.status p { padding: 4px 0; color: var(--muted); background: transparent; font-size: 11px; }
 .agent-message-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .agent-message-actions button { min-height: 32px; }
+.agent-proposal {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+  border: 1px solid #cbd6d2;
+  border-radius: 5px;
+  padding: 9px 10px;
+  background: #f8faf9;
+}
+.agent-proposal-line { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 8px; }
+.agent-proposal-line strong { color: #315b4a; font-size: 10px; text-transform: uppercase; }
+.agent-proposal-line span { color: #344550; font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
+.proposal-decision { align-self: center; color: #315b4a; font-size: 10px; font-weight: 800; text-transform: uppercase; }
 .agent-back {
   width: 100%;
   min-height: 36px;
@@ -1492,6 +1521,8 @@ a:focus-visible {
   .agent-form-actions { align-items: stretch; flex-direction: column-reverse; }
   .note-form-actions button,
   .agent-form-actions button { width: 100%; min-height: 42px; }
+  .note-review-controls { align-items: stretch; flex-direction: column; }
+  .note-review-controls button { width: 100%; min-height: 42px; }
   .action-progress-fields { grid-template-columns: 1fr 1fr; }
   .action-progress-save { width: 100%; min-height: 42px; }
 }

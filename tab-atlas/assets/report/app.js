@@ -21,10 +21,10 @@ const resources = Array.isArray(data.resources) ? data.resources : [];
 const discoveries = Array.isArray(data.discoveries) ? data.discoveries : [];
 const allResources = [...discoveries, ...resources];
 const resourceById = new Map(allResources.map(resource => [resource.resourceId, resource]));
-const spaceSummaries = hasSpaceContract
+let spaceSummaries = hasSpaceContract
   ? (data.spaceSummaries || [])
   : (data.collectionSummaries || []);
-const projectSummaries = data.projectSummaries || [];
+let projectSummaries = data.projectSummaries || [];
 let actionListSummaries = data.actionListSummaries || [];
 const sourceSummaries = Array.isArray(data.sourceSummaries) ? data.sourceSummaries : [];
 const galleryLoaders = new WeakMap();
@@ -40,6 +40,7 @@ const workspace = {
   agent: {},
   noteCache: new Map(),
   noteLoads: new Map(),
+  notePolls: new Map(),
   requestPolls: new Map(),
   latestAuditByResource: new Map(),
   messages: [],
@@ -1376,16 +1377,16 @@ function resourceNoteSection(resource) {
     if (!text.trim()) return;
     save.disabled = true;
     try {
-      const result = await workspaceRequest(`/api/v1/resources/${resource.resourceId}/notes`, {
+      await workspaceRequest(`/api/v1/resources/${resource.resourceId}/notes`, {
         method: "POST",
         json: { text }
       });
+      supersedeResourceProposals(resource.resourceId);
       textarea.value = "";
       resource.noteCount = Number(resource.noteCount || 0) + 1;
       workspace.noteCache.delete(resource.resourceId);
       await loadResourceWorkspaceState(resource.resourceId, true);
-      pollAgentRequest(result.agentRequestId, resource.resourceId);
-      elements.actionStatus.textContent = "Note saved locally; Codex interpretation queued.";
+      elements.actionStatus.textContent = "Note saved locally. Ask Codex when you want an organization suggestion.";
     } catch (error) {
       showWorkspaceError(error, "The note could not be saved.");
     } finally {
@@ -1422,35 +1423,14 @@ function noteEntry(note) {
     entry.append(audio);
     const transcript = note.processing?.transcription;
     if (transcript?.state === "succeeded" && transcript.outputText) {
-      entry.append(detailText("Transcript", transcript.outputText));
+      entry.append(transcriptEditor(note, transcript.outputText, true));
     } else {
-      const transcriptForm = node("form", "transcript-form");
-      const input = document.createElement("textarea");
-      input.rows = 2;
-      input.maxLength = 32768;
-      input.placeholder = "Add or dictate the transcript";
-      input.setAttribute("aria-label", "Voice note transcript");
-      const submit = node("button", "secondary-command", "Use transcript");
-      submit.type = "submit";
-      transcriptForm.append(input, submit);
-      transcriptForm.addEventListener("submit", async event => {
-        event.preventDefault();
-        if (!input.value.trim()) return;
-        submit.disabled = true;
-        try {
-          const result = await workspaceRequest(`/api/v1/notes/${note.id}/transcript`, {
-            method: "POST",
-            json: { text: input.value }
-          });
-          await loadResourceWorkspaceState(note.resourceId, true);
-          pollAgentRequest(result.agentRequestId, note.resourceId);
-        } catch (error) {
-          showWorkspaceError(error, "The transcript could not be saved.");
-        } finally {
-          submit.disabled = false;
-        }
-      });
-      entry.append(transcriptForm);
+      if (transcript?.state === "queued" || transcript?.state === "running") {
+        entry.append(node("p", "note-processing", "Transcribing locally. The first voice note may take longer while the model is prepared."));
+      } else if (transcript?.state === "failed") {
+        entry.append(node("p", "note-processing is-error", "Automatic transcription was unavailable. The recording is safe; add a transcript below."));
+      }
+      entry.append(transcriptEditor(note, "", false));
     }
   }
   const interpretation = note.processing?.interpretation;
@@ -1463,7 +1443,94 @@ function noteEntry(note) {
   } else if (interpretation?.state === "failed") {
     entry.append(node("p", "note-processing is-error", "Interpretation pending a later Codex session"));
   }
+  entry.append(noteReviewControls(note));
   return entry;
+}
+
+function transcriptEditor(note, transcript, correcting) {
+  const form = node("form", "transcript-form");
+  const label = node("label", "transcript-label", correcting ? "Transcript" : "Transcript fallback");
+  const input = document.createElement("textarea");
+  input.rows = correcting ? 3 : 2;
+  input.maxLength = 32768;
+  input.value = transcript;
+  input.placeholder = "Type or correct what you said";
+  input.setAttribute("aria-label", correcting ? "Correct voice note transcript" : "Voice note transcript fallback");
+  const submit = node("button", "secondary-command", correcting ? "Save correction" : "Use typed transcript");
+  submit.type = "submit";
+  form.append(label, input, submit);
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (!input.value.trim() || (correcting && input.value === transcript)) return;
+    submit.disabled = true;
+    try {
+      await workspaceRequest(`/api/v1/notes/${note.id}/transcript`, {
+        method: "POST",
+        json: { text: input.value }
+      });
+      supersedeResourceProposals(note.resourceId);
+      await loadResourceWorkspaceState(note.resourceId, true);
+      elements.actionStatus.textContent = "Transcript saved. Ask Codex when you want a new organization suggestion.";
+    } catch (error) {
+      showWorkspaceError(error, "The transcript could not be saved.");
+    } finally {
+      submit.disabled = false;
+    }
+  });
+  return form;
+}
+
+function noteReviewControls(note) {
+  const controls = node("div", "note-review-controls");
+  const analysis = note.analysis || {};
+  const canAnalyze = note.kind === "text" || (
+    note.processing?.transcription?.state === "succeeded"
+    && note.processing?.transcription?.outputText
+  );
+  const activeRequest = analysis.inputCurrent && ["queued", "running"].includes(analysis.status);
+  const pendingProposal = analysis.inputCurrent && analysis.proposalId && !analysis.decision;
+  const review = node(
+    "button",
+    pendingProposal ? "primary-command" : "secondary-command",
+    !canAnalyze ? "Waiting for transcript" : (activeRequest ? "Codex reviewing" : (pendingProposal ? "Open suggestion" : "Ask Codex to reconsider"))
+  );
+  review.type = "button";
+  review.disabled = Boolean(activeRequest || !canAnalyze);
+  review.addEventListener("click", async () => {
+    if (pendingProposal) {
+      await refreshWorkspaceSession();
+      setAgentPanel(true);
+      return;
+    }
+    await analyzeNoteWithCodex(note, review);
+  });
+  controls.append(review);
+  if (canAnalyze && !activeRequest && !pendingProposal) {
+    controls.append(node("span", "note-review-hint", "Codex will suggest changes; nothing is applied automatically."));
+  }
+  return controls;
+}
+
+async function analyzeNoteWithCodex(note, button) {
+  button.disabled = true;
+  state.selectedResource = note.resourceId;
+  setAgentPanel(true);
+  workspace.messages.push({
+    role: "user",
+    text: "Review this note and suggest whether the resource should be reorganized."
+  });
+  workspace.messages.push({ role: "status", text: "Codex is reviewing the note." });
+  renderAgentPanel();
+  try {
+    const request = await workspaceRequest(`/api/v1/notes/${note.id}/analyze`, { method: "POST" });
+    await loadResourceWorkspaceState(note.resourceId, true);
+    pollAgentRequest(request.id, note.resourceId);
+  } catch (error) {
+    workspace.messages = workspace.messages.filter(message => !(message.role === "status" && message.text === "Codex is reviewing the note."));
+    showWorkspaceError(error, "The note could not be sent to Codex.");
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function resourceActionProgressSection(resource) {
@@ -1606,6 +1673,7 @@ async function retractNote(note) {
   if (!window.confirm("Remove this note from active use? Its local audit evidence will be retained.")) return;
   try {
     await workspaceRequest(`/api/v1/notes/${note.id}/retract`, { method: "POST" });
+    supersedeResourceProposals(note.resourceId);
     const resource = resourceById.get(note.resourceId);
     if (resource) resource.noteCount = Math.max(0, Number(resource.noteCount || 0) - 1);
     workspace.noteCache.delete(note.resourceId);
@@ -1615,6 +1683,16 @@ async function retractNote(note) {
   } catch (error) {
     showWorkspaceError(error, "The note could not be removed.");
   }
+}
+
+function supersedeResourceProposals(resourceId) {
+  let changed = false;
+  for (const message of workspace.messages) {
+    if (message.resourceId !== resourceId || !message.proposalId || message.decision) continue;
+    message.decision = "superseded";
+    changed = true;
+  }
+  if (changed) renderAgentPanel();
 }
 
 async function loadResourceWorkspaceState(resourceId, force = false) {
@@ -1630,7 +1708,14 @@ async function loadResourceWorkspaceState(resourceId, force = false) {
         resource.actionItems = result.actionItems || [];
         syncResourcePresentation(resource);
       }
-      workspace.noteCache.set(resourceId, result.notes || []);
+      const notes = result.notes || [];
+      workspace.noteCache.set(resourceId, notes);
+      for (const note of notes) {
+        const transcriptionState = note.processing?.transcription?.state;
+        if (note.kind === "audio" && ["queued", "running"].includes(transcriptionState)) {
+          watchNoteTranscription(note.id, resourceId);
+        }
+      }
       if (state.selectedResource === resourceId) renderDrawer();
       return result;
     })
@@ -1641,6 +1726,30 @@ async function loadResourceWorkspaceState(resourceId, force = false) {
     .finally(() => workspace.noteLoads.delete(resourceId));
   workspace.noteLoads.set(resourceId, request);
   return request;
+}
+
+function watchNoteTranscription(noteId, resourceId) {
+  if (!noteId || workspace.notePolls.has(noteId)) return;
+  const poll = async () => {
+    try {
+      const result = await loadResourceWorkspaceState(resourceId, true);
+      const note = (result?.notes || []).find(item => item.id === noteId);
+      const stateValue = note?.processing?.transcription?.state;
+      if (["queued", "running"].includes(stateValue)) {
+        const timer = window.setTimeout(poll, 1400);
+        workspace.notePolls.set(noteId, timer);
+        return;
+      }
+      workspace.notePolls.delete(noteId);
+      if (stateValue === "succeeded") {
+        elements.actionStatus.textContent = "Voice transcript is ready for review.";
+      }
+    } catch (_error) {
+      workspace.notePolls.delete(noteId);
+    }
+  };
+  const timer = window.setTimeout(poll, 800);
+  workspace.notePolls.set(noteId, timer);
 }
 
 function syncResourcePresentation(resource) {
@@ -1687,7 +1796,7 @@ async function toggleVoiceRecording(resourceId) {
       for (const track of stream.getTracks()) track.stop();
       const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
       try {
-        await workspaceRequest(`/api/v1/resources/${resourceId}/voice-notes`, {
+        const note = await workspaceRequest(`/api/v1/resources/${resourceId}/voice-notes`, {
           method: "POST",
           body: blob,
           contentType: blob.type || "audio/webm",
@@ -1696,7 +1805,8 @@ async function toggleVoiceRecording(resourceId) {
         const resource = resourceById.get(resourceId);
         if (resource) resource.noteCount = Number(resource.noteCount || 0) + 1;
         await loadResourceWorkspaceState(resourceId, true);
-        elements.actionStatus.textContent = "Voice note saved locally.";
+        watchNoteTranscription(note.id, resourceId);
+        elements.actionStatus.textContent = "Voice note saved. Local transcription started.";
       } catch (error) {
         showWorkspaceError(error, "The voice note could not be saved.");
       }
@@ -2428,6 +2538,8 @@ async function initializeWorkspace() {
 
 function mergeWorkspaceSession(session) {
   workspace.agent = session.agent || {};
+  spaceSummaries = Array.isArray(session.spaceSummaries) ? session.spaceSummaries : spaceSummaries;
+  projectSummaries = Array.isArray(session.projectSummaries) ? session.projectSummaries : projectSummaries;
   actionListSummaries = Array.isArray(session.actionLists) ? session.actionLists : actionListSummaries;
   for (const [resourceId, count] of Object.entries(session.resourceNoteCounts || {})) {
     const resource = resourceById.get(resourceId);
@@ -2447,6 +2559,7 @@ function mergeWorkspaceSession(session) {
     workspace.messages.push({
       role: "assistant",
       text: proposal.message,
+      proposal: proposal.response || null,
       proposalId: proposal.id,
       decision: "",
       resourceId: proposal.resourceId
@@ -2527,15 +2640,24 @@ function renderAgentPanel() {
   for (const message of workspace.messages) {
     const item = node("div", `agent-message ${message.role}`);
     item.append(node("p", "", message.text));
+    if (message.proposalId && message.proposal) item.append(agentProposalSummary(message.proposal));
     const actions = node("div", "agent-message-actions");
     if (message.proposalId && !message.decision) {
-      const apply = node("button", "secondary-command", "Apply");
+      const apply = node("button", "primary-command", "Accept changes");
       apply.type = "button";
       apply.addEventListener("click", () => decideAgentProposal(message, true, apply));
       const dismiss = node("button", "text-command", "Dismiss");
       dismiss.type = "button";
       dismiss.addEventListener("click", () => decideAgentProposal(message, false, dismiss));
-      actions.append(apply, dismiss);
+      const discuss = node("button", "secondary-command", "Discuss");
+      discuss.type = "button";
+      discuss.addEventListener("click", () => discussAgentProposal(message));
+      actions.append(apply, discuss, dismiss);
+    } else if (message.decision) {
+      const label = message.decision === "accepted"
+        ? "Accepted"
+        : (message.decision === "rejected" ? "Dismissed" : "Superseded");
+      actions.append(node("span", "proposal-decision", label));
     }
     if (message.auditId) {
       const undo = node("button", "text-command", "Undo");
@@ -2553,6 +2675,41 @@ function renderAgentPanel() {
     elements.agentMessages.append(back);
   }
   elements.agentMessages.scrollTop = elements.agentMessages.scrollHeight;
+}
+
+function agentProposalSummary(proposal) {
+  const summary = node("div", "agent-proposal");
+  const memberships = Array.isArray(proposal.memberships) ? proposal.memberships : [];
+  const primary = ["space", "topic", "focus"]
+    .map(kind => memberships.find(item => item.kind === kind)?.name)
+    .filter(Boolean);
+  if (primary.length) summary.append(proposalLine("Purpose", primary.join(" / ")));
+  const projects = memberships.filter(item => item.kind === "project").map(item => item.name);
+  if (projects.length) summary.append(proposalLine("Projects", projects.join(", ")));
+  const actionLists = memberships.filter(item => item.kind === "action_list").map(item => item.name);
+  if (actionLists.length) summary.append(proposalLine("Action Lists", actionLists.join(", ")));
+  if (proposal.actionItem?.listName) {
+    const effort = proposal.actionItem.estimatedMinutes ? `, ${formatNumber(proposal.actionItem.estimatedMinutes)} min` : "";
+    summary.append(proposalLine("Next", `${proposal.actionItem.listName}, priority ${proposal.actionItem.priority || 3}${effort}`));
+  }
+  if (!summary.childElementCount) summary.append(proposalLine("Suggestion", "No organization change"));
+  return summary;
+}
+
+function proposalLine(label, value) {
+  const line = node("div", "agent-proposal-line");
+  line.append(node("strong", "", label), node("span", "", value));
+  return line;
+}
+
+function discussAgentProposal(message) {
+  if (message.resourceId && resourceById.has(message.resourceId)) state.selectedResource = message.resourceId;
+  elements.agentInput.value = "Refine this pending suggestion. Explain the tradeoffs and propose a better organization if needed.";
+  renderAgentPanel();
+  requestAnimationFrame(() => {
+    elements.agentInput.focus({ preventScroll: true });
+    elements.agentInput.setSelectionRange(elements.agentInput.value.length, elements.agentInput.value.length);
+  });
 }
 
 async function submitAgentRequest(event) {
@@ -2596,7 +2753,8 @@ function pollAgentRequest(requestId, resourceId = "") {
         }
       }
       if (request.status === "failed") {
-        workspace.messages.push({ role: "assistant", text: "The note remains saved, but Codex could not interpret it in this session." });
+        workspace.messages = workspace.messages.filter(message => message.role !== "status");
+        workspace.messages.push({ role: "assistant", text: "The note remains saved, but Codex could not complete this review in the current session." });
         workspace.requestPolls.delete(requestId);
         renderAgentPanel();
         return;
@@ -2607,13 +2765,14 @@ function pollAgentRequest(requestId, resourceId = "") {
         return;
       }
       workspace.requestPolls.delete(requestId);
-      workspace.messages = workspace.messages.filter(message => !(message.role === "status" && message.text === "Codex is considering the current scope."));
+      workspace.messages = workspace.messages.filter(message => message.role !== "status");
       const response = request.response || {};
       workspace.messages.push({
         role: "assistant",
         text: response.message || response.interpretation || "Codex completed the request.",
+        proposal: response,
         proposalId: request.proposalId,
-        decision: request.decision,
+        decision: request.decision || (request.proposalId && !request.proposalCurrent ? "superseded" : ""),
         auditId: request.auditId,
         resourceId: request.resourceId || resourceId
       });
@@ -2636,11 +2795,18 @@ async function decideAgentProposal(message, accept, button) {
   try {
     const action = accept ? "accept" : "reject";
     const result = await workspaceRequest(`/api/v1/proposals/${message.proposalId}/${action}`, { method: "POST" });
-    message.decision = result.decision;
-    message.auditId = result.auditId;
+    for (const candidate of workspace.messages) {
+      if (candidate.proposalId === message.proposalId) {
+        candidate.decision = result.decision;
+        candidate.auditId = result.auditId;
+      } else if (accept && result.resourceId && candidate.resourceId === result.resourceId && !candidate.decision) {
+        candidate.decision = "superseded";
+      }
+    }
     if (result.auditId && result.resourceId) workspace.latestAuditByResource.set(result.resourceId, result.auditId);
     if (result.resourceId) await loadResourceWorkspaceState(result.resourceId, true);
     await refreshWorkspaceSession();
+    elements.actionStatus.textContent = accept ? "Codex suggestion accepted and saved." : "Codex suggestion dismissed. No organization changed.";
     render();
   } catch (error) {
     showWorkspaceError(error, "The proposal decision could not be saved.");

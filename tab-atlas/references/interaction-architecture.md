@@ -51,10 +51,11 @@ write SQLite or control the DOM. It returns:
 - an optional Action List item;
 - an optional declarative view command.
 
-The local workspace validates proposals. A proposal remains inert until accepted
-or covered by explicit delegated authority. Applying one increments the resource
-semantic revision, records before and after state, and exposes Undo. Browser tab
-closure remains under the stronger capture-bound mutation protocol.
+The local workspace validates proposals. A proposal always remains inert until
+the user accepts it in the workspace. Applying one increments the resource
+semantic revision, records before and after state, and exposes Undo. A changed
+note or corrected transcript makes an older proposal stale. Browser tab closure
+remains under the stronger capture-bound mutation protocol.
 
 One process owns the dedicated task at a time. The workspace holds an ownership
 lock across every app-server turn. An explicit handoff can proceed only while the
@@ -84,17 +85,23 @@ Codex to simulate rapid clicks.
 ## Voice Boundary
 
 A recording is captured and saved locally before any processing. Playback and
-deletion do not require Codex. Transcription is a separate, visible state. The
-stable text-turn protocol receives only an editable transcript. Direct audio
-transcription through Codex realtime is experimental and must remain an optional
-adapter; failure cannot block typed notes or the rest of the workspace.
+deletion do not require Codex. A resumable, short-lived local Whisper worker
+decodes and transcribes one recording at a time, then exits so the model does not
+remain in memory. The first run may download the configured model; voice bytes
+are never sent to Codex or a speech API. Transcription is a separate, visible
+state and its result is editable. A failed local transcript leaves the recording
+intact and enables a typed fallback.
+
+Codex receives only the transcript after the user presses the note's explicit
+review button. It returns an inert suggestion. The user can accept it, dismiss it,
+or discuss and refine it in the resource-scoped Codex panel.
 
 ## Delivery Order
 
-1. Text note -> stored note -> Codex interpretation -> applied organization ->
-   visible result -> Undo -> restart persistence.
-2. Local voice recording -> playback -> editable transcript -> the same
-   interpretation pipeline.
+1. Text note -> stored note -> explicit Codex review -> inert proposal -> user
+   decision -> visible result -> Undo -> restart persistence.
+2. Local voice recording -> automatic local transcript -> correction -> the same
+   explicit review pipeline.
 3. Scoped agent panel -> declarative navigation and result sets.
 4. Refresh-time bounded reconsideration of related resources without whole-
    library taxonomy churn.

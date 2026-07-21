@@ -23,25 +23,32 @@ The workspace has three destinations:
 - **Library** for Purpose and Source views of every retained resource;
 - **Review** for discoveries, unplaced resources, duplicates, and captured tabs.
 
-Open a resource to add an exact local text note, record a local voice note, edit
-its transcript, update Action List progress, open the source, or remove the item
-from the visible library. Notes take precedence over page metadata when Codex
-proposes organization.
+Open a resource to add an exact local text note, record a local voice note,
+review or correct its automatic transcript, update Action List progress, open
+the source, or remove the item from the visible library. Notes take precedence
+over page metadata when Codex proposes organization.
 
 ## Codex Integration
 
 The **Ask Codex** panel starts a dedicated persistent Codex task only when a
 request needs interpretation. It uses the existing ChatGPT sign-in from the local
 Codex CLI; TabAtlas does not ask for or store an API key. Model output is a
-schema-constrained proposal. Local code validates and applies it, records before
-and after state, and exposes Undo. The child process stops after two idle minutes;
-the opaque task ID remains available for the next request.
+schema-constrained proposal. Saving a note does not start Codex. Use **Ask Codex
+to reconsider** on that note when you want a suggestion. The proposal shows its
+purpose path, Projects, and Action Lists with **Accept changes**, **Discuss**, and
+**Dismiss** controls. Nothing changes until Accept is pressed. Accepted changes
+record before and after state and expose Undo. The child process stops after two
+idle minutes; the opaque task ID remains available for the next request.
 
 The workspace is the only writer while its Codex child is active. **Open in
 Codex** stops that child before opening the same dedicated task in Codex desktop;
-**Reclaim here** resumes workspace ownership. Voice bytes remain local. The
-stable integration uses an editable text transcript rather than experimental
-realtime audio.
+**Reclaim here** resumes workspace ownership. Voice bytes remain local. A
+short-lived local Whisper worker produces the editable transcript; audio is not
+sent to Codex or a speech API. The default `openai/whisper-base` model is cached
+on first use, and the worker exits after each transcription. `ffmpeg`, Torch, and
+Transformers are required; compatible Python packages are listed in
+`requirements-voice.txt`. Set `TABATLAS_WHISPER_MODEL` to select another local
+Whisper checkpoint.
 
 If Codex is unavailable, notes remain saved and interpretation requests remain
 queued for a later workspace session. The static `report/index.html` remains a

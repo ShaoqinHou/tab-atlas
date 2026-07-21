@@ -105,21 +105,12 @@ def create_text_note(
             note_id,
             run_id,
             "interpretation",
-            "queued",
+            "not_required",
             input_hash,
-            engine="codex_app_server",
+            engine="awaiting_user_request",
             prompt_version=PROMPT_VERSION,
         )
-        request_id = _insert_agent_request(
-            connection,
-            "interpret_note",
-            resource_id=resource_id,
-            note_id=note_id,
-            request_text=None,
-        )
-    result = note_detail(connection, note_id)
-    result["agentRequestId"] = request_id
-    return result
+    return note_detail(connection, note_id)
 
 
 def create_audio_note(
@@ -200,7 +191,7 @@ def create_audio_note(
                 "transcription",
                 "queued",
                 digest,
-                engine="awaiting_transcript",
+                engine="local_whisper",
             )
     except Exception:
         target.unlink(missing_ok=True)
@@ -223,22 +214,21 @@ def add_audio_transcript(
     exact_text = _validate_note_text(transcript)
     request_key = _validate_idempotency_key(idempotency_key)
     input_hash = _sha256_text(exact_text)
-    request_marker = f"transcript:{request_key}:{input_hash}"
+    run_id = f"transcript:{request_key}"
     existing = connection.execute(
         """
-        SELECT id, request_text FROM agent_requests
-        WHERE note_id=? AND (request_text=? OR request_text LIKE ?)
+        SELECT input_hash, output_text FROM note_processing_events
+        WHERE note_id=? AND run_id=? AND stage='transcription'
+        ORDER BY sequence DESC, rowid DESC LIMIT 1
         """,
-        (note_id, f"transcript:{request_key}", f"transcript:{request_key}:%"),
+        (note_id, run_id),
     ).fetchone()
     if existing:
-        if existing["request_text"] not in {f"transcript:{request_key}", request_marker}:
+        if existing["input_hash"] != input_hash or existing["output_text"] != exact_text:
             raise ConflictError("Idempotency key was already used for another transcript")
-        result = note_detail(connection, note_id)
-        result["agentRequestId"] = existing["id"]
-        return result
-    run_id = _new_id("run")
+        return note_detail(connection, note_id)
     with connection:
+        _cancel_pending_note_analysis(connection, note_id, "transcript_changed")
         _append_processing_event(
             connection,
             note_id,
@@ -254,6 +244,186 @@ def add_audio_transcript(
             note_id,
             run_id,
             "interpretation",
+            "not_required",
+            input_hash,
+            engine="awaiting_user_request",
+            prompt_version=PROMPT_VERSION,
+        )
+    return note_detail(connection, note_id)
+
+
+def queued_audio_transcriptions(
+    connection: sqlite3.Connection,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT n.id
+        FROM resource_notes n
+        WHERE n.kind='audio'
+          AND COALESCE((
+            SELECT e.state FROM note_processing_events e
+            WHERE e.note_id=n.id AND e.stage='transcription'
+            ORDER BY e.created_at DESC, e.sequence DESC, e.rowid DESC LIMIT 1
+          ), '') IN ('queued', 'running')
+        ORDER BY n.created_at, n.rowid
+        LIMIT ?
+        """,
+        (max(1, min(limit, 100)),),
+    ).fetchall()
+    result = [note_detail(connection, row["id"]) for row in rows]
+    return [note for note in result if note["active"]]
+
+
+def audio_note_source(
+    connection: sqlite3.Connection,
+    state_dir: Path,
+    note_id: str,
+) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT * FROM resource_notes WHERE id=? AND kind='audio'",
+        (note_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError("Voice note was not found")
+    root = state_dir.resolve()
+    path = (root / str(row["audio_relpath"])).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise ValueError("Voice note audio file is unavailable")
+    return {
+        "id": row["id"],
+        "resourceId": row["resource_id"],
+        "path": path,
+        "mimeType": row["audio_mime"],
+        "sha256": row["audio_sha256"],
+    }
+
+
+def mark_audio_transcription_running(
+    connection: sqlite3.Connection,
+    note_id: str,
+) -> dict[str, Any]:
+    note = note_detail(connection, note_id)
+    latest = note.get("processing", {}).get("transcription", {})
+    if not note["active"] or note["kind"] != "audio":
+        raise ValueError("Active voice note was not found")
+    if latest.get("state") not in {"queued", "running"}:
+        return note
+    with connection:
+        _append_processing_event(
+            connection,
+            note_id,
+            _new_id("run"),
+            "transcription",
+            "running",
+            str(note["audioSha256"]),
+            engine="local_whisper",
+        )
+    return note_detail(connection, note_id)
+
+
+def complete_audio_transcription(
+    connection: sqlite3.Connection,
+    note_id: str,
+    transcript: str,
+    model: str,
+) -> dict[str, Any]:
+    exact_text = _validate_note_text(transcript)
+    note = note_detail(connection, note_id)
+    latest = note.get("processing", {}).get("transcription", {})
+    if latest.get("state") == "succeeded":
+        return note
+    if latest.get("state") not in {"queued", "running"}:
+        raise ValueError("Voice note is not awaiting transcription")
+    input_hash = _sha256_text(exact_text)
+    run_id = _new_id("run")
+    with connection:
+        _append_processing_event(
+            connection,
+            note_id,
+            run_id,
+            "transcription",
+            "succeeded",
+            str(note["audioSha256"]),
+            output_text=exact_text,
+            engine="local_whisper",
+            model=_bounded_label(model, 160, "local_whisper"),
+        )
+        _append_processing_event(
+            connection,
+            note_id,
+            run_id,
+            "interpretation",
+            "not_required",
+            input_hash,
+            engine="awaiting_user_request",
+            prompt_version=PROMPT_VERSION,
+        )
+    return note_detail(connection, note_id)
+
+
+def fail_audio_transcription(
+    connection: sqlite3.Connection,
+    note_id: str,
+    error_code: str,
+) -> dict[str, Any]:
+    note = note_detail(connection, note_id)
+    latest = note.get("processing", {}).get("transcription", {})
+    if latest.get("state") not in {"queued", "running"}:
+        return note
+    with connection:
+        _append_processing_event(
+            connection,
+            note_id,
+            _new_id("run"),
+            "transcription",
+            "failed",
+            str(note["audioSha256"]),
+            engine="local_whisper",
+            error_code=_bounded_label(error_code, 80, "local_transcription_failed"),
+        )
+    return note_detail(connection, note_id)
+
+
+def create_note_analysis_request(
+    connection: sqlite3.Connection,
+    note_id: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    note = note_detail(connection, note_id)
+    note_text = active_note_text(connection, note_id)
+    request_key = _validate_idempotency_key(idempotency_key)
+    input_hash = _sha256_text(note_text)
+    marker_prefix = f"analyze:{request_key}:"
+    marker = f"{marker_prefix}{input_hash}"
+    existing = connection.execute(
+        """
+        SELECT id, request_text FROM agent_requests
+        WHERE note_id=? AND substr(request_text, 1, ?)=?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
+        """,
+        (note_id, len(marker_prefix), marker_prefix),
+    ).fetchone()
+    if existing:
+        if existing["request_text"] != marker:
+            raise ConflictError("Idempotency key was already used for another note analysis")
+        return agent_request_detail(connection, existing["id"])
+    active = connection.execute(
+        """
+        SELECT id, request_text FROM agent_requests
+        WHERE note_id=? AND status IN ('queued', 'running')
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
+        """,
+        (note_id,),
+    ).fetchone()
+    if active and str(active["request_text"] or "").endswith(f":{input_hash}"):
+        return agent_request_detail(connection, active["id"])
+    with connection:
+        _append_processing_event(
+            connection,
+            note_id,
+            _new_id("run"),
+            "interpretation",
             "queued",
             input_hash,
             engine="codex_app_server",
@@ -262,13 +432,11 @@ def add_audio_transcript(
         request_id = _insert_agent_request(
             connection,
             "interpret_note",
-            resource_id=str(note["resource_id"]),
+            resource_id=note["resourceId"],
             note_id=note_id,
-            request_text=request_marker,
+            request_text=marker,
         )
-    result = note_detail(connection, note_id)
-    result["agentRequestId"] = request_id
-    return result
+    return agent_request_detail(connection, request_id)
 
 
 def note_detail(connection: sqlite3.Connection, note_id: str) -> dict[str, Any]:
@@ -300,6 +468,54 @@ def note_detail(connection: sqlite3.Connection, note_id: str) -> dict[str, Any]:
             "errorCode": event["error_code"] or "",
             "createdAt": event["created_at"],
         }
+    analysis_row = connection.execute(
+        """
+        SELECT * FROM agent_requests
+        WHERE note_id=?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
+        """,
+        (note_id,),
+    ).fetchone()
+    analysis: dict[str, Any] | None = None
+    if analysis_row:
+        proposal = connection.execute(
+            "SELECT id, input_hash, base_revision FROM semantic_proposals WHERE request_id=?",
+            (analysis_row["id"],),
+        ).fetchone()
+        decision = None
+        if proposal:
+            decision = connection.execute(
+                "SELECT decision, audit_id FROM semantic_decisions WHERE proposal_id=?",
+                (proposal["id"],),
+            ).fetchone()
+        current_text = (
+            str(row["text_body"] or "")
+            if row["kind"] == "text"
+            else str(processing.get("transcription", {}).get("outputText") or "")
+        )
+        current_hash = _sha256_text(current_text) if current_text else ""
+        request_marker = str(analysis_row["request_text"] or "")
+        resource_revision = connection.execute(
+            "SELECT semantic_revision FROM resources WHERE id=?",
+            (row["resource_id"],),
+        ).fetchone()["semantic_revision"]
+        analysis = {
+            "requestId": analysis_row["id"],
+            "status": analysis_row["status"],
+            "response": _json_or_none(analysis_row["response_json"]),
+            "errorCode": analysis_row["error_code"] or "",
+            "proposalId": proposal["id"] if proposal else "",
+            "decision": decision["decision"] if decision else "",
+            "auditId": decision["audit_id"] if decision and decision["audit_id"] else "",
+            "inputCurrent": bool(
+                current_hash
+                and (
+                    request_marker.endswith(f":{current_hash}")
+                    or (proposal and proposal["input_hash"] == current_hash)
+                )
+                and (not proposal or proposal["base_revision"] == resource_revision)
+            ),
+        }
     return {
         "id": row["id"],
         "resourceId": row["resource_id"],
@@ -314,6 +530,7 @@ def note_detail(connection: sqlite3.Connection, note_id: str) -> dict[str, Any]:
         "createdAt": row["created_at"],
         "active": active,
         "processing": processing,
+        "analysis": analysis,
     }
 
 
@@ -405,14 +622,21 @@ def active_note_text(connection: sqlite3.Connection, note_id: str) -> str:
 
 
 def note_counts(connection: sqlite3.Connection) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    rows = connection.execute(
-        "SELECT resource_id, id FROM resource_notes ORDER BY created_at, rowid"
-    ).fetchall()
-    for row in rows:
-        if note_detail(connection, row["id"])["active"]:
-            counts[row["resource_id"]] = counts.get(row["resource_id"], 0) + 1
-    return counts
+    return {
+        row["resource_id"]: int(row["note_count"])
+        for row in connection.execute(
+            """
+            SELECT n.resource_id, COUNT(*) AS note_count
+            FROM resource_notes n
+            WHERE COALESCE((
+              SELECT e.event FROM note_events e
+              WHERE e.note_id=n.id
+              ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1
+            ), 'restore')='restore'
+            GROUP BY n.resource_id
+            """
+        )
+    }
 
 
 def queued_agent_requests(connection: sqlite3.Connection, limit: int = 20) -> list[dict[str, Any]]:
@@ -554,6 +778,10 @@ def complete_agent_request(
                 prompt_version=PROMPT_VERSION,
             )
         if request["resource_id"] and _response_has_semantic_operations(normalized):
+            proposal_note_id = request["note_id"] or _latest_active_note_id(
+                connection,
+                request["resource_id"],
+            )
             revision = connection.execute(
                 "SELECT semantic_revision FROM resources WHERE id=?",
                 (request["resource_id"],),
@@ -570,7 +798,7 @@ def complete_agent_request(
                 (
                     proposal_id,
                     request["resource_id"],
-                    request["note_id"],
+                    proposal_note_id or None,
                     request_id,
                     revision,
                     model,
@@ -578,12 +806,12 @@ def complete_agent_request(
                     normalized["message"],
                     _canonical_json(normalized),
                     _canonical_json(
-                        [{"kind": "user_note", "id": request["note_id"]}]
-                        if request["note_id"] else []
+                        [{"kind": "user_note", "id": proposal_note_id}]
+                        if proposal_note_id else []
                     ),
                     _sha256_text(
-                        active_note_text(connection, request["note_id"])
-                        if request["note_id"] else str(request["request_text"] or "")
+                        active_note_text(connection, proposal_note_id)
+                        if proposal_note_id else str(request["request_text"] or "")
                     ),
                     PROMPT_VERSION,
                     utc_now(),
@@ -621,6 +849,7 @@ def agent_request_detail(connection: sqlite3.Connection, request_id: str) -> dic
         "errorCode": row["error_code"] or "",
         "threadId": row["thread_id"] or "",
         "proposalId": proposal["id"] if proposal else "",
+        "proposalCurrent": proposal_is_current(connection, proposal["id"]) if proposal else False,
         "decision": decision["decision"] if decision else "",
         "auditId": decision["audit_id"] if decision and decision["audit_id"] else "",
         "createdAt": row["created_at"],
@@ -722,35 +951,22 @@ def normalize_agent_response(value: Any) -> dict[str, Any]:
     }
 
 
-def proposal_can_auto_apply(connection: sqlite3.Connection, proposal_id: str) -> bool:
+def proposal_is_current(connection: sqlite3.Connection, proposal_id: str) -> bool:
     row = _proposal_row(connection, proposal_id)
-    operations = normalize_agent_response(json.loads(row["operations_json"]))
-    if (
-        operations["needsReview"]
-        or operations["confidence"] < 0.75
-        or not operations["memberships"]
-        or not row["note_id"]
-    ):
+    resource = connection.execute(
+        "SELECT semantic_revision FROM resources WHERE id=?",
+        (row["resource_id"],),
+    ).fetchone()
+    if not resource or resource["semantic_revision"] != row["base_revision"]:
         return False
-    if _latest_active_note_id(connection, row["resource_id"]) != row["note_id"]:
-        return False
-    locked_kinds = {
-        membership["kind"]
-        for membership in connection.execute(
-            """
-            SELECT c.kind FROM resource_collections rc
-            JOIN collections c ON c.id=rc.collection_id
-            WHERE rc.resource_id=? AND rc.authority='user_locked'
-            """,
-            (row["resource_id"],),
-        )
-    }
-    proposed_primary = {
-        membership["kind"]
-        for membership in operations["memberships"]
-        if membership["kind"] in PRIMARY_COLLECTION_KINDS
-    }
-    return not bool(locked_kinds & proposed_primary)
+    if row["note_id"]:
+        if _latest_active_note_id(connection, row["resource_id"]) != row["note_id"]:
+            return False
+        try:
+            return row["input_hash"] == _sha256_text(active_note_text(connection, row["note_id"]))
+        except ValueError:
+            return False
+    return True
 
 
 def apply_semantic_proposal(
@@ -776,6 +992,10 @@ def apply_semantic_proposal(
         raise ConflictError("The resource changed after this proposal was created")
     if proposal["note_id"] and _latest_active_note_id(connection, proposal["resource_id"]) != proposal["note_id"]:
         raise ConflictError("A newer user note superseded this proposal")
+    if proposal["note_id"] and proposal["input_hash"] != _sha256_text(
+        active_note_text(connection, proposal["note_id"])
+    ):
+        raise ConflictError("The note or transcript changed after this proposal was created")
 
     operations = normalize_agent_response(json.loads(proposal["operations_json"]))
     locked_primary = {
@@ -1066,6 +1286,81 @@ def action_list_summaries(connection: sqlite3.Connection) -> list[dict[str, Any]
             }
         )
     return result
+
+
+def workspace_directory_summaries(connection: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
+    summaries: list[dict[str, Any]] = []
+    for collection in connection.execute(
+        """
+        SELECT c.*, parent.name AS parent_name
+        FROM collections c
+        LEFT JOIN collections parent ON parent.id=c.parent_id
+        WHERE c.status='active' AND c.kind IN ('space', 'project')
+          AND EXISTS(
+            SELECT 1 FROM resource_collections rc WHERE rc.collection_id=c.id
+          )
+        ORDER BY c.name COLLATE NOCASE
+        """
+    ):
+        resource_ids = [
+            row["resource_id"]
+            for row in connection.execute(
+                """
+                SELECT rc.resource_id
+                FROM resource_collections rc
+                JOIN resources r ON r.id=rc.resource_id
+                WHERE rc.collection_id=? AND r.library_state='accepted'
+                ORDER BY r.title COLLATE NOCASE, r.id
+                """,
+                (collection["id"],),
+            )
+        ]
+        if not resource_ids:
+            continue
+        top_topics = []
+        if collection["kind"] == "space":
+            top_topics = [
+                {"name": row["name"], "count": int(row["resource_count"])}
+                for row in connection.execute(
+                    """
+                    SELECT topic.name, COUNT(DISTINCT base.resource_id) AS resource_count
+                    FROM resource_collections base
+                    JOIN resources r ON r.id=base.resource_id AND r.library_state='accepted'
+                    JOIN resource_collections topic_rc ON topic_rc.resource_id=base.resource_id
+                    JOIN collections topic ON topic.id=topic_rc.collection_id AND topic.kind='topic'
+                    WHERE base.collection_id=?
+                    GROUP BY topic.id, topic.name
+                    ORDER BY resource_count DESC, topic.name COLLATE NOCASE
+                    LIMIT 5
+                    """,
+                    (collection["id"],),
+                )
+            ]
+        summaries.append(
+            {
+                "id": collection["id"],
+                "name": collection["name"],
+                "kind": collection["kind"],
+                "parentId": collection["parent_id"] or "",
+                "parentName": collection["parent_name"] or "",
+                "description": collection["description"] or "Resources organized around this purpose.",
+                "objective": collection["objective"] or "",
+                "resourceCount": len(resource_ids),
+                "resourceIds": resource_ids,
+                "previewResourceIds": resource_ids[:3],
+                "topTopics": top_topics,
+            }
+        )
+    return {
+        "spaces": sorted(
+            (item for item in summaries if item["kind"] == "space"),
+            key=lambda item: (-item["resourceCount"], item["name"].casefold()),
+        ),
+        "projects": sorted(
+            (item for item in summaries if item["kind"] == "project"),
+            key=lambda item: (-item["resourceCount"], item["name"].casefold()),
+        ),
+    }
 
 
 def update_action_progress(
@@ -1415,6 +1710,34 @@ def _note_input_hash(note: dict[str, Any]) -> str:
     if transcript.get("outputText"):
         return _sha256_text(str(transcript["outputText"]))
     return str(note.get("audioSha256") or _sha256_text(note["id"]))
+
+
+def _cancel_pending_note_analysis(
+    connection: sqlite3.Connection,
+    note_id: str,
+    error_code: str,
+) -> None:
+    note = note_detail(connection, note_id)
+    changed = connection.execute(
+        """
+        UPDATE agent_requests
+        SET status='failed', error_code=?, completed_at=?
+        WHERE note_id=? AND status IN ('queued', 'running')
+        """,
+        (_bounded_label(error_code, 80, "note_changed"), utc_now(), note_id),
+    ).rowcount
+    if changed:
+        _append_processing_event(
+            connection,
+            note_id,
+            _new_id("run"),
+            "interpretation",
+            "stale",
+            _note_input_hash(note),
+            engine="workspace_user",
+            prompt_version=PROMPT_VERSION,
+            error_code=_bounded_label(error_code, 80, "note_changed"),
+        )
 
 
 def _latest_active_note_id(connection: sqlite3.Connection, resource_id: str) -> str:

@@ -2,6 +2,7 @@ const data = window.__TAB_ATLAS__ || {
   inventory: {},
   resources: [],
   discoveries: [],
+  dismissed: [],
   groups: [],
   collectionSummaries: [],
   spaceSummaries: [],
@@ -19,8 +20,10 @@ const REQUEST_SAFETY_TEXT = "Downloads a request only. Codex verifies a fresh ca
 const hasSpaceContract = Object.prototype.hasOwnProperty.call(data, "spaceSummaries");
 const resources = Array.isArray(data.resources) ? data.resources : [];
 const discoveries = Array.isArray(data.discoveries) ? data.discoveries : [];
+const dismissed = Array.isArray(data.dismissed) ? data.dismissed : [];
 const allResources = [...discoveries, ...resources];
-const resourceById = new Map(allResources.map(resource => [resource.resourceId, resource]));
+const trackedResources = [...allResources, ...dismissed];
+const resourceById = new Map(trackedResources.map(resource => [resource.resourceId, resource]));
 let spaceSummaries = hasSpaceContract
   ? (data.spaceSummaries || [])
   : (data.collectionSummaries || []);
@@ -643,6 +646,7 @@ function renderReview() {
   const openResources = openTabResources();
   const modes = [
     ["discoveries", "New discoveries", discoveries.length],
+    ["dismissed", "Dismissed", dismissed.length],
     ["inbox", "Inbox", inboxResources().length],
     ["duplicates", "Exact duplicates", exactDuplicateResources().length],
     ["open", "Open tabs", currentTabCount()]
@@ -678,11 +682,14 @@ function renderReview() {
   page.append(control);
 
   let reviewResources = state.reviewMode === "discoveries" ? discoveries : inboxResources();
+  if (state.reviewMode === "dismissed") reviewResources = dismissed;
   if (state.reviewMode === "duplicates") reviewResources = exactDuplicateResources();
   if (state.reviewMode === "open") reviewResources = openResources;
   let galleryLabel = `${formatNumber(reviewResources.length)} resource${reviewResources.length === 1 ? "" : "s"}`;
   if (state.reviewMode === "discoveries") {
     galleryLabel = `${formatNumber(reviewResources.length)} awaiting approval`;
+  } else if (state.reviewMode === "dismissed") {
+    galleryLabel = `${formatNumber(reviewResources.length)} dismissed resource${reviewResources.length === 1 ? "" : "s"}`;
   } else if (state.reviewMode === "duplicates") {
     galleryLabel = `${formatNumber(safeDuplicateCount())} safe close candidate${safeDuplicateCount() === 1 ? "" : "s"}`;
   } else if (state.reviewMode === "open") {
@@ -714,8 +721,7 @@ function reviewActionPanel(mode) {
     label = `Review ${formatNumber(pending)} new first`;
     disabled = true;
   } else if (dismissedOpen) {
-    label = `Resolve ${formatNumber(dismissedOpen)} dismissed first`;
-    disabled = true;
+    label = `Close ${formatNumber(openTabs)} reviewed tabs`;
   }
   const button = node(
     "button",
@@ -726,13 +732,19 @@ function reviewActionPanel(mode) {
     "p",
     "action-safety-note",
     mode === "discoveries"
-      ? "Downloads a request to add this reviewed batch. Browser tabs are unchanged."
-      : REQUEST_SAFETY_TEXT
+      ? (workspace.interactive
+          ? "Adds this reviewed batch to the local library. Browser tabs are unchanged."
+          : "Downloads a request to add this reviewed batch. Browser tabs are unchanged.")
+      : (mode === "open" && dismissedOpen
+          ? `${formatNumber(dismissedOpen)} dismissed resource${dismissedOpen === 1 ? "" : "s"} will be discarded; accepted resources remain in the library. ${REQUEST_SAFETY_TEXT}`
+          : REQUEST_SAFETY_TEXT)
   );
   note.id = "reviewActionSafety";
   button.type = "button";
   button.disabled = disabled;
-  button.title = "Downloads a privacy-safe action request; it does not close tabs directly.";
+  button.title = mode === "discoveries" && workspace.interactive
+    ? "Updates the local library only; browser tabs are unchanged."
+    : "Downloads a privacy-safe action request; it does not close tabs directly.";
   button.setAttribute("aria-describedby", note.id);
   button.addEventListener("click", () => {
     if (mode === "discoveries") requestDiscoveryAcceptance();
@@ -1222,10 +1234,28 @@ function resourceFooter(resource, placement) {
       node("strong", "", "New discovery"),
       node("span", "", "Not yet in the durable library")
     );
-    const button = node("button", "resource-action-command accept-resource-command", "Add to library");
-    button.type = "button";
-    button.addEventListener("click", () => requestDiscoveryAcceptance(resource));
-    wrapper.append(copy, button);
+    const actions = node("span", "resource-footer-actions");
+    const accept = node("button", "resource-action-command accept-resource-command", "Add to library");
+    accept.type = "button";
+    accept.addEventListener("click", () => requestDiscoveryAcceptance(resource));
+    const dismiss = node("button", "resource-action-command dismiss-resource-command", "Dismiss");
+    dismiss.type = "button";
+    dismiss.addEventListener("click", () => requestDiscoveryDismissal(resource));
+    actions.append(accept, dismiss);
+    wrapper.append(copy, actions);
+    return wrapper;
+  }
+  if (resource.libraryState === "dismissed") {
+    wrapper.classList.add("has-command", "is-dismissed");
+    const copy = node("span", "resource-footer-copy");
+    copy.append(
+      node("strong", "", "Dismissed"),
+      node("span", "", "Outside the library; retained for recovery")
+    );
+    const restore = node("button", "resource-action-command", "Restore to library");
+    restore.type = "button";
+    restore.addEventListener("click", () => requestDiscoveryAcceptance(resource));
+    wrapper.append(copy, restore);
     return wrapper;
   }
   if (duplicateCount) {
@@ -2180,18 +2210,18 @@ function inboxResources() {
 }
 
 function exactDuplicateResources() {
-  return allResources.filter(resource => duplicateSummary(resource).sets > 0).sort((a, b) => {
+  return trackedResources.filter(resource => duplicateSummary(resource).sets > 0).sort((a, b) => {
     const count = duplicateSummary(b).safeCloseCandidates - duplicateSummary(a).safeCloseCandidates;
     return count || resourceSort(a, b);
   });
 }
 
 function openTabResources() {
-  return allResources.filter(resource => liveTabs(resource).length > 0).sort(resourceSort);
+  return trackedResources.filter(resource => liveTabs(resource).length > 0).sort(resourceSort);
 }
 
 function safeDuplicateCount() {
-  return allResources.reduce((total, resource) => total + duplicateSummary(resource).safeCloseCandidates, 0);
+  return trackedResources.reduce((total, resource) => total + duplicateSummary(resource).safeCloseCandidates, 0);
 }
 
 function duplicateSummary(resource) {
@@ -2316,7 +2346,8 @@ function matchesSearch(resource) {
 }
 
 function reviewDescription(mode) {
-  if (mode === "discoveries") return "New canonical resources from the latest capture. Accept selected items or the complete batch before archiving their tabs.";
+  if (mode === "discoveries") return "Provisionally organized resources from the latest capture. Accept them into the library or dismiss them before closing browser tabs.";
+  if (mode === "dismissed") return "Reviewed resources kept outside the library. Restore any mistake before running the verified close batch.";
   if (mode === "duplicates") return "Exact URL matches within the same browser window and group. Protected tabs remain visible and excluded from safe candidates.";
   if (mode === "open") return "Resources represented by the latest captured browser state. Their metadata and reopen links remain in the durable library after tabs close.";
   return "Stored or open resources without a purpose space. Organize them without keeping browser tabs alive.";
@@ -2324,6 +2355,7 @@ function reviewDescription(mode) {
 
 function reviewEmptyMessage(mode) {
   if (mode === "discoveries") return "No new resources are waiting for approval.";
+  if (mode === "dismissed") return "No resources have been dismissed.";
   if (mode === "duplicates") return "No exact duplicate sets are present in the current capture.";
   if (mode === "open") return "No captured tabs are currently open. The retained library remains available in Spaces and search.";
   return "Every library resource has a purpose space.";
@@ -2394,24 +2426,58 @@ function closeDetails() {
 
 function requestCapturedTabArchive() {
   const currentTabs = currentTabCount();
-  if (!currentTabs || pendingDiscoveryCount() || inventoryCount("currentDismissedResources", 0)) return;
+  const dismissedOpenResources = inventoryCount("currentDismissedResources", 0);
+  if (!currentTabs || pendingDiscoveryCount()) return;
   downloadActionRequest("archive_captured_tabs", {
     libraryResources: libraryResourceCount(),
     currentResources: currentResourceCount(),
-    currentTabs
+    currentTabs,
+    dismissedOpenResources
   });
 }
 
-function requestDiscoveryAcceptance(resource = null) {
+async function requestDiscoveryAcceptance(resource = null) {
   const selected = resource
     ? [resource.resourceId]
     : discoveries.map(item => item.resourceId);
-  const count = selected.length;
-  if (!count) return;
-  downloadActionRequest("accept_discoveries", {
-    pendingDiscoveries: pendingDiscoveryCount(),
-    selectedResources: count
-  }, selected);
+  await requestDiscoveryDecision("accept", selected);
+}
+
+async function requestDiscoveryDismissal(resource) {
+  if (!resource) return;
+  await requestDiscoveryDecision("dismiss", [resource.resourceId]);
+}
+
+async function requestDiscoveryDecision(decision, selected) {
+  const resourceIds = unique(selected.filter(resourceId => resourceById.has(resourceId)));
+  if (!resourceIds.length) return;
+  if (!workspace.interactive) {
+    downloadActionRequest(
+      decision === "accept" ? "accept_discoveries" : "dismiss_discoveries",
+      {
+        pendingDiscoveries: pendingDiscoveryCount(),
+        selectedResources: resourceIds.length
+      },
+      resourceIds
+    );
+    return;
+  }
+  const buttons = [...document.querySelectorAll(".accept-resource-command, .dismiss-resource-command")];
+  buttons.forEach(button => { button.disabled = true; });
+  try {
+    const result = await workspaceRequest(`/api/v1/discoveries/${decision}`, {
+      method: "POST",
+      json: { resourceIds }
+    });
+    const restored = decision === "accept" && resourceIds.some(resourceId => resourceById.get(resourceId)?.libraryState === "dismissed");
+    elements.actionStatus.textContent = decision === "dismiss"
+      ? `${formatNumber(result.updated)} resource${result.updated === 1 ? "" : "s"} dismissed. Browser tabs were unchanged.`
+      : `${formatNumber(result.updated)} resource${result.updated === 1 ? "" : "s"} ${restored ? "restored" : "added"} to the library.`;
+    window.location.reload();
+  } catch (error) {
+    buttons.forEach(button => { button.disabled = false; });
+    showWorkspaceError(error, "The discovery decision could not be saved.");
+  }
 }
 
 function requestDuplicateClose(resource = null) {
@@ -2939,7 +3005,7 @@ function currentResourceCount() {
 }
 
 function currentTabCount() {
-  const fallback = allResources.reduce((total, resource) => total + liveTabs(resource).length, 0);
+  const fallback = trackedResources.reduce((total, resource) => total + liveTabs(resource).length, 0);
   return inventoryCount("currentTabs", fallback);
 }
 

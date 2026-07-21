@@ -69,6 +69,14 @@ or regroup browser tabs. Duplicate cleanup and archive-all use separate bounded,
 audited protocols described in [SKILL.md](SKILL.md) and
 [references/safety.md](references/safety.md).
 
+Staging is durable but does not make a resource part of the library. In the
+authenticated workspace, **Review -> New discoveries** applies Accept or Dismiss
+directly to the local database. Dismissed items remain recoverable under
+**Review -> Dismissed**. Neither decision changes a browser tab. After every new
+item has been reviewed, **Open tabs** can prepare one verified close batch:
+accepted resources remain in the library and dismissed resources are recorded as
+discarded before their matching tabs are closed.
+
 ## Architecture
 
 See [references/interaction-architecture.md](references/interaction-architecture.md)

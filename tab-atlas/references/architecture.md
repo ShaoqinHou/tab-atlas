@@ -62,7 +62,11 @@ Keep three concepts separate:
 
 Canonical identity prevents a known resource from being staged again. A later
 capture updates its observations and provenance. Dismissed resources remain
-outside the accepted library and remain visible to safety checks while open.
+outside the accepted library, remain recoverable in their own Review mode, and
+remain visible to safety checks while open. Candidate and dismissed rows live in
+the same private SQLite database for crash recovery, but library queries exclude
+them. Accept, Dismiss, and Restore are local catalog decisions; none is a browser
+mutation.
 
 Semantic organization uses **Space -> Topic -> Focus**. A Project is a
 cross-cutting overlay and does not replace this hierarchy. Codex should

@@ -149,6 +149,10 @@ class CatalogTests(unittest.TestCase):
             )
             after = inventory(connection)
             accepted = library_resources(connection)
+            accepted_membership = connection.execute(
+                "SELECT accepted, authority FROM resource_collections WHERE resource_id=?",
+                (pending[0]["resourceId"],),
+            ).fetchone()
             connection.close()
 
             self.assertEqual(first_live["new_resource_count"], 1)
@@ -166,11 +170,14 @@ class CatalogTests(unittest.TestCase):
             )
             self.assertEqual(len(staged_report["resources"]), 1)
             self.assertEqual(len(staged_report["discoveries"]), 1)
+            self.assertEqual(staged_report["dismissed"], [])
             self.assertEqual(staged_report["discoveries"][0]["libraryState"], "candidate")
             self.assertEqual(decision["updated"], 1)
             self.assertEqual(after["libraryResources"], 2)
             self.assertEqual(after["pendingDiscoveries"], 0)
             self.assertEqual({item["libraryState"] for item in accepted}, {"accepted"})
+            self.assertEqual(accepted_membership["accepted"], 1)
+            self.assertEqual(accepted_membership["authority"], "accepted_stable")
 
     def test_archive_plan_blocks_unreviewed_and_requires_opt_in_for_dismissed_resources(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -257,12 +264,15 @@ class CatalogTests(unittest.TestCase):
             set_discovery_state(connection, "dismissed", {resource_id})
 
             dismissed = discovery_batch(connection, 10, state="dismissed")
+            dismissed_report = report_payload(connection)
             restored = set_discovery_state(connection, "accepted", {resource_id})
             plan = build_archive_plan(connection, {"edge"})
             connection.close()
 
             self.assertEqual(dismissed["state"], "dismissed")
             self.assertEqual(dismissed["total"], 1)
+            self.assertEqual(len(dismissed_report["dismissed"]), 1)
+            self.assertEqual(dismissed_report["dismissed"][0]["libraryState"], "dismissed")
             self.assertEqual(restored["updated"], 1)
             self.assertEqual(plan["summary"]["dismissedOpenResourceCount"], 0)
             self.assertEqual(plan["summary"]["plannedClosures"], 1)

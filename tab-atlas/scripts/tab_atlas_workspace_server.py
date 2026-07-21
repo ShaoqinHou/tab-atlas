@@ -35,6 +35,7 @@ from tab_atlas_core import (
     library_resources,
     remove_library_resources,
     resource_presentation,
+    set_discovery_state,
 )
 from tab_atlas_workspace import (
     ConflictError,
@@ -554,6 +555,19 @@ class TabAtlasWorkspaceHandler(SimpleHTTPRequestHandler):
             return
         path = urlsplit(self.path).path
         try:
+            match = re.fullmatch(r"/api/v1/discoveries/(accept|dismiss)", path)
+            if match:
+                document = self._read_json_body()
+                resource_ids = document.get("resourceIds")
+                if not isinstance(resource_ids, list) or not resource_ids:
+                    raise ValueError("resourceIds must be a non-empty list")
+                target_state = "accepted" if match.group(1) == "accept" else "dismissed"
+                with self.workspace_server.database() as connection:
+                    result = set_discovery_state(connection, target_state, resource_ids)
+                    result["inventory"] = inventory(connection)
+                self.workspace_server.regenerate_report()
+                self._send_json(result)
+                return
             match = re.fullmatch(rf"/api/v1/resources/({RESOURCE_ID_PATTERN})/notes", path)
             if match:
                 document = self._read_json_body()

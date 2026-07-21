@@ -1640,6 +1640,18 @@ def set_discovery_state(
                     f"WHERE library_state IN ('candidate', 'dismissed') AND id IN ({placeholders})",
                     [now, *batch],
                 )
+                connection.execute(
+                    f"""
+                    UPDATE resource_collections
+                    SET accepted=1,
+                        authority=CASE
+                          WHEN authority IN ('user_locked', 'user_note') THEN authority
+                          ELSE 'accepted_stable'
+                        END
+                    WHERE resource_id IN ({placeholders})
+                    """,
+                    batch,
+                )
             else:
                 connection.execute(
                     f"UPDATE resources SET library_state='dismissed', dismissed_at=? "
@@ -4227,6 +4239,11 @@ def report_payload(connection: sqlite3.Connection) -> dict[str, Any]:
         resource = dict(item)
         resource["presentation"] = resource_presentation(resource)
         discoveries.append(resource)
+    dismissed = []
+    for item in library_resources(connection, {"dismissed"}):
+        resource = dict(item)
+        resource["presentation"] = resource_presentation(resource)
+        dismissed.append(resource)
     collections = [
         dict(row)
         for row in connection.execute(
@@ -4268,6 +4285,7 @@ def report_payload(connection: sqlite3.Connection) -> dict[str, Any]:
         "inventory": inventory(connection),
         "resources": resources,
         "discoveries": discoveries,
+        "dismissed": dismissed,
         "groups": groups,
         "collections": collections,
         "collectionSummaries": active_summaries,

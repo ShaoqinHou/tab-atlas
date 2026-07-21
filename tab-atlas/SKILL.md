@@ -41,8 +41,9 @@ python scripts/tab_atlas.py dismiss --resource-id <id>
 python scripts/tab_atlas.py dismiss --all
 ```
 
-Dismissal is reversible. Review dismissed resources and restore an individual
-resource with:
+Dismissal is reversible and never closes a browser tab by itself. The interactive
+workspace exposes dismissed resources as a separate Review mode; restore there,
+or restore an individual resource with:
 
 ```powershell
 python scripts/tab_atlas.py discoveries --state dismissed
@@ -214,8 +215,9 @@ python scripts/tab_atlas.py archive-approval revoke
 ```
 
 The protocol performs a fresh capture and always blocks while pending discoveries
-exist. Dismissed live items also block unless the user separately approves their
-closure and the operator supplies `--include-dismissed`; those targets are audited
+exist. A reviewed close request may include dismissed live items only when its
+scope names the retained and discarded counts and the operator supplies
+`--include-dismissed`; those targets are audited
 as discards and never enter the accepted library. The protocol verifies catalog
 integrity and a private backup, binds targets to URL hashes and browser context,
 closes revalidated tabs, captures again to prove the targets are absent, and

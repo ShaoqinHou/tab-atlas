@@ -47,6 +47,8 @@ from tab_atlas_workspace_server import (  # noqa: E402
 
 
 RESOURCE_ID = "res_" + "a" * 24
+CANDIDATE_ID = "res_" + "b" * 24
+DISMISSED_ID = "res_" + "c" * 24
 
 
 def seed_resource(connection) -> None:
@@ -69,6 +71,20 @@ def seed_resource(connection) -> None:
             "A visual mathematics course.",
             now,
         ),
+    )
+    connection.commit()
+
+
+def seed_candidate_resource(connection, resource_id: str, title: str) -> None:
+    now = utc_now()
+    connection.execute(
+        """
+        INSERT INTO resources(
+          id, canonical_url, host, kind, title, first_seen_at, last_seen_at,
+          brief, status, library_state
+        ) VALUES(?, ?, 'example.com', 'web_page', ?, ?, ?, '', 'open', 'candidate')
+        """,
+        (resource_id, f"https://example.com/{resource_id}", title, now, now),
     )
     connection.commit()
 
@@ -697,6 +713,8 @@ class WorkspaceServerTests(unittest.TestCase):
             report = root / "report"
             connection = connect(database)
             seed_resource(connection)
+            seed_candidate_resource(connection, CANDIDATE_ID, "Accept this discovery")
+            seed_candidate_resource(connection, DISMISSED_ID, "Dismiss this discovery")
             generate_report(connection, report, ROOT / "assets" / "report", state)
             connection.close()
             server, _url = create_workspace_server(
@@ -730,6 +748,41 @@ class WorkspaceServerTests(unittest.TestCase):
                 response = client.getresponse()
                 session = json.loads(response.read())
                 self.assertEqual(response.status, 200)
+
+                decision_headers = {
+                    "Host": server.expected_host,
+                    "Cookie": cookie,
+                    "Origin": server.origin,
+                    "X-TabAtlas-CSRF": session["csrfToken"],
+                    "Idempotency-Key": "server-idempotency-accept-discovery-01",
+                    "Content-Type": "application/json",
+                }
+                decision_body = json.dumps({"resourceIds": [CANDIDATE_ID]}).encode("utf-8")
+                decision_headers["Content-Length"] = str(len(decision_body))
+                client.request("POST", "/api/v1/discoveries/accept", decision_body, decision_headers)
+                response = client.getresponse()
+                accepted = json.loads(response.read())
+                self.assertEqual(response.status, 200, accepted)
+                self.assertEqual(accepted["state"], "accepted")
+                self.assertEqual(accepted["updated"], 1)
+
+                decision_body = json.dumps({"resourceIds": [DISMISSED_ID]}).encode("utf-8")
+                decision_headers["Content-Length"] = str(len(decision_body))
+                decision_headers["Idempotency-Key"] = "server-idempotency-dismiss-discovery-01"
+                client.request("POST", "/api/v1/discoveries/dismiss", decision_body, decision_headers)
+                response = client.getresponse()
+                dismissed = json.loads(response.read())
+                self.assertEqual(response.status, 200, dismissed)
+                self.assertEqual(dismissed["state"], "dismissed")
+                self.assertEqual(dismissed["updated"], 1)
+
+                decision_headers["Idempotency-Key"] = "server-idempotency-restore-discovery-01"
+                client.request("POST", "/api/v1/discoveries/accept", decision_body, decision_headers)
+                response = client.getresponse()
+                restored = json.loads(response.read())
+                self.assertEqual(response.status, 200, restored)
+                self.assertEqual(restored["state"], "accepted")
+                self.assertEqual(restored["updated"], 1)
 
                 body = json.dumps({"text": "A private note"}).encode("utf-8")
                 headers = {

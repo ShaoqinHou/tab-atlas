@@ -594,8 +594,8 @@ a:focus-visible {
 }
 .review-modes {
   display: grid;
-  grid-template-columns: repeat(4, minmax(140px, 1fr));
-  max-width: 920px;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  max-width: 1000px;
   margin: 16px 0 2px;
   border: 1px solid var(--line-strong);
   border-radius: 5px;
@@ -1003,6 +1003,8 @@ a:focus-visible {
 .resource-footer.is-stored .resource-footer-copy strong { color: #617078; font-weight: 700; }
 .resource-footer.is-open { border-left: 3px solid #75a491; }
 .resource-footer.is-discovery { border-left: 3px solid #3c6790; }
+.resource-footer.is-dismissed { border-left: 3px solid #a36b68; }
+.resource-footer-actions { display: flex; gap: 6px; }
 .resource-action-command {
   min-width: 0;
   min-height: 34px;
@@ -1497,12 +1499,16 @@ a:focus-visible {
     line-height: 1.2;
     text-align: center;
   }
-  .review-modes button:nth-child(2) { border-right: 0; }
+  .review-modes button:nth-child(2n) { border-right: 0; }
   .review-modes button:nth-child(n + 3) { border-top: 1px solid var(--line); }
+  .review-modes button:last-child:nth-child(odd) { grid-column: 1 / -1; }
   .resource-grid { grid-template-columns: 1fr; }
   .resource-card { min-height: 0; }
   .card-body { min-height: 194px; }
   .resource-footer.has-command { grid-template-columns: minmax(0, 1fr) auto; }
+  .resource-footer.is-discovery { grid-template-columns: minmax(0, 1fr); }
+  .resource-footer-actions { width: 100%; }
+  .resource-footer-actions .resource-action-command { flex: 1; }
   .resource-command-link,
   .resource-command-button,
   .resource-command-menu > summary { min-height: 34px; font-size: 11px; }

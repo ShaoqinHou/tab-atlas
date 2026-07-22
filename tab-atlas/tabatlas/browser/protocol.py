@@ -10,21 +10,22 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlsplit
 
-from tab_atlas_core import (
-    connect,
+from ..capture import store_snapshot
+from ..common import normalize_browser
+from ..constants import (
     LEGACY_CAPTURE_PROTOCOL_VERSION,
+    TABATLAS_EXTENSION_ID,
+    TARGET_HASH_PROTOCOL_VERSION,
+)
+from ..database import (
+    connect,
     mark_pairing_seen,
-    MUTATION_PROTOCOL_VERSION,
-    normalize_browser,
     pairing_secret,
     protocol_proof,
     save_pairing,
-    store_snapshot,
-    TABATLAS_EXTENSION_ID,
-    TARGET_HASH_PROTOCOL_VERSION,
     token_hash,
 )
 
@@ -63,7 +64,9 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         if not self._request_allowed(require_origin=True):
-            self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "origin denied"})
+            self._send_json(
+                HTTPStatus.FORBIDDEN, {"ok": False, "error": "origin denied"}
+            )
             return
         self.send_response(HTTPStatus.NO_CONTENT)
         self._cors_headers()
@@ -78,7 +81,9 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if not self._request_allowed():
-            self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "request denied"})
+            self._send_json(
+                HTTPStatus.FORBIDDEN, {"ok": False, "error": "request denied"}
+            )
             return
         path = urlsplit(self.path).path
         if path != "/v1/command":
@@ -86,7 +91,9 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             return
         pairing = self._authenticate_signed("command")
         if not pairing:
-            self._send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"}
+            )
             return
         browser = pairing["browser"]
         if not pairing["enabled"]:
@@ -105,7 +112,10 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
                 ),
             }
             self._send_json(HTTPStatus.UNAUTHORIZED, payload)
-            if self.server.session.mode == "revoke" and browser in self.server.session.expected_browsers:
+            if (
+                self.server.session.mode == "revoke"
+                and browser in self.server.session.expected_browsers
+            ):
                 self.server.session.done.set()
             return
         connection = connect(self.server.session.database_path)
@@ -118,7 +128,10 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
         with self.server.session.lock:
             session = self.server.session
             if session.mode == "capture":
-                if browser not in session.expected_browsers or browser in session.captured:
+                if (
+                    browser not in session.expected_browsers
+                    or browser in session.captured
+                ):
                     action = "idle"
                     request_id = ""
                 else:
@@ -126,17 +139,27 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
                     request_id = session.request_id
             elif session.mode == "mutate" and session.mutation_plan:
                 browser_plan = session.mutation_plan.get("browsers", {}).get(browser)
-                if browser not in session.expected_browsers or browser in session.mutated or not browser_plan:
+                if (
+                    browser not in session.expected_browsers
+                    or browser in session.mutated
+                    or not browser_plan
+                ):
                     action = "idle"
                     request_id = ""
                 else:
-                    action = str(session.mutation_plan.get("action") or "close_exact_duplicates")
+                    action = str(
+                        session.mutation_plan.get("action") or "close_exact_duplicates"
+                    )
                     request_id = str(session.mutation_plan["requestId"])
                     targets = browser_plan["targets"]
                     targets_hash = browser_plan["targetsHash"]
             elif session.mode == "cleanup" and session.mutation_plan:
                 browser_plan = session.mutation_plan.get("browsers", {}).get(browser)
-                if browser not in session.expected_browsers or browser in session.cleaned or not browser_plan:
+                if (
+                    browser not in session.expected_browsers
+                    or browser in session.cleaned
+                    or not browser_plan
+                ):
                     action = "idle"
                     request_id = ""
                 else:
@@ -145,7 +168,10 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
                     targets = browser_plan["targets"]
                     targets_hash = browser_plan["targetsHash"]
             else:
-                self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "receiver is not active"})
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {"ok": False, "error": "receiver is not active"},
+                )
                 return
         response_parts = [
             "response",
@@ -172,7 +198,9 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if not self._request_allowed():
-            self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "request denied"})
+            self._send_json(
+                HTTPStatus.FORBIDDEN, {"ok": False, "error": "request denied"}
+            )
             return
         path = urlsplit(self.path).path
         if path == "/v1/pair":
@@ -192,7 +220,9 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
     def _pair(self) -> None:
         session = self.server.session
         if session.mode != "pair" or not session.pairing_code:
-            self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "pairing is not active"})
+            self._send_json(
+                HTTPStatus.CONFLICT, {"ok": False, "error": "pairing is not active"}
+            )
             return
         try:
             body = self._read_json(64 * 1024)
@@ -204,13 +234,21 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)})
             return
         if browser not in session.expected_browsers:
-            self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "wrong browser"})
+            self._send_json(
+                HTTPStatus.FORBIDDEN, {"ok": False, "error": "wrong browser"}
+            )
             return
         if extension_id != EXPECTED_EXTENSION_ID:
-            self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "wrong extension"})
+            self._send_json(
+                HTTPStatus.FORBIDDEN, {"ok": False, "error": "wrong extension"}
+            )
             return
-        if not re.fullmatch(r"[a-f0-9]{32}", nonce) or not re.fullmatch(r"[a-f0-9]{64}", client_proof):
-            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid pairing proof"})
+        if not re.fullmatch(r"[a-f0-9]{32}", nonce) or not re.fullmatch(
+            r"[a-f0-9]{64}", client_proof
+        ):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid pairing proof"}
+            )
             return
         pairing_key = token_hash(session.pairing_code)
         expected_proof = protocol_proof(
@@ -221,7 +259,9 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             nonce,
         )
         if not hmac.compare_digest(client_proof, expected_proof):
-            self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "invalid pairing proof"})
+            self._send_json(
+                HTTPStatus.FORBIDDEN, {"ok": False, "error": "invalid pairing proof"}
+            )
             return
 
         token = secrets.token_urlsafe(32)
@@ -232,25 +272,30 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
         finally:
             connection.close()
         session.paired_browser = browser
-        self._send_json(HTTPStatus.OK, {
-            "ok": True,
-            "token": token,
-            "browser": browser,
-            "serverProof": protocol_proof(
-                pairing_key,
-                "paired",
-                browser,
-                extension_id,
-                nonce,
-                issued_key,
-            ),
-        })
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "token": token,
+                "browser": browser,
+                "serverProof": protocol_proof(
+                    pairing_key,
+                    "paired",
+                    browser,
+                    extension_id,
+                    nonce,
+                    issued_key,
+                ),
+            },
+        )
         session.done.set()
 
     def _snapshot(self) -> None:
         session = self.server.session
         if session.mode != "capture":
-            self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "capture is not active"})
+            self._send_json(
+                HTTPStatus.CONFLICT, {"ok": False, "error": "capture is not active"}
+            )
             return
         try:
             raw_body = self._read_body(MAX_BODY_BYTES)
@@ -261,13 +306,18 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             body_hash = hashlib.sha256(raw_body).hexdigest()
             pairing = self._authenticate_signed("snapshot", request_id, body_hash)
             if not pairing or not pairing["enabled"]:
-                self._send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"}
+                )
                 return
             browser = normalize_browser(body.get("browser"))
             extension_id = str(body.get("extensionId") or "")
             if browser != pairing["browser"]:
                 raise ValueError("browser does not match pairing")
-            if extension_id != pairing["extension_id"] or extension_id != EXPECTED_EXTENSION_ID:
+            if (
+                extension_id != pairing["extension_id"]
+                or extension_id != EXPECTED_EXTENSION_ID
+            ):
                 raise ValueError("extension does not match pairing")
             if browser not in session.expected_browsers:
                 raise ValueError("browser was not requested")
@@ -286,36 +336,43 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             finally:
                 connection.close()
         except (ValueError, TypeError, json.JSONDecodeError) as error:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)[:240]})
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)[:240]}
+            )
             return
 
         with session.lock:
             session.captured[browser] = result
             complete = session.expected_browsers.issubset(session.captured.keys())
-        self._send_json(HTTPStatus.OK, {
-            "ok": True,
-            "captureId": result["id"],
-            "browser": browser,
-            "tabs": result["tab_count"],
-            "newResources": result.get("new_resource_count", 0),
-            "pendingResources": result.get("candidate_resource_count", 0),
-            "serverProof": protocol_proof(
-                pairing["secret"],
-                "accepted",
-                browser,
-                pairing["extension_id"],
-                pairing["nonce"],
-                request_id,
-                result["id"],
-            ),
-        })
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "captureId": result["id"],
+                "browser": browser,
+                "tabs": result["tab_count"],
+                "newResources": result.get("new_resource_count", 0),
+                "pendingResources": result.get("candidate_resource_count", 0),
+                "serverProof": protocol_proof(
+                    pairing["secret"],
+                    "accepted",
+                    browser,
+                    pairing["extension_id"],
+                    pairing["nonce"],
+                    request_id,
+                    result["id"],
+                ),
+            },
+        )
         if complete:
             session.done.set()
 
     def _mutation(self) -> None:
         session = self.server.session
         if session.mode != "mutate" or not session.mutation_plan:
-            self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "mutation is not active"})
+            self._send_json(
+                HTTPStatus.CONFLICT, {"ok": False, "error": "mutation is not active"}
+            )
             return
         try:
             raw_body = self._read_body(2 * 1024 * 1024)
@@ -325,15 +382,25 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             request_id = str(body.get("requestId") or "")
             targets_hash = str(body.get("targetsHash") or "")
             body_hash = hashlib.sha256(raw_body).hexdigest()
-            pairing = self._authenticate_signed("mutation", request_id, targets_hash, body_hash)
+            pairing = self._authenticate_signed(
+                "mutation", request_id, targets_hash, body_hash
+            )
             if not pairing or not pairing["enabled"]:
-                self._send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"}
+                )
                 return
             browser = normalize_browser(body.get("browser"))
             extension_id = str(body.get("extensionId") or "")
-            if browser != pairing["browser"] or browser not in session.expected_browsers:
+            if (
+                browser != pairing["browser"]
+                or browser not in session.expected_browsers
+            ):
                 raise ValueError("browser does not match mutation plan")
-            if extension_id != pairing["extension_id"] or extension_id != EXPECTED_EXTENSION_ID:
+            if (
+                extension_id != pairing["extension_id"]
+                or extension_id != EXPECTED_EXTENSION_ID
+            ):
                 raise ValueError("extension does not match pairing")
             if request_id != str(session.mutation_plan["requestId"]):
                 raise ValueError("mutation request does not match receiver run")
@@ -341,9 +408,13 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             if not browser_plan or targets_hash != browser_plan["targetsHash"]:
                 raise ValueError("mutation target set does not match receiver plan")
             results = body.get("results")
-            if not isinstance(results, list) or len(results) != len(browser_plan["targets"]):
+            if not isinstance(results, list) or len(results) != len(
+                browser_plan["targets"]
+            ):
                 raise ValueError("mutation result count does not match plan")
-            expected_ids = {int(item["targetTabId"]) for item in browser_plan["targets"]}
+            expected_ids = {
+                int(item["targetTabId"]) for item in browser_plan["targets"]
+            }
             seen_ids: set[int] = set()
             normalized_results = []
             for item in results:
@@ -357,7 +428,9 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
                 if status not in {"closed", "skipped"}:
                     raise ValueError("mutation result status is invalid")
                 seen_ids.add(tab_id)
-                normalized_results.append({"tabId": tab_id, "status": status, "reason": reason})
+                normalized_results.append(
+                    {"tabId": tab_id, "status": status, "reason": reason}
+                )
             if seen_ids != expected_ids:
                 raise ValueError("mutation results are incomplete")
             control_tab_id = None
@@ -368,7 +441,9 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
                 if control_tab_id < 0 or control_window_id < 0:
                     raise ValueError("archive control tab is invalid")
         except (ValueError, TypeError, json.JSONDecodeError) as error:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)[:240]})
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)[:240]}
+            )
             return
 
         closed_count = sum(item["status"] == "closed" for item in normalized_results)
@@ -386,30 +461,35 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
         with session.lock:
             session.mutated[browser] = result
             complete = session.expected_browsers.issubset(session.mutated.keys())
-        self._send_json(HTTPStatus.OK, {
-            "ok": True,
-            "browser": browser,
-            "closedCount": closed_count,
-            "skippedCount": skipped_count,
-            "serverProof": protocol_proof(
-                pairing["secret"],
-                "mutation-accepted",
-                browser,
-                pairing["extension_id"],
-                pairing["nonce"],
-                request_id,
-                targets_hash,
-                str(closed_count),
-                str(skipped_count),
-            ),
-        })
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "browser": browser,
+                "closedCount": closed_count,
+                "skippedCount": skipped_count,
+                "serverProof": protocol_proof(
+                    pairing["secret"],
+                    "mutation-accepted",
+                    browser,
+                    pairing["extension_id"],
+                    pairing["nonce"],
+                    request_id,
+                    targets_hash,
+                    str(closed_count),
+                    str(skipped_count),
+                ),
+            },
+        )
         if complete:
             session.done.set()
 
     def _cleanup(self) -> None:
         session = self.server.session
         if session.mode != "cleanup" or not session.mutation_plan:
-            self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "cleanup is not active"})
+            self._send_json(
+                HTTPStatus.CONFLICT, {"ok": False, "error": "cleanup is not active"}
+            )
             return
         try:
             raw_body = self._read_body(64 * 1024)
@@ -419,9 +499,13 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             request_id = str(body.get("requestId") or "")
             targets_hash = str(body.get("targetsHash") or "")
             body_hash = hashlib.sha256(raw_body).hexdigest()
-            pairing = self._authenticate_signed("cleanup", request_id, targets_hash, body_hash)
+            pairing = self._authenticate_signed(
+                "cleanup", request_id, targets_hash, body_hash
+            )
             if not pairing or not pairing["enabled"]:
-                self._send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+                self._send_json(
+                    HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"}
+                )
                 return
             browser = normalize_browser(body.get("browser"))
             extension_id = str(body.get("extensionId") or "")
@@ -429,9 +513,15 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             control_window_id = int(body.get("controlWindowId"))
             status = str(body.get("status") or "")
             reason = str(body.get("reason") or "")[:160]
-            if browser != pairing["browser"] or browser not in session.expected_browsers:
+            if (
+                browser != pairing["browser"]
+                or browser not in session.expected_browsers
+            ):
                 raise ValueError("browser does not match cleanup plan")
-            if extension_id != pairing["extension_id"] or extension_id != EXPECTED_EXTENSION_ID:
+            if (
+                extension_id != pairing["extension_id"]
+                or extension_id != EXPECTED_EXTENSION_ID
+            ):
                 raise ValueError("extension does not match pairing")
             if request_id != str(session.mutation_plan["requestId"]):
                 raise ValueError("cleanup request does not match receiver run")
@@ -441,15 +531,16 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
             expected = browser_plan["targets"]
             if len(expected) != 1:
                 raise ValueError("cleanup plan must contain one control tab")
-            if (
-                control_tab_id != int(expected[0]["controlTabId"])
-                or control_window_id != int(expected[0]["controlWindowId"])
-            ):
+            if control_tab_id != int(
+                expected[0]["controlTabId"]
+            ) or control_window_id != int(expected[0]["controlWindowId"]):
                 raise ValueError("cleanup control tab does not match plan")
             if status not in {"closed", "skipped"}:
                 raise ValueError("cleanup result status is invalid")
         except (ValueError, TypeError, json.JSONDecodeError) as error:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)[:240]})
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)[:240]}
+            )
             return
 
         result = {
@@ -463,27 +554,32 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
         with session.lock:
             session.cleaned[browser] = result
             complete = session.expected_browsers.issubset(session.cleaned.keys())
-        self._send_json(HTTPStatus.OK, {
-            "ok": True,
-            "browser": browser,
-            "serverProof": protocol_proof(
-                pairing["secret"],
-                "cleanup-accepted",
-                browser,
-                pairing["extension_id"],
-                pairing["nonce"],
-                request_id,
-                targets_hash,
-                str(control_tab_id),
-                str(control_window_id),
-                status,
-                reason,
-            ),
-        })
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "browser": browser,
+                "serverProof": protocol_proof(
+                    pairing["secret"],
+                    "cleanup-accepted",
+                    browser,
+                    pairing["extension_id"],
+                    pairing["nonce"],
+                    request_id,
+                    targets_hash,
+                    str(control_tab_id),
+                    str(control_window_id),
+                    status,
+                    reason,
+                ),
+            },
+        )
         if complete:
             session.done.set()
 
-    def _authenticate_signed(self, purpose: str, *extra_parts: str) -> dict[str, Any] | None:
+    def _authenticate_signed(
+        self, purpose: str, *extra_parts: str
+    ) -> dict[str, Any] | None:
         browser = normalize_browser(self.headers.get("X-TabAtlas-Browser"))
         extension_id = self.headers.get("X-TabAtlas-Extension", "")
         nonce = self.headers.get("X-TabAtlas-Nonce", "")
@@ -569,160 +665,3 @@ class TabAtlasHandler(BaseHTTPRequestHandler):
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
-
-
-def pairing_code() -> str:
-    return "".join(secrets.choice(PAIRING_ALPHABET) for _ in range(8))
-
-
-def run_pairing(
-    database_path: Path,
-    state_dir: Path,
-    browser: str,
-    timeout_seconds: int,
-    announce: Callable[[str], None] | None = None,
-) -> tuple[bool, str, str | None]:
-    browser = normalize_browser(browser)
-    code = pairing_code()
-    session = ReceiverSession(
-        mode="pair",
-        database_path=database_path,
-        state_dir=state_dir,
-        expected_browsers={browser},
-        pairing_code=code,
-    )
-    completed = _run(
-        session,
-        timeout_seconds,
-        on_ready=(lambda: announce(code)) if announce else None,
-    )
-    return completed, code, session.paired_browser
-
-
-def run_capture(
-    database_path: Path,
-    state_dir: Path,
-    browsers: set[str],
-    timeout_seconds: int,
-) -> tuple[bool, dict[str, dict[str, Any]]]:
-    session = ReceiverSession(
-        mode="capture",
-        database_path=database_path,
-        state_dir=state_dir,
-        expected_browsers={normalize_browser(browser) for browser in browsers},
-    )
-    completed = _run(session, timeout_seconds)
-    return completed, session.captured
-
-
-def run_revocation(
-    database_path: Path,
-    state_dir: Path,
-    browser: str,
-    timeout_seconds: int,
-) -> bool:
-    session = ReceiverSession(
-        mode="revoke",
-        database_path=database_path,
-        state_dir=state_dir,
-        expected_browsers={normalize_browser(browser)},
-    )
-    return _run(session, timeout_seconds)
-
-
-def run_mutation(
-    database_path: Path,
-    state_dir: Path,
-    plan: dict[str, Any],
-    timeout_seconds: int,
-) -> tuple[bool, dict[str, dict[str, Any]]]:
-    expected = {
-        browser
-        for browser, browser_plan in plan.get("browsers", {}).items()
-        if browser_plan.get("targets")
-    }
-    if not expected:
-        return True, {}
-    require_mutation_protocol(database_path, expected)
-    session = ReceiverSession(
-        mode="mutate",
-        database_path=database_path,
-        state_dir=state_dir,
-        expected_browsers=expected,
-        request_id=str(plan["requestId"]),
-        mutation_plan=plan,
-    )
-    completed = _run(session, timeout_seconds)
-    return completed, session.mutated
-
-
-def run_archive_cleanup(
-    database_path: Path,
-    state_dir: Path,
-    plan: dict[str, Any],
-    timeout_seconds: int,
-) -> tuple[bool, dict[str, dict[str, Any]]]:
-    expected = {
-        browser
-        for browser, browser_plan in plan.get("browsers", {}).items()
-        if browser_plan.get("targets")
-    }
-    if not expected:
-        return True, {}
-    require_mutation_protocol(database_path, expected)
-    session = ReceiverSession(
-        mode="cleanup",
-        database_path=database_path,
-        state_dir=state_dir,
-        expected_browsers=expected,
-        request_id=str(plan["requestId"]),
-        mutation_plan=plan,
-    )
-    completed = _run(session, timeout_seconds)
-    return completed, session.cleaned
-
-
-def require_mutation_protocol(database_path: Path, browsers: set[str]) -> None:
-    expected = {normalize_browser(browser) for browser in browsers}
-    connection = connect(database_path)
-    try:
-        statuses = {
-            item["browser"]: item
-            for item in connection.execute(
-                "SELECT browser, enabled, protocol_version FROM pairings"
-            ).fetchall()
-        }
-    finally:
-        connection.close()
-    unsupported = [
-        browser
-        for browser in sorted(expected)
-        if browser not in statuses
-        or not bool(statuses[browser]["enabled"])
-        or int(statuses[browser]["protocol_version"]) < MUTATION_PROTOCOL_VERSION
-    ]
-    if unsupported:
-        names = ", ".join(browser.title() for browser in unsupported)
-        raise ValueError(
-            f"Tab-closing requires TabAtlas protocol {MUTATION_PROTOCOL_VERSION}. "
-            f"Reload the TabAtlas Bridge extension in {names}, then run refresh again."
-        )
-
-
-def _run(
-    session: ReceiverSession,
-    timeout_seconds: int,
-    on_ready: Callable[[], None] | None = None,
-) -> bool:
-    server = TabAtlasHTTPServer((HOST, PORT), TabAtlasHandler)
-    server.session = session
-    thread = threading.Thread(target=server.serve_forever, name="tab-atlas-receiver", daemon=True)
-    thread.start()
-    try:
-        if on_ready:
-            on_ready()
-        return session.done.wait(timeout_seconds)
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)

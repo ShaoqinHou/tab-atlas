@@ -1,231 +1,28 @@
-# TabAtlas
+# TabAtlas Workspace
 
-TabAtlas is a local, agent-operated workspace for turning large Chrome and
-Microsoft Edge tab sessions into a durable, searchable resource library. The
-user talks to Codex; this repository supplies deterministic browser capture,
-SQLite storage, organization, reporting, and audited close operations.
+The active project is [tab-atlas](tab-atlas/README.md).
 
-It is intentionally not a hosted app, embedded model runner, or background
-Windows service.
+TabAtlas is a local Codex-assisted library for turning large Chrome and Edge tab
+sessions into durable, searchable resources. Browser tabs are capture inputs;
+the private SQLite catalog is the long-term record. The browser extensions stay
+passive until the on-demand workspace asks them for a bounded capture.
 
-## What It Does
-
-- Captures tabs, windows, ordering, and browser tab groups without activating or
-  navigating content tabs.
-- Stages previously unseen canonical URLs as discoveries. Existing URLs update
-  live context without creating duplicate library entries.
-- Keeps accepted resources after their browser tabs close, including exact URLs,
-  provenance, concise summaries, previews, and last-known browser context.
-- Organizes the complete accepted library as Space -> Topic -> Focus, with
-  optional cross-cutting Project collections.
-- Provides a separate Source lens for platform, domain, owner, channel, and
-  community retrieval without replacing the purpose hierarchy.
-- Generates a local decision workspace with preview crops, brief and detailed
-  views, dense metadata previews when no image exists, search, browser-group
-  filters, discovery review, duplicate review, open tab review, and batched
-  infinite scrolling.
-- Can close exact duplicate extras or every reviewed captured tab through
-  separate authenticated, backed-up, post-verified operations.
-
-## Layout
-
-```text
-PROJECT_STATE.md       Canonical direction and current checkpoint
-tab-atlas/SKILL.md     Agent operating workflow
-tab-atlas/scripts/     Python standard-library CLI, catalog, and receiver
-tab-atlas/assets/      Manifest V3 extension and static report source
-tab-atlas/tests/       Focused behavior, protocol, and isolated-browser tests
-tab-atlas/state/       Private local database, captures, and previews (ignored)
-tab-atlas/report/      Generated private report (ignored)
-legacy/                Quarantined prior implementation (ignored)
-```
-
-## Use Through Codex
-
-The normal interface is conversation. Useful requests are:
-
-- `Refresh TabAtlas`
-- `Show me the new discoveries`
-- `Accept all new discoveries`
-- `Reconsider the library organization`
-- `Open the TabAtlas report`
-- `Close the exact duplicates`
-- `Archive my captured tabs`
-
-Codex translates those requests into the bounded workflow documented in
-`tab-atlas/SKILL.md`. New discoveries are reviewed before acceptance. After
-acceptance, Codex enriches and reconsiders them together with the existing
-library rather than classifying the new batch in isolation.
-
-## Direct Commands
-
-Python 3.11 or newer is sufficient for normal operation.
+Start here:
 
 ```powershell
 cd tab-atlas
-python scripts/tab_atlas.py status
-python scripts/tab_atlas.py refresh --browser all
-python scripts/tab_atlas.py discoveries
-python scripts/tab_atlas.py accept --all
-python scripts/tab_atlas.py enrich
-python scripts/tab_atlas.py report
-python scripts/tab_atlas.py view --open
+python scripts/tab_atlas.py workspace --open
 ```
 
-Selected discoveries can be accepted or dismissed by opaque resource ID.
-Dismissal is reversible:
+Project guidance lives with the code:
 
-```powershell
-python scripts/tab_atlas.py accept --resource-id <id>
-python scripts/tab_atlas.py dismiss --resource-id <id>
-python scripts/tab_atlas.py discoveries --state dismissed
-python scripts/tab_atlas.py accept --resource-id <id>
-```
+- [README.md](tab-atlas/README.md) explains use and the product model.
+- [AGENTS.md](tab-atlas/AGENTS.md) maps responsibilities and verification.
+- [SKILL.md](tab-atlas/SKILL.md) defines the Codex operating workflow.
+- [references](tab-atlas/references/) defines stable architecture, taxonomy, and
+  safety contracts.
 
-Accepted resources can be removed from the visible library without erasing their
-URL, annotations, provenance, or preview. Restore them with `accept`:
-
-```powershell
-python scripts/tab_atlas.py remove --resource-id <id>
-python scripts/tab_atlas.py discoveries --state dismissed
-python scripts/tab_atlas.py accept --resource-id <id>
-```
-
-Codex can attach a validated local JPEG, PNG, or WebP capture to a known resource:
-
-```powershell
-python scripts/tab_atlas.py register-preview --resource-id <id> path\to\capture.png
-python scripts/tab_atlas.py report
-```
-
-The generated report is `tab-atlas/report/index.html`. `view` regenerates it and
-serves it through a read-only `127.0.0.1` viewer until `Ctrl+C`. Use that viewer
-for all live video previews; the plain file remains the static fallback.
-
-## Browser Extension
-
-Prepare the stable unpacked directory once:
-
-```powershell
-python scripts/tab_atlas.py prepare-extension
-```
-
-Load `tab-atlas/state/extension` as an unpacked extension in Chrome and Edge,
-then pair each browser once:
-
-```powershell
-python scripts/tab_atlas.py pair --browser chrome
-python scripts/tab_atlas.py pair --browser edge
-```
-
-The extension has two explicit states:
-
-- **OFF**: no alarm, loopback request, or tab query.
-- **ON**: one low-cost 30-second alarm checks the fixed loopback receiver. Tabs
-  are read only when a one-shot authenticated command is waiting.
-
-The receiver records the protocol version reported by each authenticated worker.
-Older paired workers remain usable for read-only capture, but duplicate cleanup
-and archive commands require protocol 4 and fail before mutation with a precise
-reload instruction. After `prepare-extension` changes the unpacked source, click
-**Reload** once on TabAtlas Bridge in `chrome://extensions` and
-`edge://extensions`; restarting the browsers does not reliably refresh an
-already registered unpacked worker. The popup's **Build** row shows the code the
-browser actually loaded, for example `v0.4.2 / protocol 4`. If **Reload** leaves
-an older value active, toggle the TabAtlas Bridge extension-manager card off and
-on; do not confuse that manager control with the popup's passive-mode switch.
-
-The receiver is started on demand, binds only to `127.0.0.1`, and exits after the
-requested operation. Nothing is scheduled with Windows. A closed browser keeps
-its last trusted inventory; TabAtlas does not secretly launch or automate the
-normal browser profile.
-
-## Decision Workspace
-
-- **Home** provides one next action and the six purpose Spaces.
-- **Spaces** drill into Topic and Focus levels, with format, browser, and captured
-  group filters.
-- **Sources** groups the same resources by major platform. Reliable URL evidence
-  adds owner handles, repository owners, communities, and ordinary-site domains;
-  semantic topics remain available when publisher evidence is absent.
-- **Review** separates new discoveries, ambiguous accepted resources, exact
-  duplicates, and currently open tabs.
-- Resource cards show the smallest useful decision set: visual evidence where
-  available, cleaned title, concise brief, topic/focus signal, next action, and
-  open or stored state. Missing images become explicit metadata previews rather
-  than empty placeholders. The inspector exposes provenance and detail on demand.
-- Preview adapters select the decision-bearing object for each supported source:
-  a video frame for YouTube, attached image/video-poster/card media for an X post,
-  repository social art for GitHub, and attached post media for Reddit. The UI
-  names the evidence it is showing instead of presenting every image as a generic
-  screenshot.
-- Supported YouTube and public X video cards can play a muted live preview after
-  a short hover dwell or an explicit play-button click. Only one player exists at
-  a time, and it is discarded on pointer leave, scroll, Escape, page hide, or
-  replacement. Reduced-motion and data-saver settings disable hover autoplay but
-  leave the play button available.
-- Live previews stream from the provider only while active. TabAtlas does not
-  download video files into SQLite or the report; it retains a YouTube video ID
-  or an allowlisted public X MP4 URL alongside the cached poster.
-- Every resource exposes direct Open source and Copy link commands. More actions
-  can request an appropriate richer preview, semantic reconsideration, or
-  recoverable removal from the library. Private conversations, search results,
-  browser-internal pages, and local files do not offer misleading automatic
-  preview requests.
-- Discovery cards receive agent-written decision summaries and safe public video
-  thumbnails before acceptance, so review is not limited to raw tab titles.
-- The first 30 matching cards render immediately. More are appended as the user
-  scrolls, without a manual Show more control.
-
-Report commands download privacy-safe action requests containing opaque resource
-IDs, not source URLs. They do not mutate the database or browser directly; Codex
-validates and executes the corresponding CLI operation.
-
-## Safe Close Operations
-
-Exact duplicate cleanup retains one exact HTTPS URL in the same browser, window,
-and tab group. It excludes protected or changed tabs and proves the keeper
-remains after closure.
-
-```powershell
-python scripts/tab_atlas.py dedupe --browser all
-python scripts/tab_atlas.py dedupe --browser all --execute --approval "<bounded scope>"
-```
-
-Archive-all always blocks on pending discoveries. By default it also blocks on
-dismissed live resources. After the user explicitly reviews those dismissals,
-`--include-dismissed` closes them as audited discards while accepted resources
-remain in the durable library. The command verifies raw evidence and catalog
-integrity, creates an integrity-checked private backup, revalidates every tab
-immediately before closure, captures again, and requires every planned tab to be
-both reported closed and absent. A temporary extension-owned control tab keeps
-verification alive and is removed through a separate authenticated result.
-Any pre-existing TabAtlas popup tab is bound to the same fresh plan as an
-operational target, so the workflow does not leave its own setup page behind.
-If the control page is the browser's last tab, the extension briefly creates a
-blank handoff tab, submits and verifies the signed control-close result, and then
-removes the handoff. This prevents normal browser exit from killing the service
-worker before its final audit POST.
-
-```powershell
-python scripts/tab_atlas.py archive-tabs --browser all
-python scripts/tab_atlas.py archive-tabs --browser all --execute --approval "<bounded scope>"
-python scripts/tab_atlas.py archive-tabs --browser all --include-dismissed --execute --approval "<scope naming retained and discarded counts>"
-```
-
-## Verification
-
-```powershell
-cd tab-atlas
-python -m unittest discover -s tests -p "test_*.py"
-node --test tests/extension_protocol.test.mjs
-node tests/live_extension_e2e.mjs all archive
-node tests/live_extension_e2e.mjs all dedupe
-python -m py_compile scripts/tab_atlas.py scripts/tab_atlas_core.py scripts/tab_atlas_receiver.py
-node --check assets/extension/service_worker.js
-node --check assets/report/app.js
-```
-
-The live browser tests use disposable isolated profiles. Private snapshots, the
-SQLite database, generated reports, previews, pairing material, and quarantined
-legacy tree remain untracked.
+There is deliberately no manually maintained project-state ledger. Use git,
+tests, and the ignored local database for current facts. `legacy/`, generated
+reports, captures, previews, pairings, recordings, and database files are not
+authoritative instructions and must remain untracked.

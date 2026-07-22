@@ -12,11 +12,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "scripts"
-sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(ROOT))
 
-from tab_atlas_core import connect, generate_report, utc_now  # noqa: E402
-from tab_atlas_workspace import (  # noqa: E402
+from tabatlas import apply_annotations, connect, generate_report, save_pairing, utc_now  # noqa: E402
+from tabatlas.workspace import (  # noqa: E402
     ConflictError,
     add_audio_transcript,
     agent_request_detail,
@@ -34,14 +33,16 @@ from tab_atlas_workspace import (  # noqa: E402
     proposal_is_current,
     queued_audio_transcriptions,
     reject_semantic_proposal,
+    recover_agent_requests,
     set_note_active,
     undo_semantic_audit,
     update_action_progress,
     workspace_directory_summaries,
 )
-import tab_atlas_workspace_server as workspace_server_module  # noqa: E402
-from tab_atlas_workspace_server import (  # noqa: E402
-    _workspace_agent_context,
+import tabatlas.workspace.runtime as workspace_server_module  # noqa: E402
+from tabatlas.workspace.context import _workspace_agent_context  # noqa: E402
+from tabatlas.workspace.browser_sync import BrowserSyncCoordinator  # noqa: E402
+from tabatlas.workspace import (  # noqa: E402
     create_workspace_server,
 )
 
@@ -164,7 +165,9 @@ class WorkspaceDataTests(unittest.TestCase):
         self.assertEqual(first["id"], second["id"])
         self.assertEqual(note_detail(self.connection, first["id"])["text"], text)
         self.assertEqual(
-            self.connection.execute("SELECT COUNT(*) FROM resource_notes").fetchone()[0],
+            self.connection.execute("SELECT COUNT(*) FROM resource_notes").fetchone()[
+                0
+            ],
             1,
         )
         with self.assertRaises(ConflictError):
@@ -192,7 +195,9 @@ class WorkspaceDataTests(unittest.TestCase):
             1500,
             "audio-idempotency-01",
         )
-        self.assertTrue((self.state / "notes" / "audio" / f"{note['id']}.wav").is_file())
+        self.assertTrue(
+            (self.state / "notes" / "audio" / f"{note['id']}.wav").is_file()
+        )
         self.assertEqual(note["processing"]["transcription"]["state"], "queued")
         add_audio_transcript(
             self.connection,
@@ -228,7 +233,9 @@ class WorkspaceDataTests(unittest.TestCase):
                 "audio-idempotency-02",
             )
 
-    def test_retract_note_keeps_evidence_and_cancels_queued_interpretation(self) -> None:
+    def test_retract_note_keeps_evidence_and_cancels_queued_interpretation(
+        self,
+    ) -> None:
         note = create_text_note(
             self.connection,
             RESOURCE_ID,
@@ -276,12 +283,16 @@ class WorkspaceDataTests(unittest.TestCase):
         )
         proposal_id = completed["proposalId"]
         self.assertEqual(
-            self.connection.execute("SELECT COUNT(*) FROM resource_collections").fetchone()[0],
+            self.connection.execute(
+                "SELECT COUNT(*) FROM resource_collections"
+            ).fetchone()[0],
             0,
         )
         self.assertTrue(proposal_is_current(self.connection, proposal_id))
         self.assertEqual(
-            self.connection.execute("SELECT COUNT(*) FROM semantic_decisions").fetchone()[0],
+            self.connection.execute(
+                "SELECT COUNT(*) FROM semantic_decisions"
+            ).fetchone()[0],
             0,
         )
         decision = apply_semantic_proposal(
@@ -301,8 +312,12 @@ class WorkspaceDataTests(unittest.TestCase):
                 (RESOURCE_ID,),
             )
         }
-        self.assertEqual(names, {"Understand AI Models", "Models & Evaluation", "Must Watch"})
-        self.assertFalse(note_detail(self.connection, note["id"])["analysis"]["inputCurrent"])
+        self.assertEqual(
+            names, {"Understand AI Models", "Models & Evaluation", "Must Watch"}
+        )
+        self.assertFalse(
+            note_detail(self.connection, note["id"])["analysis"]["inputCurrent"]
+        )
         directories = workspace_directory_summaries(self.connection)
         self.assertEqual(directories["spaces"][0]["name"], "Understand AI Models")
         self.assertEqual(directories["spaces"][0]["resourceIds"], [RESOURCE_ID])
@@ -313,9 +328,72 @@ class WorkspaceDataTests(unittest.TestCase):
 
         undo_semantic_audit(self.connection, decision["auditId"])
         self.assertEqual(
-            self.connection.execute("SELECT COUNT(*) FROM resource_collections").fetchone()[0],
+            self.connection.execute(
+                "SELECT COUNT(*) FROM resource_collections"
+            ).fetchone()[0],
             0,
         )
+
+    def test_direct_organization_write_invalidates_an_older_proposal(self) -> None:
+        note = create_text_note(
+            self.connection,
+            RESOURCE_ID,
+            "Use this as a mathematics learning resource.",
+            "direct-write-note-0001",
+        )
+        request_id = create_note_analysis_request(
+            self.connection,
+            note["id"],
+            "direct-write-analysis-0001",
+        )["id"]
+        mark_agent_request_running(self.connection, request_id)
+        completed = complete_agent_request(
+            self.connection,
+            request_id,
+            agent_response(),
+            "00000000-0000-0000-0000-000000000002",
+            "gpt-test",
+        )
+        self.assertTrue(proposal_is_current(self.connection, completed["proposalId"]))
+
+        apply_annotations(
+            self.connection,
+            [
+                {
+                    "resourceId": RESOURCE_ID,
+                    "replaceCollections": True,
+                    "collections": [{"name": "Reference", "kind": "space"}],
+                }
+            ],
+        )
+
+        self.assertFalse(proposal_is_current(self.connection, completed["proposalId"]))
+        revision = self.connection.execute(
+            "SELECT semantic_revision FROM resources WHERE id=?",
+            (RESOURCE_ID,),
+        ).fetchone()[0]
+        self.assertEqual(revision, 1)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM semantic_audits WHERE proposal_id IS NULL"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_running_agent_request_is_recovered_after_restart(self) -> None:
+        request = create_workspace_chat_request(
+            self.connection, "Find this resource", RESOURCE_ID
+        )
+        mark_agent_request_running(self.connection, request["id"])
+
+        recovered = recover_agent_requests(self.connection)
+
+        self.assertEqual([item["id"] for item in recovered], [request["id"]])
+        row = self.connection.execute(
+            "SELECT status, started_at, error_code FROM agent_requests WHERE id=?",
+            (request["id"],),
+        ).fetchone()
+        self.assertEqual(tuple(row), ("queued", None, "recovered_after_restart"))
 
     def test_action_progress_is_audited_idempotent_and_undoable(self) -> None:
         note = create_text_note(
@@ -405,7 +483,9 @@ class WorkspaceDataTests(unittest.TestCase):
         )
         self.assertTrue(proposal_is_current(self.connection, completed["proposalId"]))
         self.assertEqual(
-            self.connection.execute("SELECT COUNT(*) FROM semantic_decisions").fetchone()[0],
+            self.connection.execute(
+                "SELECT COUNT(*) FROM semantic_decisions"
+            ).fetchone()[0],
             0,
         )
         rejected = reject_semantic_proposal(
@@ -416,7 +496,9 @@ class WorkspaceDataTests(unittest.TestCase):
         )
         self.assertEqual(rejected["decision"], "rejected")
         self.assertEqual(
-            self.connection.execute("SELECT COUNT(*) FROM resource_collections").fetchone()[0],
+            self.connection.execute(
+                "SELECT COUNT(*) FROM resource_collections"
+            ).fetchone()[0],
             0,
         )
 
@@ -424,7 +506,11 @@ class WorkspaceDataTests(unittest.TestCase):
         now = utc_now()
         for number in range(1, 31):
             resource_id = "res_" + format(number, "024x")
-            title = "Linear algebra visual course" if number == 17 else f"Unrelated item {number}"
+            title = (
+                "Linear algebra visual course"
+                if number == 17
+                else f"Unrelated item {number}"
+            )
             self.connection.execute(
                 """
                 INSERT INTO resources(
@@ -437,9 +523,13 @@ class WorkspaceDataTests(unittest.TestCase):
         self.connection.commit()
         context = _workspace_agent_context(self.connection, None, "find linear algebra")
         self.assertEqual(len(context["resourceIndex"]), 1)
-        self.assertEqual(context["resourceIndex"][0]["title"], "Linear algebra visual course")
+        self.assertEqual(
+            context["resourceIndex"][0]["title"], "Linear algebra visual course"
+        )
         self.assertEqual(context["libraryResourceCount"], 31)
-        broad = _workspace_agent_context(self.connection, None, "help organize my library")
+        broad = _workspace_agent_context(
+            self.connection, None, "help organize my library"
+        )
         self.assertEqual(broad["resourceIndex"], [])
 
     def test_newer_note_makes_older_proposal_stale(self) -> None:
@@ -468,7 +558,9 @@ class WorkspaceDataTests(unittest.TestCase):
             "This is not relevant to my work.",
             "note-idempotency-0004",
         )
-        self.assertFalse(agent_request_detail(self.connection, request_id)["proposalCurrent"])
+        self.assertFalse(
+            agent_request_detail(self.connection, request_id)["proposalCurrent"]
+        )
         with self.assertRaises(ConflictError):
             apply_semantic_proposal(
                 self.connection,
@@ -488,7 +580,10 @@ class WorkspaceDataTests(unittest.TestCase):
             1500,
             "audio-idempotency-queue-01",
         )
-        self.assertEqual([item["id"] for item in queued_audio_transcriptions(self.connection)], [note["id"]])
+        self.assertEqual(
+            [item["id"] for item in queued_audio_transcriptions(self.connection)],
+            [note["id"]],
+        )
         running = mark_audio_transcription_running(self.connection, note["id"])
         self.assertEqual(running["processing"]["transcription"]["state"], "running")
         completed = complete_audio_transcription(
@@ -498,10 +593,14 @@ class WorkspaceDataTests(unittest.TestCase):
             "openai/whisper-base",
         )
         self.assertEqual(completed["processing"]["transcription"]["state"], "succeeded")
-        self.assertEqual(completed["processing"]["interpretation"]["state"], "not_required")
+        self.assertEqual(
+            completed["processing"]["interpretation"]["state"], "not_required"
+        )
         self.assertEqual(queued_audio_transcriptions(self.connection), [])
         self.assertEqual(
-            self.connection.execute("SELECT COUNT(*) FROM agent_requests").fetchone()[0],
+            self.connection.execute("SELECT COUNT(*) FROM agent_requests").fetchone()[
+                0
+            ],
             0,
         )
 
@@ -601,9 +700,7 @@ class WorkspaceDataTests(unittest.TestCase):
         self.assertFalse(proposal_is_current(self.connection, completed["proposalId"]))
 
     def test_schema_upgrade_creates_integrity_checked_backup(self) -> None:
-        self.connection.execute(
-            "UPDATE meta SET value='8' WHERE key='schema_version'"
-        )
+        self.connection.execute("UPDATE meta SET value='8' WHERE key='schema_version'")
         self.connection.commit()
         self.connection.close()
         self.connection = connect(self.database)
@@ -613,9 +710,108 @@ class WorkspaceDataTests(unittest.TestCase):
         self.assertEqual(len(manifests), 1)
         backup = sqlite3.connect(backups[0])
         try:
-            self.assertEqual(backup.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(
+                backup.execute("PRAGMA integrity_check").fetchone()[0], "ok"
+            )
         finally:
             backup.close()
+
+
+class BrowserSyncCoordinatorTests(unittest.TestCase):
+    def test_sync_is_serialized_and_reports_aggregate_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            database = state / "atlas.sqlite"
+            connection = connect(database)
+            save_pairing(connection, "chrome", "a" * 32, "secret")
+            connection.close()
+            started = threading.Event()
+            release = threading.Event()
+            published = []
+
+            def capture_runner(_database, _state, browsers, _timeout):
+                self.assertEqual(browsers, {"chrome"})
+                started.set()
+                self.assertTrue(release.wait(2))
+                return True, {
+                    "chrome": {
+                        "tab_count": 12,
+                        "resource_count": 10,
+                        "candidate_resource_count": 3,
+                    }
+                }
+
+            coordinator = BrowserSyncCoordinator(
+                database,
+                state,
+                lambda: published.append(True),
+                capture_runner=capture_runner,
+                timeout_seconds=1,
+            )
+            first = coordinator.start(("chrome",), trigger="user")
+            self.assertTrue(started.wait(1))
+            second = coordinator.start(("chrome",), trigger="user")
+            self.assertEqual(first["id"], second["id"])
+            self.assertTrue(second["reused"])
+            release.set()
+            deadline = time.monotonic() + 2
+            while coordinator.status()["phase"] not in {"complete", "failed"}:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            status = coordinator.status()
+            self.assertEqual(status["phase"], "complete")
+            self.assertEqual(status["browsers"]["chrome"]["tabs"], 12)
+            self.assertEqual(status["newResources"], 3)
+            self.assertEqual(published, [True])
+
+    def test_unpaired_browser_fails_without_starting_a_receiver(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            database = state / "atlas.sqlite"
+            connection = connect(database)
+            connection.close()
+            coordinator = BrowserSyncCoordinator(database, state, lambda: None)
+
+            result = coordinator.start(("edge",), trigger="user")
+
+            self.assertEqual(result["phase"], "failed")
+            self.assertEqual(result["browsers"]["edge"]["state"], "unavailable")
+
+    def test_unpaired_requested_browser_makes_a_successful_capture_partial(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            database = state / "atlas.sqlite"
+            connection = connect(database)
+            save_pairing(connection, "chrome", "a" * 32, "secret")
+            connection.close()
+
+            coordinator = BrowserSyncCoordinator(
+                database,
+                state,
+                lambda: None,
+                capture_runner=lambda *_args: (
+                    True,
+                    {
+                        "chrome": {
+                            "tab_count": 1,
+                            "resource_count": 1,
+                            "candidate_resource_count": 0,
+                        }
+                    },
+                ),
+            )
+            coordinator.start(("chrome", "edge"))
+            deadline = time.monotonic() + 2
+            while coordinator.status()["phase"] not in {"partial", "failed"}:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+
+            status = coordinator.status()
+            self.assertEqual(status["phase"], "partial")
+            self.assertEqual(status["browsers"]["chrome"]["state"], "captured")
+            self.assertEqual(status["browsers"]["edge"]["state"], "unavailable")
 
 
 class WorkspaceServerTests(unittest.TestCase):
@@ -642,7 +838,13 @@ class WorkspaceServerTests(unittest.TestCase):
                 "model": "test-whisper",
             }
             try:
-                wav = b"RIFF" + (36).to_bytes(4, "little") + b"WAVE" + b"fmt " + b"\x00" * 24
+                wav = (
+                    b"RIFF"
+                    + (36).to_bytes(4, "little")
+                    + b"WAVE"
+                    + b"fmt "
+                    + b"\x00" * 24
+                )
                 with server.database() as connection:
                     note = create_audio_note(
                         connection,
@@ -728,7 +930,9 @@ class WorkspaceServerTests(unittest.TestCase):
             server.agent_handed_off = True
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
-            client = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+            client = http.client.HTTPConnection(
+                "127.0.0.1", server.server_port, timeout=10
+            )
             try:
                 client.request(
                     "GET",
@@ -748,6 +952,28 @@ class WorkspaceServerTests(unittest.TestCase):
                 response = client.getresponse()
                 session = json.loads(response.read())
                 self.assertEqual(response.status, 200)
+                self.assertEqual(session["browserSync"]["phase"], "idle")
+
+                client.request(
+                    "GET",
+                    "/api/v1/catalog",
+                    headers={"Host": server.expected_host, "Cookie": cookie},
+                )
+                response = client.getresponse()
+                catalog = json.loads(response.read())
+                self.assertEqual(response.status, 200)
+                self.assertEqual(catalog["contractVersion"], 1)
+                self.assertRegex(catalog["revision"], r"^[0-9a-f]{24}$")
+
+                client.request(
+                    "GET",
+                    "/api/v1/browser-sync",
+                    headers={"Host": server.expected_host, "Cookie": cookie},
+                )
+                response = client.getresponse()
+                sync_status = json.loads(response.read())
+                self.assertEqual(response.status, 200)
+                self.assertEqual(sync_status["phase"], "idle")
 
                 decision_headers = {
                     "Host": server.expected_host,
@@ -757,27 +983,63 @@ class WorkspaceServerTests(unittest.TestCase):
                     "Idempotency-Key": "server-idempotency-accept-discovery-01",
                     "Content-Type": "application/json",
                 }
-                decision_body = json.dumps({"resourceIds": [CANDIDATE_ID]}).encode("utf-8")
+                sync_body = json.dumps({"browsers": ["chrome"]}).encode("utf-8")
+                decision_headers["Content-Length"] = str(len(sync_body))
+                client.request(
+                    "POST", "/api/v1/browser-sync", sync_body, decision_headers
+                )
+                response = client.getresponse()
+                sync_result = json.loads(response.read())
+                self.assertEqual(response.status, 202, sync_result)
+                self.assertEqual(sync_result["phase"], "failed")
+                self.assertEqual(
+                    sync_result["browsers"]["chrome"]["state"], "unavailable"
+                )
+
+                decision_body = json.dumps({"resourceIds": [CANDIDATE_ID]}).encode(
+                    "utf-8"
+                )
                 decision_headers["Content-Length"] = str(len(decision_body))
-                client.request("POST", "/api/v1/discoveries/accept", decision_body, decision_headers)
+                client.request(
+                    "POST",
+                    "/api/v1/discoveries/accept",
+                    decision_body,
+                    decision_headers,
+                )
                 response = client.getresponse()
                 accepted = json.loads(response.read())
                 self.assertEqual(response.status, 200, accepted)
                 self.assertEqual(accepted["state"], "accepted")
                 self.assertEqual(accepted["updated"], 1)
 
-                decision_body = json.dumps({"resourceIds": [DISMISSED_ID]}).encode("utf-8")
+                decision_body = json.dumps({"resourceIds": [DISMISSED_ID]}).encode(
+                    "utf-8"
+                )
                 decision_headers["Content-Length"] = str(len(decision_body))
-                decision_headers["Idempotency-Key"] = "server-idempotency-dismiss-discovery-01"
-                client.request("POST", "/api/v1/discoveries/dismiss", decision_body, decision_headers)
+                decision_headers["Idempotency-Key"] = (
+                    "server-idempotency-dismiss-discovery-01"
+                )
+                client.request(
+                    "POST",
+                    "/api/v1/discoveries/dismiss",
+                    decision_body,
+                    decision_headers,
+                )
                 response = client.getresponse()
                 dismissed = json.loads(response.read())
                 self.assertEqual(response.status, 200, dismissed)
                 self.assertEqual(dismissed["state"], "dismissed")
                 self.assertEqual(dismissed["updated"], 1)
 
-                decision_headers["Idempotency-Key"] = "server-idempotency-restore-discovery-01"
-                client.request("POST", "/api/v1/discoveries/accept", decision_body, decision_headers)
+                decision_headers["Idempotency-Key"] = (
+                    "server-idempotency-restore-discovery-01"
+                )
+                client.request(
+                    "POST",
+                    "/api/v1/discoveries/accept",
+                    decision_body,
+                    decision_headers,
+                )
                 response = client.getresponse()
                 restored = json.loads(response.read())
                 self.assertEqual(response.status, 200, restored)
@@ -794,20 +1056,26 @@ class WorkspaceServerTests(unittest.TestCase):
                     "Content-Type": "application/json",
                     "Content-Length": str(len(body)),
                 }
-                client.request("POST", f"/api/v1/resources/{RESOURCE_ID}/notes", body, headers)
+                client.request(
+                    "POST", f"/api/v1/resources/{RESOURCE_ID}/notes", body, headers
+                )
                 response = client.getresponse()
                 response.read()
                 self.assertEqual(response.status, 403)
 
                 headers["Origin"] = server.origin
                 headers["X-TabAtlas-CSRF"] = "wrong"
-                client.request("POST", f"/api/v1/resources/{RESOURCE_ID}/notes", body, headers)
+                client.request(
+                    "POST", f"/api/v1/resources/{RESOURCE_ID}/notes", body, headers
+                )
                 response = client.getresponse()
                 response.read()
                 self.assertEqual(response.status, 403)
 
                 headers["X-TabAtlas-CSRF"] = session["csrfToken"]
-                client.request("POST", f"/api/v1/resources/{RESOURCE_ID}/notes", body, headers)
+                client.request(
+                    "POST", f"/api/v1/resources/{RESOURCE_ID}/notes", body, headers
+                )
                 response = client.getresponse()
                 document = json.loads(response.read())
                 self.assertEqual(response.status, 201)

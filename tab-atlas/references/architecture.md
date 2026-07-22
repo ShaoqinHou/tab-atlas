@@ -2,149 +2,207 @@
 
 ## Product Boundary
 
-The user can operate TabAtlas through Codex or through one on-demand local
-workspace. The workspace owns durable state and deterministic mutations. A
-dedicated Codex task is an optional interpretation and navigation layer; it is
-not the database and does not apply changes directly.
+TabAtlas is one on-demand local workspace backed by a private SQLite catalog.
+It is not a hosted service, a continuously running browser monitor, or a second
+general-purpose chat client.
 
 ```text
 Chrome / Edge extension
         |
-        | authenticated loopback command
+        | authenticated bounded command
         v
-one-shot receiver -> raw capture -> SQLite catalog -> on-demand workspace
-                                      |-- staged discoveries
-                                      |-- durable accepted library
-                                      |-- authoritative user notes
-                                      |-- audited proposals and undo
-                                      |-- action lists and progress
-                                      `-- generated read-only report
+loopback receiver -> capture -> SQLite catalog -> workspace
+                                      |              |
+                                      |              `-> reviewed writes
+                                      `-> generated read-only report
+
+Codex task <-> bounded context and inert proposals <-> workspace
 ```
 
-The ongoing cycle is:
+Responsibilities are separate:
+
+- The extension observes tabs and executes separately approved browser
+  mutations.
+- The workspace owns durable state, review, notes, organization, progress, and
+  audits.
+- Codex interprets bounded evidence and proposes actions; it is not the database
+  and cannot mutate browser state through a suggestion.
+- The generated report is a replaceable projection and offline fallback.
+
+## Runtime Lifecycle
+
+`workspace` starts one authenticated loopback server and automatically requests
+one serialized sync from paired, enabled Chrome and Edge extensions. The current
+catalog remains available while that sync is starting, waiting, importing, and
+republishing. **Sync now** invokes the same coordinator for tabs opened later.
+
+Only one sync may run at a time. Concurrent requests join or report the current
+job instead of starting competing receivers. Status exposes aggregate progress
+and browser outcomes, never private tab content.
+
+This is event-on-demand, not continuous collection. Workspace startup and an
+explicit Sync now action are the events. The extension alarm merely checks for a
+waiting loopback command; it does not stream browser state. A closed or
+unavailable browser leaves its last trusted catalog observations intact.
+
+The workspace, receiver, and optional Codex child are not scheduled and do not
+start with Windows. They stop with the interactive session. TabAtlas does not
+launch, copy, or remote-debug the user's normal browser profile.
+
+## Extension And Receiver
+
+One Manifest V3 extension package is loaded separately in Chrome and Edge.
+
+- `OFF`: clear the alarm; perform no loopback check and no tab query.
+- `ON`: perform one low-frequency loopback check. Query windows, groups, and
+  tabs only after an authenticated bounded command is available.
+- Register no tab, window, or group change listeners for continuous capture.
+
+The receiver binds only to `127.0.0.1`, validates payload shape and size, and
+uses nonce-bound proofs for pairing, command, snapshot, result, and cleanup
+messages. Raw evidence is written atomically before import.
+
+Read-only capture must not focus, navigate, move, regroup, or close tabs. Pairing
+authorizes communication, not mutation. Mutation requires its own fresh plan and
+approval.
+
+## Catalog Model
+
+SQLite is the sole durable authority. Keep these concepts distinct:
+
+1. A **capture** records browser, window, group, order, title, exact URL, and tab
+   state at one trusted observation.
+2. A **candidate** is a previously unseen canonical resource awaiting review.
+3. An **accepted resource** is a durable library entry that survives tab closure.
+4. A **dismissed resource** is a reviewed rejection retained for recovery,
+   deduplication, and close safety but excluded from normal library queries.
+
+Canonical identity prevents repeated discoveries. A later observation of a
+known resource updates provenance and live context without creating another
+semantic record. Capture never silently promotes a candidate. Accept, Dismiss,
+Restore, and Remove are catalog decisions and do not mutate browser tabs.
+
+The report and workspace read models are derived from one versioned catalog
+snapshot. Regeneration may replace the report atomically; it must never become a
+second source of truth.
+
+## Organization And Authority
+
+One resource has at most one primary purpose path:
 
 ```text
-refresh -> review discoveries -> accept or dismiss -> enrich and reconsider
-        -> annotate or ask Codex -> optionally run a verified archive
+Space -> optional Topic -> optional Focus
 ```
 
-The authority, agent, voice, and interaction contracts are defined in
-`references/interaction-architecture.md`.
+Projects and Action Lists are orthogonal many-to-many overlays. Source,
+platform, owner, channel, domain, browser, and captured group are facets. They do
+not replace the purpose hierarchy.
 
-## Browser Extension And Receiver
+Organization evidence uses this precedence:
 
-Use one Manifest V3 extension package in Chrome and Edge.
+1. Direct user locks, exclusions, and progress decisions.
+2. The user's active note and stored interpretation.
+3. Previously accepted stable organization.
+4. Codex inference from bounded page evidence.
+5. Metadata, source, and browser-group heuristics.
 
-- `OFF`: clear the polling alarm; do not query tabs or contact the receiver.
-- `ON`: use one low-frequency alarm to check the loopback receiver. Read windows,
-  tabs, and groups only after an authenticated bounded command is available.
-- Register no tab, window, or group change listeners.
-- Keep permissions limited to alarms, storage, tabs, tab groups, and loopback.
+The complete accepted library may be reconsidered after new acceptance reveals
+a clearer grouping. Stable high-confidence memberships should not churn without
+new evidence. Weakly evidenced resources remain in Inbox.
 
-The receiver is not scheduled and does not start with Windows. A CLI operation
-owns its lifetime. Bind only to `127.0.0.1`, validate size and schema, and use
-nonce-bound HMAC proofs for receiver identity, commands, snapshots, results, and
-cleanup. Write raw snapshots atomically before importing them.
+## Notes, Voice, And Codex
 
-Ordinary capture does not focus, navigate, group, move, or close tabs. It works
-with paired extensions in browsers that are already running. Automatic launch of
-normal browser profiles is not part of the implemented capture path.
+The original typed note or recording is immutable local evidence. Editing
+creates a successor. Voice is saved before processing, transcribed by a
+short-lived local worker, and remains available if transcription fails. Audio is
+not sent to Codex.
 
-## Catalog State
+The user's note outranks metadata. Saving a note does not start a model turn.
+After an explicit review request, the workspace sends a bounded transcript and
+resource context to a dedicated Codex task using the user's existing sign-in.
+No API key is collected by TabAtlas.
 
-Keep three concepts separate:
+Codex output is schema-constrained and may contain:
 
-1. A live observation preserves browser, window, group, order, title, exact URL,
-   and tab state for a specific capture.
-2. A staged discovery is a newly observed canonical resource awaiting accept or
-   dismiss.
-3. An accepted resource is a durable library record that survives tab closure.
+- a concise interpretation;
+- one proposed primary hierarchy path;
+- optional Project or Action List changes;
+- an optional declarative navigation command.
 
-Canonical identity prevents a known resource from being staged again. A later
-capture updates its observations and provenance. Dismissed resources remain
-outside the accepted library, remain recoverable in their own Review mode, and
-remain visible to safety checks while open. Candidate and dismissed rows live in
-the same private SQLite database for crash recovery, but library queries exclude
-them. Accept, Dismiss, and Restore are local catalog decisions; none is a browser
-mutation.
+The workspace validates the result. A proposal remains inert until accepted,
+must match the current semantic revision, records before and after state, and is
+undoable. A changed note or transcript makes an older proposal stale. Agent
+navigation is declarative and visible; Codex does not control the DOM or simulate
+rapid clicks.
 
-Semantic organization uses **Space -> Topic -> Focus**. A Project is a
-cross-cutting overlay and does not replace this hierarchy. Codex should
-periodically reconsider the accepted library as a whole when new accepted
-resources reveal a better grouping; stable high-confidence memberships should
-not churn without evidence.
+The workspace holds single ownership of its dedicated Codex task. Explicit
+handoff to Codex desktop stops the local child first; reclaim resumes workspace
+ownership. Queued requests stay in SQLite. No heartbeat or background model turn
+is used.
 
 ## Presentation
 
-Generate a self-contained local HTML report as a read-only export. The on-demand
-workspace serves the same presentation with authenticated local write APIs. It
-supports discovery review,
-purpose-first navigation, hierarchy filters, Project overlays, global search,
-and progressive resource detail. Resource lists append in bounded batches through
-infinite scrolling so large libraries remain responsive. Browser groups preserve
-working context and tab order but remain secondary filters.
+The workspace has three primary destinations:
 
-Presentation evidence has three layers:
+- **Home** for continuation, Projects, Action Lists, and purpose Spaces.
+- **Library** for Purpose and Source lenses over durable resources.
+- **Review** for candidates, uncertain resources, duplicates, dismissed items,
+  and currently captured tabs.
 
-1. Deterministic local signals for source, format, intent, duplicates, groups,
-   and safe previews.
-2. Codex annotations for concise summaries, decision context, and next actions.
-3. Selective source inspection when the first two layers cannot support a useful
-   decision.
+Cards show the smallest useful decision set. The inspector reveals notes,
+interpretation, hierarchy, actions, provenance, and detailed evidence on demand.
+Lists render in bounded batches and append on scroll.
 
-Cache only allowlisted public preview images during explicit enrichment. Do not
-crawl arbitrary URLs, access authenticated pages, or load remote media when the
-report opens. The optional loopback viewer is read-only and starts only for an
-interactive session. A supported video loads remotely only after a short hover
-dwell or explicit play action; one active player is torn down on leave, scroll,
-Escape, page hide, or replacement. Video bytes are never persisted.
+Preview acquisition is explicit and allowlisted. Public image adapters may cache
+decision-bearing thumbnails or posters. Remote video is loaded only for the one
+resource being interacted with and is never persisted. Private, authenticated,
+internal, local, and weakly evidenced pages remain metadata-only unless an
+appropriate local capture is deliberately registered.
 
-### Preview selection matrix
+## Browser Mutations
 
-| Resource type | Default card evidence | Richer evidence policy |
-| --- | --- | --- |
-| YouTube video | Public video thumbnail | Cache the allowlisted image; derive a privacy-enhanced live embed from its video ID on interaction |
-| X status | Post metadata | Cache attached post image, video/GIF poster, or card image; retain only a strictly allowlisted public MP4 URL for interaction; reject avatars |
-| GitHub repository/page | Repository metadata | Cache an allowlisted GitHub social image |
-| Reddit post | Post metadata | Cache allowlisted attached post media when exposed |
-| PDF | Document metadata | Render or capture the first useful page on demand |
-| Public article/docs | Page metadata | Capture on demand in an isolated or user-authorized context |
-| Private conversation | Private summary | No automatic remote capture |
-| Search/browser-internal/local page | Contextual metadata | No automatic remote capture |
+Exact-duplicate cleanup and archive-all are separate protocols. Approval for one
+never authorizes the other. Each requires:
 
-An agent-supplied local capture has higher precedence than every automatic
-adapter, including during a refresh. Adapter failure is a normal metadata-only
-result; generic branding, profile pictures, or unrelated fallback imagery must
-not be substituted merely to increase image coverage.
+1. A fresh trusted capture bound to the requested browsers.
+2. A deterministic target plan and bounded approval.
+3. Extension-side revalidation of tab ID, exact URL hash, window, and group.
+4. Authenticated per-target results.
+5. A real newer post-action capture proving planned closures are absent.
+6. Private retained audit evidence.
 
-## Mutation Protocols
+Archive-all additionally requires zero candidates, catalog integrity, durable
+accepted records, raw evidence, and an integrity-checked private database backup.
+Dismissed live resources block closure by default. They can be included only
+after explicit review with `--include-dismissed` and an approval whose scope
+names retained and discarded targets. They remain dismissed and are audited as
+discards.
 
-Exact-duplicate cleanup and archive-all are distinct one-shot protocols. Each
-requires its own bounded approval, fresh capture, authenticated target plan,
-extension-side revalidation, post-action capture, and private audit.
+A failure preserves evidence and reports the operation incomplete. Process exit,
+browser disappearance, or stale inventory is not proof of closure.
 
-Archive-all adds stronger durability and completeness checks:
+## Implementation Boundaries
 
-1. Capture the requested running browsers immediately before planning and bind
-   the plan to the exact capture IDs returned by that receiver run. Receiver
-   arrival order, rather than the browser's wall clock, defines current state.
-2. Block if any live resource is pending review or was dismissed.
-3. Verify catalog integrity, raw capture evidence, accepted resource records, and
-   an integrity-checked private database backup.
-4. Bind every target to its tab ID, exact URL hash, window, and group.
-5. Create one temporary pinned inactive extension control tab per affected browser.
-6. Revalidate each target in the extension immediately before closing it.
-7. Capture again and require a real newer trusted capture in which every target
-   is both reported closed and absent.
-8. Remove the control tab before submitting its authenticated cleanup result, and
-   retain the actual outcome in ignored audit evidence.
+The package dependency direction is:
 
-The accepted library remains available after successful closure. A failure stops
-the protocol and preserves its evidence; it does not silently claim completion.
+```text
+primitives -> database/stores -> domain services -> read models
+           -> workspace/report transports -> command line
+```
+
+Domain invariants belong in cohesive services, not HTTP handlers, CLI branches,
+or the root package. SQLite writes use transactions. External contracts use
+structured JSON with explicit validation. Generated files and private runtime
+state are not source modules.
+
+See `AGENTS.md` for the concrete module map and change locations.
 
 ## Test Boundary
 
-Browser end-to-end tests use bundled Chromium or isolated disposable Chrome and
-Edge profiles with test data. They must not read, mutate, launch, or close the
-user's normal browser profiles. Production captures use the installed, paired
-extension only when the user asks the agent to operate TabAtlas.
+Unit and integration tests use temporary databases. Browser end-to-end tests use
+bundled Chromium or isolated disposable Chrome and Edge profiles. Tests must not
+read, launch, automate, or mutate the user's normal browser profiles.
+
+Tests should protect named behavior, persistence, protocol, privacy, and
+mutation-safety invariants. Historical test counts and release milestones are
+not architecture.

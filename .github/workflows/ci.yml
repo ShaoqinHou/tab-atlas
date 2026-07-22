@@ -25,6 +25,7 @@ jobs:
       - run: python -m ruff format --check tabatlas scripts tests
       - run: python -m ruff check tabatlas scripts tests
       - run: python -m compileall -q tabatlas scripts
+      - run: python scripts/check_repository_hygiene.py
       - run: python -m unittest discover -s tests -p "test_*.py"
       - run: node --test tests/extension_protocol.test.mjs
       - run: find assets/extension assets/report -name '*.js' -print0 | xargs -0 -n1 node --check

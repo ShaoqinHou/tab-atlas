@@ -17,12 +17,13 @@ python scripts/tab_atlas.py workspace --open
 Project guidance lives with the code:
 
 - [README.md](tab-atlas/README.md) explains use and the product model.
-- [AGENTS.md](tab-atlas/AGENTS.md) maps responsibilities and verification.
+- [DEVELOPMENT.md](tab-atlas/DEVELOPMENT.md) maps responsibilities and verification.
 - [SKILL.md](tab-atlas/SKILL.md) defines the Codex operating workflow.
 - [references](tab-atlas/references/) defines stable architecture, taxonomy, and
   safety contracts.
 
 There is deliberately no manually maintained project-state ledger. Use git,
-tests, and the ignored local database for current facts. `legacy/`, generated
-reports, captures, previews, pairings, recordings, and database files are not
-authoritative instructions and must remain untracked.
+tests, and the ignored local database for current facts. `legacy/` is a
+quarantined, ignored snapshot of the retired implementation; generated reports,
+captures, previews, pairings, recordings, and database files also remain
+untracked.

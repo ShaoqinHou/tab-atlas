@@ -52,6 +52,7 @@ def run_capture(
     state_dir: Path,
     browsers: set[str],
     timeout_seconds: int,
+    on_ready: Callable[[], None] | None = None,
 ) -> tuple[bool, dict[str, dict[str, Any]]]:
     session = ReceiverSession(
         mode="capture",
@@ -59,7 +60,7 @@ def run_capture(
         state_dir=state_dir,
         expected_browsers={normalize_browser(browser) for browser in browsers},
     )
-    completed = _run(session, timeout_seconds)
+    completed = _run(session, timeout_seconds, on_ready=on_ready)
     return completed, session.captured
 
 

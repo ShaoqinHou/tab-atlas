@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import mimetypes
-import re
 import secrets
 from functools import partial
 from http import HTTPStatus
@@ -12,34 +10,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from ..catalog import inventory, remove_library_resources, set_discovery_state
-from .agent import AgentUnavailable
-from .agent_requests import agent_request_detail, create_workspace_chat_request
-from .context import _resource_by_id, _safe_error_code
-from .directory import update_action_progress
+from .api_read_routes import serve_audio
+from .api_routes import handle_get, handle_post
 from .lease import WorkspaceLease
-from .notes import (
-    create_note_analysis_request,
-    create_text_note,
-    resource_notes,
-    set_note_active,
-)
-from .transcription import add_audio_transcript, create_audio_note
 from .runtime import TabAtlasWorkspaceServer
-from .semantics import (
-    apply_semantic_proposal,
-    reject_semantic_proposal,
-    undo_semantic_audit,
-)
 from .server_constants import (
+    COOKIE_MAX_AGE_SECONDS,
     COOKIE_NAME,
     DEFAULT_WORKSPACE_PORT,
     MAX_JSON_BYTES,
-    OPAQUE_ID_PATTERN,
-    RESOURCE_ID_PATTERN,
     WORKSPACE_HOST,
 )
-from .support import ConflictError
 
 
 class TabAtlasWorkspaceHandler(SimpleHTTPRequestHandler):
@@ -84,260 +65,19 @@ class TabAtlasWorkspaceHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/" and self._accept_bootstrap(parse_qs(parsed.query)):
             return
         if not self._authenticated():
-            self.send_error(HTTPStatus.UNAUTHORIZED)
+            if parsed.path in {"/", "/index.html"}:
+                self._send_browser_access_required()
+            else:
+                self.send_error(HTTPStatus.UNAUTHORIZED)
             return
-        if parsed.path == "/api/v1/session":
-            self._send_json(self.workspace_server.session_status())
-            return
-        if parsed.path == "/api/v1/catalog":
-            self._send_json(self.workspace_server.catalog_snapshot())
-            return
-        if parsed.path == "/api/v1/browser-sync":
-            self._send_json(self.workspace_server.browser_sync.status())
-            return
-        match = re.fullmatch(
-            rf"/api/v1/resources/({RESOURCE_ID_PATTERN})/notes", parsed.path
-        )
-        if match:
-            with self.workspace_server.database() as connection:
-                notes = resource_notes(connection, match.group(1))
-            self._send_json({"resourceId": match.group(1), "notes": notes})
-            return
-        match = re.fullmatch(
-            rf"/api/v1/resources/({RESOURCE_ID_PATTERN})/workspace-state", parsed.path
-        )
-        if match:
-            with self.workspace_server.database() as connection:
-                resource = _resource_by_id(connection, match.group(1))
-                notes = resource_notes(connection, match.group(1))
-            self._send_json(
-                {
-                    "resourceId": match.group(1),
-                    "semanticRevision": resource.get("semanticRevision", 0),
-                    "noteCount": resource.get("noteCount", 0),
-                    "collections": resource.get("collections") or [],
-                    "actionItems": resource.get("actionItems") or [],
-                    "notes": notes,
-                }
-            )
-            return
-        match = re.fullmatch(
-            rf"/api/v1/agent-requests/({OPAQUE_ID_PATTERN})", parsed.path
-        )
-        if match:
-            with self.workspace_server.database() as connection:
-                result = agent_request_detail(connection, match.group(1))
-            self._send_json(result)
-            return
-        match = re.fullmatch(rf"/api/v1/notes/({OPAQUE_ID_PATTERN})/audio", parsed.path)
-        if match:
-            self._serve_audio(match.group(1))
+        if handle_get(self, parsed.path):
             return
         super().do_GET()
 
     def do_POST(self) -> None:
         if not self._valid_write_request():
             return
-        path = urlsplit(self.path).path
-        try:
-            if path == "/api/v1/browser-sync":
-                document = self._read_json_body()
-                raw_browsers = document.get("browsers", ["chrome", "edge"])
-                if not isinstance(raw_browsers, list):
-                    raise ValueError("browsers must be a list")
-                browsers = tuple(str(browser) for browser in raw_browsers)
-                result = self.workspace_server.start_browser_sync(
-                    browsers, trigger="user"
-                )
-                self._send_json(
-                    result,
-                    HTTPStatus.OK if result.get("reused") else HTTPStatus.ACCEPTED,
-                )
-                return
-            match = re.fullmatch(r"/api/v1/discoveries/(accept|dismiss)", path)
-            if match:
-                document = self._read_json_body()
-                resource_ids = document.get("resourceIds")
-                if not isinstance(resource_ids, list) or not resource_ids:
-                    raise ValueError("resourceIds must be a non-empty list")
-                target_state = "accepted" if match.group(1) == "accept" else "dismissed"
-                with self.workspace_server.database() as connection:
-                    result = set_discovery_state(connection, target_state, resource_ids)
-                    result["inventory"] = inventory(connection)
-                self.workspace_server.regenerate_report()
-                self._send_json(result)
-                return
-            match = re.fullmatch(
-                rf"/api/v1/resources/({RESOURCE_ID_PATTERN})/notes", path
-            )
-            if match:
-                document = self._read_json_body()
-                with self.workspace_server.database() as connection:
-                    result = create_text_note(
-                        connection,
-                        match.group(1),
-                        document.get("text"),
-                        self._idempotency_key(),
-                        supersedes_note_id=document.get("supersedesNoteId") or None,
-                    )
-                self._send_json(result, HTTPStatus.CREATED)
-                return
-            match = re.fullmatch(
-                rf"/api/v1/resources/({RESOURCE_ID_PATTERN})/voice-notes", path
-            )
-            if match:
-                payload = self._read_raw_body(25 * 1024 * 1024)
-                duration_header = self.headers.get("X-TabAtlas-Audio-Duration-Ms")
-                duration = int(duration_header) if duration_header else None
-                with self.workspace_server.database() as connection:
-                    result = create_audio_note(
-                        connection,
-                        self.workspace_server.state_dir,
-                        match.group(1),
-                        payload,
-                        self.headers.get_content_type(),
-                        duration,
-                        self._idempotency_key(),
-                    )
-                self.workspace_server.enqueue_audio_transcription(result["id"])
-                self._send_json(result, HTTPStatus.CREATED)
-                return
-            match = re.fullmatch(
-                rf"/api/v1/notes/({OPAQUE_ID_PATTERN})/transcript", path
-            )
-            if match:
-                document = self._read_json_body()
-                with self.workspace_server.database() as connection:
-                    result = add_audio_transcript(
-                        connection,
-                        match.group(1),
-                        document.get("text"),
-                        self._idempotency_key(),
-                    )
-                self._send_json(result)
-                return
-            match = re.fullmatch(rf"/api/v1/notes/({OPAQUE_ID_PATTERN})/analyze", path)
-            if match:
-                self._read_empty_body()
-                with self.workspace_server.database() as connection:
-                    result = create_note_analysis_request(
-                        connection,
-                        match.group(1),
-                        self._idempotency_key(),
-                    )
-                self.workspace_server.enqueue_agent_request(result["id"])
-                self._send_json(result, HTTPStatus.ACCEPTED)
-                return
-            match = re.fullmatch(rf"/api/v1/notes/({OPAQUE_ID_PATTERN})/retract", path)
-            if match:
-                self._read_empty_body()
-                with self.workspace_server.database() as connection:
-                    result = set_note_active(
-                        connection,
-                        match.group(1),
-                        False,
-                        self._idempotency_key(),
-                    )
-                self.workspace_server.regenerate_report()
-                self._send_json(result)
-                return
-            match = re.fullmatch(
-                rf"/api/v1/resources/({RESOURCE_ID_PATTERN})/action-lists/({OPAQUE_ID_PATTERN})/progress",
-                path,
-            )
-            if match:
-                document = self._read_json_body()
-                with self.workspace_server.database() as connection:
-                    result = update_action_progress(
-                        connection,
-                        match.group(1),
-                        match.group(2),
-                        state=document.get("state"),
-                        priority=document.get("priority", 3),
-                        completed_units=document.get("completedUnits", 0),
-                        total_units=document.get("totalUnits"),
-                        due_at=document.get("dueAt"),
-                        expected_revision=document.get("expectedRevision", 0),
-                        request_id=self._idempotency_key(),
-                    )
-                self.workspace_server.regenerate_report()
-                self._send_json(result)
-                return
-            match = re.fullmatch(
-                rf"/api/v1/resources/({RESOURCE_ID_PATTERN})/remove", path
-            )
-            if match:
-                self._read_empty_body()
-                with self.workspace_server.database() as connection:
-                    result = remove_library_resources(connection, [match.group(1)])
-                self.workspace_server.regenerate_report()
-                self._send_json(result)
-                return
-            if path == "/api/v1/agent-requests":
-                document = self._read_json_body()
-                with self.workspace_server.database() as connection:
-                    result = create_workspace_chat_request(
-                        connection,
-                        document.get("message"),
-                        document.get("resourceId") or None,
-                    )
-                self.workspace_server.enqueue_agent_request(result["id"])
-                self._send_json(result, HTTPStatus.ACCEPTED)
-                return
-            match = re.fullmatch(
-                rf"/api/v1/proposals/({OPAQUE_ID_PATTERN})/(accept|reject)", path
-            )
-            if match:
-                with self.workspace_server.database() as connection:
-                    if match.group(2) == "accept":
-                        result = apply_semantic_proposal(
-                            connection,
-                            match.group(1),
-                            "workspace_user",
-                            self._idempotency_key(),
-                        )
-                    else:
-                        result = reject_semantic_proposal(
-                            connection,
-                            match.group(1),
-                            "workspace_user",
-                            self._idempotency_key(),
-                        )
-                self.workspace_server.regenerate_report()
-                self._send_json(result)
-                return
-            match = re.fullmatch(rf"/api/v1/audits/({OPAQUE_ID_PATTERN})/undo", path)
-            if match:
-                with self.workspace_server.database() as connection:
-                    result = undo_semantic_audit(connection, match.group(1))
-                self.workspace_server.regenerate_report()
-                self._send_json(result)
-                return
-            if path == "/api/v1/agent/handoff":
-                self._read_empty_body()
-                self._send_json(self.workspace_server.handoff_agent())
-                return
-            if path == "/api/v1/agent/reclaim":
-                self._read_empty_body()
-                self._send_json(self.workspace_server.reclaim_agent())
-                return
-            self.send_error(HTTPStatus.NOT_FOUND)
-        except ConflictError as error:
-            self._send_json(
-                {"error": str(error), "code": "conflict"}, HTTPStatus.CONFLICT
-            )
-        except (ValueError, UnicodeError, json.JSONDecodeError) as error:
-            self._send_json(
-                {"error": str(error), "code": "invalid_request"}, HTTPStatus.BAD_REQUEST
-            )
-        except AgentUnavailable as error:
-            self._send_json(
-                {
-                    "error": "Codex is unavailable; saved work remains local.",
-                    "code": _safe_error_code(error),
-                },
-                HTTPStatus.SERVICE_UNAVAILABLE,
-            )
+        handle_post(self, urlsplit(self.path).path)
 
     def do_OPTIONS(self) -> None:
         self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
@@ -363,10 +103,27 @@ class TabAtlasWorkspaceHandler(SimpleHTTPRequestHandler):
         self.send_header("Location", "/")
         self.send_header(
             "Set-Cookie",
-            f"{COOKIE_NAME}={self.workspace_server.session_token}; Path=/; HttpOnly; SameSite=Strict",
+            f"{COOKIE_NAME}={self.workspace_server.session_token}; Path=/; "
+            f"Max-Age={COOKIE_MAX_AGE_SECONDS}; HttpOnly; SameSite=Strict",
         )
         self.end_headers()
         return True
+
+    def _send_browser_access_required(self) -> None:
+        payload = b"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect this browser to TabAtlas</title></head><body>
+<main><h1>Connect this browser to TabAtlas</h1>
+<p>This browser has not been authorized for the local workspace yet.</p>
+<p>Ask Codex to open TabAtlas in this browser once, or start the workspace with <code>workspace --open</code>.</p>
+<p>After that first connection, this address will open normally in this browser.</p></main>
+</body></html>"""
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _valid_host(self) -> bool:
         return secrets.compare_digest(
@@ -440,59 +197,7 @@ class TabAtlasWorkspaceHandler(SimpleHTTPRequestHandler):
         return length
 
     def _serve_audio(self, note_id: str) -> None:
-        with self.workspace_server.database() as connection:
-            row = connection.execute(
-                "SELECT audio_relpath, audio_mime, audio_sha256 FROM resource_notes WHERE id=? AND kind='audio'",
-                (note_id,),
-            ).fetchone()
-        if not row:
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        source = (self.workspace_server.state_dir / row["audio_relpath"]).resolve()
-        try:
-            source.relative_to(self.workspace_server.state_dir)
-        except ValueError:
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        if not source.is_file():
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        size = source.stat().st_size
-        start, end = 0, size - 1
-        status = HTTPStatus.OK
-        range_header = self.headers.get("Range", "")
-        if range_header:
-            match = re.fullmatch(r"bytes=(\d+)-(\d*)", range_header)
-            if not match:
-                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                return
-            start = int(match.group(1))
-            end = int(match.group(2)) if match.group(2) else end
-            if start > end or start >= size or end >= size:
-                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                return
-            status = HTTPStatus.PARTIAL_CONTENT
-        self.send_response(status)
-        self.send_header(
-            "Content-Type",
-            row["audio_mime"]
-            or mimetypes.guess_type(source.name)[0]
-            or "application/octet-stream",
-        )
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Length", str(end - start + 1))
-        if status == HTTPStatus.PARTIAL_CONTENT:
-            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        self.end_headers()
-        with source.open("rb") as stream:
-            stream.seek(start)
-            remaining = end - start + 1
-            while remaining:
-                chunk = stream.read(min(64 * 1024, remaining))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                remaining -= len(chunk)
+        serve_audio(self, note_id)
 
     def _send_json(self, value: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(

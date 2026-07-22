@@ -1,6 +1,6 @@
 .topbar {
   display: grid;
-  grid-template-columns: minmax(220px, 330px) minmax(320px, 1fr) minmax(150px, auto);
+  grid-template-columns: minmax(220px, 330px) minmax(320px, 1fr) minmax(280px, auto);
   gap: 18px;
   align-items: center;
   min-height: 68px;
@@ -59,9 +59,10 @@
 
 .sync-control {
   display: grid;
-  min-width: 150px;
-  justify-items: end;
-  gap: 3px;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-width: 280px;
+  gap: 10px;
+  align-items: center;
 }
 .sync-control[hidden] { display: none; }
 .sync-command {
@@ -90,15 +91,17 @@
   content: "";
   animation: sync-spin .8s linear infinite;
 }
-.sync-status {
+.sync-copy { display: block; min-width: 0; }
+.sync-status,
+.sync-detail {
   display: block;
-  max-width: 220px;
+  max-width: 260px;
   overflow: hidden;
-  color: var(--muted);
-  font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.sync-status { color: var(--ink); font-size: 11px; }
+.sync-detail { margin-top: 2px; color: var(--muted); font-size: 10px; }
 .sync-control[data-phase="failed"] .sync-status,
 .sync-control[data-phase="partial"] .sync-status { color: var(--amber); }
 @keyframes sync-spin { to { transform: rotate(360deg); } }

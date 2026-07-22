@@ -34,11 +34,18 @@ Responsibilities are separate:
 `workspace` starts one authenticated loopback server and automatically requests
 one serialized sync from paired, enabled Chrome and Edge extensions. The current
 catalog remains available while that sync is starting, waiting, importing, and
-republishing. **Sync now** invokes the same coordinator for tabs opened later.
+preparing allowlisted public review previews, and republishing. **Sync now**
+invokes the same coordinator for tabs opened later. Terminal status retains the
+per-browser tab counts, candidate count, preview result, and completion time.
 
 Only one sync may run at a time. Concurrent requests join or report the current
 job instead of starting competing receivers. Status exposes aggregate progress
 and browser outcomes, never private tab content.
+
+Sync performs deterministic capture and allowlisted preview preparation. It does
+not invoke Codex. Semantic batch preparation is a separate, explicit active-task
+operation; it may annotate candidates for review but cannot silently accept,
+dismiss, or close them.
 
 This is event-on-demand, not continuous collection. Workspace startup and an
 explicit Sync now action are the events. The extension alarm merely checks for a
@@ -48,6 +55,11 @@ unavailable browser leaves its last trusted catalog observations intact.
 The workspace, receiver, and optional Codex child are not scheduled and do not
 start with Windows. They stop with the interactive session. TabAtlas does not
 launch, copy, or remote-debug the user's normal browser profile.
+
+Browser access uses a durable random credential stored in the private catalog.
+One bootstrap navigation sets a persistent HttpOnly, host-only, SameSite cookie
+in that browser. Bare unauthenticated navigation reveals no catalog data, and an
+explicit access rotation revokes all previously authorized browser cookies.
 
 ## Extension And Receiver
 
@@ -154,10 +166,13 @@ interpretation, hierarchy, actions, provenance, and detailed evidence on demand.
 Lists render in bounded batches and append on scroll.
 
 Preview acquisition is explicit and allowlisted. Public image adapters may cache
-decision-bearing thumbnails or posters. Remote video is loaded only for the one
-resource being interacted with and is never persisted. Private, authenticated,
-internal, local, and weakly evidenced pages remain metadata-only unless an
-appropriate local capture is deliberately registered.
+decision-bearing thumbnails or posters during a requested Sync. A failed preview
+does not invalidate an authenticated browser capture and enters a 24-hour retry
+backoff so unchanged syncs do not repeatedly wait on the same unavailable media.
+Remote video is loaded only for the one resource being interacted with and is
+never persisted. Private, authenticated, internal, local, and weakly evidenced
+pages remain metadata-only unless an appropriate local capture is deliberately
+registered.
 
 ## Browser Mutations
 
@@ -195,7 +210,7 @@ or the root package. SQLite writes use transactions. External contracts use
 structured JSON with explicit validation. Generated files and private runtime
 state are not source modules.
 
-See `AGENTS.md` for the concrete module map and change locations.
+See `DEVELOPMENT.md` for the concrete module map and change locations.
 
 ## Test Boundary
 

@@ -21,6 +21,43 @@ from .resource_view import (
 )
 
 
+# Classic scripts are intentional: Chromium blocks ES-module imports from file://.
+# This tuple is the dependency graph and load order for both offline and HTTP reports.
+REPORT_SCRIPT_PATHS = (
+    # Shared state owner and stable DOM shell.
+    "modules/state.js",
+    "modules/shell.js",
+    # Cross-feature primitives and optional HTTP workspace transport.
+    "modules/utilities.js",
+    "modules/workspace.js",
+    # Catalog selectors and reusable navigation controls.
+    "modules/catalog-selection.js",
+    "modules/directory-controls.js",
+    # Resource presentation and inspector features.
+    "modules/preview.js",
+    "modules/resource-controls.js",
+    "modules/gallery.js",
+    "modules/details.js",
+    "modules/notes.js",
+    "modules/action-progress.js",
+    "modules/resource-workspace.js",
+    "modules/voice-notes.js",
+    "modules/drawer.js",
+    "modules/actions.js",
+    # Navigation and one renderer per report area.
+    "modules/navigation.js",
+    "modules/home-view.js",
+    "modules/library-view.js",
+    "modules/review-view.js",
+    "modules/search-view.js",
+    "modules/views.js",
+    # Optional live-workspace features, followed by the only entry point.
+    "modules/sync.js",
+    "modules/agent.js",
+    "app.js",
+)
+
+
 def report_payload(connection: sqlite3.Connection) -> dict[str, Any]:
     """Build one consistent, versioned catalog snapshot for file and HTTP clients."""
     savepoint = "tabatlas_catalog_snapshot"
@@ -167,6 +204,20 @@ def refresh_catalog_revision(document: dict[str, Any]) -> str:
     return revision
 
 
+def _report_scripts(assets_dir: Path) -> tuple[str, ...]:
+    # Minimal test/embedded clients may provide one self-contained app.js.
+    if not (assets_dir / "modules").is_dir():
+        return tuple(
+            path for path in REPORT_SCRIPT_PATHS if (assets_dir / path).is_file()
+        )
+    missing = [
+        path for path in REPORT_SCRIPT_PATHS if not (assets_dir / path).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(f"Incomplete report script graph: {', '.join(missing)}")
+    return REPORT_SCRIPT_PATHS
+
+
 def generate_report(
     connection: sqlite3.Connection,
     report_dir: Path,
@@ -191,6 +242,9 @@ def generate_report(
         .replace("\u2028", "\\u2028")
         .replace("\u2029", "\\u2029")
     )
+    script_tags = "\n".join(
+        f'  <script src="{path}"></script>' for path in _report_scripts(assets_dir)
+    )
     template = """<!doctype html>
 <html lang=\"en\">
 <head>
@@ -202,10 +256,10 @@ def generate_report(
 <body>
   <div id=\"app\"></div>
   <script>window.__TAB_ATLAS__=__PAYLOAD__;</script>
-  <script src=\"app.js\"></script>
+__REPORT_SCRIPTS__
 </body>
 </html>
-""".replace("__PAYLOAD__", payload)
+""".replace("__PAYLOAD__", payload).replace("__REPORT_SCRIPTS__", script_tags)
     _atomic_write(report_dir / "index.html", template.encode("utf-8"))
     _atomic_write(report_dir / "app.css", (assets_dir / "app.css").read_bytes())
     _atomic_write(report_dir / "app.js", (assets_dir / "app.js").read_bytes())

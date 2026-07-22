@@ -208,6 +208,7 @@
 .accent-teal { background: #3b7882; }
 .remote-load {
   position: absolute;
+  z-index: 3;
   right: 11px;
   bottom: 11px;
   min-height: 34px;

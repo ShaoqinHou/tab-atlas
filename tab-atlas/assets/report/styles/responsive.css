@@ -25,8 +25,8 @@
     padding: 10px 12px 11px;
   }
   .brand-copy small { max-width: calc(100vw - 205px); }
-  .sync-control { min-width: 112px; }
-  .sync-status { max-width: 150px; }
+  .sync-control { min-width: 176px; }
+  .sync-status, .sync-detail { max-width: 150px; }
   .search { height: 42px; }
   .primary-nav {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -139,8 +139,9 @@
 
 @media (max-width: 390px) {
   .brand-copy small { max-width: calc(100vw - 184px); }
-  .sync-control { min-width: 94px; }
-  .sync-status { display: none; }
+  .sync-control { min-width: 150px; gap: 7px; }
+  .sync-status { max-width: 92px; }
+  .sync-detail { display: none; }
   .screen { padding-right: 10px; padding-left: 10px; }
   .continue-action { grid-template-columns: minmax(0, 1fr) 42px; gap: 4px 10px; }
   .continue-detail { font-size: 11px; }

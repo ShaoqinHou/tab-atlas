@@ -49,6 +49,7 @@ from tabatlas import (  # noqa: E402
     store_snapshot,
     token_hash,
 )
+from tabatlas.database import remember_workspace_origin  # noqa: E402
 from tabatlas.media import _x_motion_url_allowed  # noqa: E402
 from tabatlas.previews import (  # noqa: E402
     _AllowlistedRedirectHandler,
@@ -81,6 +82,64 @@ ORIGIN = f"chrome-extension://{EXPECTED_EXTENSION_ID}"
 
 
 class CatalogTests(unittest.TestCase):
+    def test_workspace_page_is_observed_but_never_catalogued(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            remember_workspace_origin(connection, "http://127.0.0.1:8789")
+            remember_workspace_origin(connection, "http://127.0.0.1:8790")
+            stored = store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-22T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "title": "TabAtlas",
+                            "url": "http://127.0.0.1:8790/?bootstrap=private",
+                        },
+                        {
+                            "id": 2,
+                            "windowId": 1,
+                            "index": 1,
+                            "title": "Old TabAtlas port",
+                            "url": "http://127.0.0.1:8789/",
+                        },
+                        {
+                            "id": 3,
+                            "windowId": 1,
+                            "index": 2,
+                            "title": "Bridge popup",
+                            "url": f"{ORIGIN}/popup.html?capture=1",
+                        },
+                        {
+                            "id": 4,
+                            "windowId": 1,
+                            "index": 3,
+                            "title": "Useful page",
+                            "url": "https://example.com/useful",
+                        },
+                    ],
+                },
+                "extension_live",
+                new_resource_state="candidate",
+            )
+            rows = connection.execute(
+                "SELECT canonical_url FROM resources ORDER BY canonical_url"
+            ).fetchall()
+            connection.close()
+
+            self.assertEqual(stored["tab_count"], 4)
+            self.assertEqual(stored["resource_count"], 1)
+            self.assertEqual(stored["new_resource_count"], 1)
+            self.assertEqual(
+                [row["canonical_url"] for row in rows], ["https://example.com/useful"]
+            )
+
     def test_live_discoveries_require_acceptance_and_known_urls_are_not_readded(
         self,
     ) -> None:
@@ -857,7 +916,7 @@ class CatalogTests(unittest.TestCase):
                             "index": 3,
                             "groupId": -1,
                             "title": "TabAtlas",
-                            "url": f"chrome-extension://{EXPECTED_EXTENSION_ID}/popup.html",
+                            "url": f"chrome-extension://{EXPECTED_EXTENSION_ID}/archive_complete.html",
                         },
                     ],
                 },
@@ -913,7 +972,7 @@ class CatalogTests(unittest.TestCase):
             )
             results = {
                 "chrome": {
-                    "closedCount": 4,
+                    "closedCount": 3,
                     "skippedCount": 0,
                     "controlTabId": 99,
                     "controlWindowId": 1,
@@ -945,17 +1004,17 @@ class CatalogTests(unittest.TestCase):
             }
             connection.close()
 
-            self.assertEqual(plan["summary"]["plannedClosures"], 4)
+            self.assertEqual(plan["summary"]["plannedClosures"], 3)
             self.assertEqual(plan["summary"]["plannedRetainedClosures"], 2)
             self.assertEqual(plan["summary"]["plannedDiscardedClosures"], 1)
-            self.assertEqual(plan["summary"]["plannedOperationalClosures"], 1)
+            self.assertEqual(plan["summary"]["plannedOperationalClosures"], 0)
             self.assertNotIn("https://", json.dumps(plan))
             self.assertNotIn("file:///", json.dumps(plan))
-            self.assertEqual(totals["closed"], 4)
+            self.assertEqual(totals["closed"], 3)
             self.assertEqual(totals["verifiedBrowsers"], 1)
             self.assertEqual(totals["archivedResources"], 2)
             self.assertEqual(totals["discardedResources"], 1)
-            self.assertEqual(totals["operationalResources"], 1)
+            self.assertEqual(totals["operationalResources"], 0)
             self.assertEqual(live, [])
             self.assertEqual(len(library), 2)
             self.assertEqual(statuses, {"accepted": "saved", "dismissed": "archived"})
@@ -965,7 +1024,7 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(evidence["durability"]["catalogIntegrity"], "ok")
             self.assertEqual(evidence["durability"]["durableResourceCount"], 2)
             self.assertEqual(evidence["durability"]["reviewedDiscardResourceCount"], 1)
-            self.assertEqual(evidence["durability"]["operationalResourceCount"], 1)
+            self.assertEqual(evidence["durability"]["operationalResourceCount"], 0)
             self.assertNotIn("example.com", evidence_path.read_text(encoding="utf-8"))
 
     def test_archive_finalization_rejects_unknown_post_capture(self) -> None:
@@ -1684,6 +1743,49 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(stored["previewSource"], "agent_local_capture")
             self.assertEqual(stored["motionKind"], "x_mp4")
             self.assertEqual(stored["motionUrl"], motion_url)
+
+    def test_failed_public_preview_uses_backoff_until_forced_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-22T00:00:00Z",
+                    "tabs": [
+                        {
+                            "title": "Unavailable public video thumbnail",
+                            "url": "https://www.youtube.com/watch?v=Backoff0001",
+                        }
+                    ],
+                },
+                "test",
+            )
+
+            with patch(
+                "tabatlas.previews._download_public_preview",
+                side_effect=URLError("unavailable"),
+            ) as downloader:
+                first = cache_public_previews(connection, state, workers=1)
+                deferred = cache_public_previews(connection, state, workers=1)
+                forced = cache_public_previews(
+                    connection, state, refresh=True, workers=1
+                )
+            attempt = connection.execute(
+                "SELECT attempted_at, retry_after FROM resource_preview_attempts"
+            ).fetchone()
+            connection.close()
+
+            self.assertEqual(downloader.call_count, 2)
+            self.assertEqual(first["failed"], 1)
+            self.assertEqual(first["deferred"], 0)
+            self.assertEqual(deferred["failed"], 0)
+            self.assertEqual(deferred["deferred"], 1)
+            self.assertEqual(forced["failed"], 1)
+            self.assertIsNotNone(attempt)
+            self.assertGreater(attempt["retry_after"], attempt["attempted_at"])
 
     def test_report_server_is_loopback_read_only_and_sends_safe_headers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -38,11 +38,14 @@ def _require_resource(connection: sqlite3.Connection, resource_id: str) -> None:
     if not re.fullmatch(r"res_[a-f0-9]{24}", str(resource_id or "")):
         raise ValueError("Resource ID is invalid")
     row = connection.execute(
-        "SELECT 1 FROM resources WHERE id=? AND library_state='accepted'",
+        """
+        SELECT 1 FROM resources
+        WHERE id=? AND library_state IN ('accepted', 'candidate', 'dismissed')
+        """,
         (resource_id,),
     ).fetchone()
     if not row:
-        raise ValueError("Accepted resource was not found")
+        raise ValueError("Resource was not found")
 
 
 def _validate_note_text(value: Any) -> str:

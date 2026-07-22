@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import threading
 import uuid
 from collections.abc import Callable, Iterable
@@ -10,11 +11,13 @@ from ..browser.receiver import run_capture
 from ..catalog import inventory
 from ..common import normalize_browser
 from ..database import open_connection, pairing_status, utc_now
+from .product_browsers import no_product_browser_launch
+from .review_preparation import prepare_visual_review
 
 
-CaptureRunner = Callable[
-    [Path, Path, set[str], int], tuple[bool, dict[str, dict[str, Any]]]
-]
+CaptureRunner = Callable[..., tuple[bool, dict[str, dict[str, Any]]]]
+ReviewPreparer = Callable[[Path, Path], dict[str, Any]]
+BrowserLauncher = Callable[[set[str]], Any]
 
 
 class BrowserSyncCoordinator:
@@ -27,12 +30,16 @@ class BrowserSyncCoordinator:
         publish: Callable[[], None],
         *,
         capture_runner: CaptureRunner = run_capture,
+        review_preparer: ReviewPreparer = prepare_visual_review,
+        browser_launcher: BrowserLauncher = no_product_browser_launch,
         timeout_seconds: int = 45,
     ) -> None:
         self.database_path = database_path.resolve()
         self.state_dir = state_dir.resolve()
         self.publish = publish
         self.capture_runner = capture_runner
+        self.review_preparer = review_preparer
+        self.browser_launcher = browser_launcher
         self.timeout_seconds = timeout_seconds
         self._lock = threading.Lock()
         self._job = self._idle_job()
@@ -69,6 +76,7 @@ class BrowserSyncCoordinator:
             if self._job["phase"] in {
                 "starting",
                 "waiting_for_extension",
+                "preparing_review",
                 "publishing",
             }:
                 reused = _public_job(self._job)
@@ -95,6 +103,7 @@ class BrowserSyncCoordinator:
                 },
                 "newResources": 0,
                 "pendingDiscoveries": 0,
+                "previews": _empty_preview_status(),
                 "error": "No requested browser is paired" if not targets else "",
             }
             result = _public_job(self._job)
@@ -111,13 +120,61 @@ class BrowserSyncCoordinator:
 
     def _run(self, targets: set[str]) -> None:
         self._set_phase("waiting_for_extension")
+        launch_context = self.browser_launcher(targets)
+        launched: dict[str, Any] = {}
+        launch_context_entered = False
+
+        def launch_when_receiver_is_ready() -> None:
+            nonlocal launch_context_entered, launched
+            launched = launch_context.__enter__()
+            launch_context_entered = True
+            with self._lock:
+                for browser, details in (launched or {}).items():
+                    if browser in self._job["browsers"]:
+                        self._job["browsers"][browser]["launchedBySync"] = bool(
+                            details.get("launched")
+                        )
+
+        capture_error: BaseException | None = None
         try:
-            complete, captured = self.capture_runner(
-                self.database_path,
-                self.state_dir,
-                targets,
-                self.timeout_seconds,
-            )
+            if _capture_runner_accepts_ready_callback(self.capture_runner):
+                complete, captured = self.capture_runner(
+                    self.database_path,
+                    self.state_dir,
+                    targets,
+                    self.timeout_seconds,
+                    on_ready=launch_when_receiver_is_ready,
+                )
+            else:
+                launch_when_receiver_is_ready()
+                complete, captured = self.capture_runner(
+                    self.database_path,
+                    self.state_dir,
+                    targets,
+                    self.timeout_seconds,
+                )
+        except Exception as error:
+            capture_error = error
+        finally:
+            if launch_context_entered:
+                launch_context.__exit__(None, None, None)
+        try:
+            if capture_error:
+                raise capture_error
+            self._set_phase("preparing_review")
+            try:
+                preview_status = self.review_preparer(
+                    self.database_path,
+                    self.state_dir,
+                )
+            except Exception as error:
+                preview_status = {
+                    **_empty_preview_status(),
+                    "state": "failed",
+                    "error": _safe_error(error),
+                }
+            with self._lock:
+                self._job["previews"] = preview_status
             self._set_phase("publishing")
             self.publish()
             connection = open_connection(self.database_path)
@@ -184,6 +241,7 @@ class BrowserSyncCoordinator:
             "browsers": {},
             "newResources": 0,
             "pendingDiscoveries": 0,
+            "previews": _empty_preview_status(),
             "error": "",
         }
 
@@ -202,6 +260,7 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
         },
         "newResources": int(job.get("newResources") or 0),
         "pendingDiscoveries": int(job.get("pendingDiscoveries") or 0),
+        "previews": dict(job.get("previews") or _empty_preview_status()),
         "error": str(job.get("error") or ""),
     }
 
@@ -209,3 +268,24 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
 def _safe_error(error: BaseException) -> str:
     name = type(error).__name__.replace("Error", "").strip().lower()
     return name or "browser_sync_failed"
+
+
+def _capture_runner_accepts_ready_callback(capture_runner: CaptureRunner) -> bool:
+    try:
+        signature = inspect.signature(capture_runner)
+    except (TypeError, ValueError):
+        return False
+    return "on_ready" in signature.parameters
+
+
+def _empty_preview_status() -> dict[str, Any]:
+    return {
+        "state": "idle",
+        "eligible": 0,
+        "alreadyCached": 0,
+        "prepared": 0,
+        "motionPrepared": 0,
+        "failed": 0,
+        "deferred": 0,
+        "error": "",
+    }

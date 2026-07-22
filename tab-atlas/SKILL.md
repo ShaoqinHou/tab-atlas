@@ -29,10 +29,14 @@ After sync:
 
 1. Report capture outcome using browser names and aggregate counts only.
 2. Keep every unseen canonical resource in `candidate` until reviewed.
-3. Accept or dismiss through Review, individually or in a deliberate batch.
-4. Reconsider accepted resources against the complete library, not only the new
+3. When the user asked this active task to prepare or manage discoveries, review
+   the staged batch and apply concise evidence-based briefs, details, and
+   organization suggestions. Do not accept or dismiss merely because they were
+   prepared.
+4. Accept or dismiss through Review, individually or in a deliberate batch.
+5. Reconsider accepted resources against the complete library, not only the new
    batch.
-5. Regenerate the report after durable changes.
+6. Regenerate the report after durable changes.
 
 Known canonical resources update observations without creating another
 discovery. An unavailable browser leaves its previous trusted state intact.
@@ -97,7 +101,8 @@ recording remains evidence if transcription fails. Do not send audio to Codex.
 An **Ask Codex** request receives bounded context and returns an inert proposal.
 The user can accept, dismiss, or refine it. Applying a proposal must be revision
 checked, audited, and undoable. Saving a note alone must not trigger a model
-turn. Sync and candidate staging do not require Codex.
+turn. Sync and candidate staging do not invoke Codex; semantic batch preparation
+is a separate operation performed only when the active task was asked to do it.
 
 ## Pairing
 

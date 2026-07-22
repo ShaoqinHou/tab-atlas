@@ -28,14 +28,38 @@ This starts one authenticated loopback workspace. It is not a Windows service,
 is not scheduled, and stops with `Ctrl+C`.
 
 Starting the workspace begins one serialized sync against paired, enabled Chrome
-and Edge extensions. The catalog remains usable while the sync waits for a
-browser. Use **Sync now** to capture tabs opened later. There is no continuous
-tab monitor: the extension's low-frequency loopback check only discovers a
-waiting command, and it reads tabs only for that bounded command.
+and Edge extensions. Passive extensions may take up to 30 seconds to wake; the
+catalog remains usable while the sync waits for a browser. It then caches
+allowlisted public thumbnails needed for review and
+publishes one new catalog snapshot. Use **Sync now** to capture tabs opened
+later. Its status names each browser and captured tab count, new discoveries,
+preview preparation, and completion time. There is no continuous tab monitor:
+the extension's low-frequency loopback check only discovers a waiting command,
+and it reads tabs only for that bounded command.
+
+If Chrome or Edge is already running, sync leaves that browser open and waits
+for the passive extension. If a paired product browser is closed, the workspace
+starts it minimized with the normal profile, asks Chromium to restore the last
+session, opens the TabAtlas Bridge popup only to wake the extension for that
+waiting receiver, and closes only browser processes it started. If the browser
+profile has no restorable tab session, the sync records that fact instead of
+inventing pages.
+
+Sync is deterministic capture and safe visual preparation; it does not hide a
+model call. Candidate cards immediately have the same preview, note, inspector,
+source, and decision controls as library cards. Public-preview failures enter a
+24-hour retry backoff so repeated no-change syncs stay quick; an explicit preview
+refresh may retry sooner.
 
 If a paired browser is closed or unavailable, the sync reports that state and
 leaves its last trusted catalog data unchanged. TabAtlas does not launch or
 remote-debug the user's normal browser profile.
+
+The first authorized open in each normal browser sets a persistent, HttpOnly
+loopback cookie. After Codex opens the private bootstrap URL once, the plain
+`http://127.0.0.1:8790/` address works in that browser across workspace restarts.
+The access credential stays in the ignored private database. Run `workspace
+--rotate-access` to revoke every authorized browser session.
 
 ## Pair Browsers
 
@@ -62,7 +86,9 @@ The receiver exists only during a requested operation and binds to
 ## Daily Workflow
 
 1. Start the workspace. Its initial sync stages unseen canonical resources.
-2. Review **New discoveries**. Accept useful resources or dismiss unwanted ones.
+2. Review **New discoveries**. Candidates use the same cards, previews, notes,
+   inspector, source actions, and scoped Ask Codex context as accepted resources.
+   Accept useful resources or dismiss unwanted ones.
 3. Use Home and Library to browse by purpose, project, action, or source.
 4. Add typed or local voice notes when page metadata does not express your
    intent. Ask Codex for a proposal only when interpretation is useful.
@@ -70,6 +96,11 @@ The receiver exists only during a requested operation and binds to
    only unseen canonical resources return to review.
 6. Close browser tabs only through a separately previewed and approved mutation
    when verified closure is wanted.
+
+When working through an active Codex task, say **“sync and prepare new
+discoveries.”** Codex can review the staged batch against the whole library and
+add concise evidence-based summaries and organization suggestions. Resources
+remain candidates until the user explicitly accepts or dismisses them.
 
 Candidates are durable but are not accepted library entries. Capture never
 silently promotes them. Dismissal is reversible and does not close a browser tab.
@@ -110,8 +141,9 @@ python scripts/tab_atlas.py view --open
 
 ## Direct Operations
 
-The UI is the normal path. The thin source-tree entry point exposes the same
-package CLI for diagnosis and bounded automation:
+The UI is the normal path. This repository is the operation boundary: Codex and
+the user run its thin source-tree entry point directly for diagnosis and bounded
+automation. It is not installed as a background application or system-wide CLI.
 
 ```powershell
 python scripts/tab_atlas.py status
@@ -119,13 +151,6 @@ python scripts/tab_atlas.py refresh --browser all
 python scripts/tab_atlas.py discoveries
 python scripts/tab_atlas.py inventory
 python scripts/tab_atlas.py query --text "..."
-```
-
-An editable install also provides the `tabatlas` console command:
-
-```powershell
-python -m pip install -e .
-tabatlas workspace --open
 ```
 
 Normal runtime uses only the Python standard library. Optional local voice
@@ -144,7 +169,7 @@ to the accepted library. See [references/safety.md](references/safety.md).
 
 ## Development
 
-Read [AGENTS.md](AGENTS.md) before changing code. Stable design contracts live
+Read [DEVELOPMENT.md](DEVELOPMENT.md) before changing code. Stable design contracts live
 in [architecture.md](references/architecture.md),
 [taxonomy.md](references/taxonomy.md), and [safety.md](references/safety.md).
 

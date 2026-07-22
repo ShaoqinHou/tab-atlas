@@ -28,7 +28,16 @@ elements.pair.addEventListener("click", () => run(async () => {
   render(await status());
 }));
 
-elements.capture.addEventListener("click", () => run(async () => {
+elements.capture.addEventListener("click", () => run(captureWaitingReceiver));
+
+run(async () => {
+  render(await status());
+  if (new URLSearchParams(location.search).get("capture") === "1") {
+    await captureWaitingReceiver();
+  }
+});
+
+async function captureWaitingReceiver() {
   say("Checking for a capture request...");
   const result = await send({ type: "tabatlas:capture-now" });
   if (!result.ok && !result.idle) throw new Error(result.error || "Capture failed.");
@@ -38,9 +47,7 @@ elements.capture.addEventListener("click", () => run(async () => {
   else if (result.cleaned) say("Archive verification finished.");
   else say("No receiver is waiting.");
   render(await status());
-}));
-
-run(async () => render(await status()));
+}
 
 async function status() {
   return send({ type: "tabatlas:status" });

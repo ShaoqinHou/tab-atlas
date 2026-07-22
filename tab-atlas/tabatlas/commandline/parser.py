@@ -139,6 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
     workspace_parser.add_argument("--output", type=Path, default=DEFAULT_REPORT)
     workspace_parser.add_argument("--port", type=int, default=DEFAULT_WORKSPACE_PORT)
     workspace_parser.add_argument("--open", action="store_true", dest="open_report")
+    workspace_parser.add_argument(
+        "--rotate-access",
+        action="store_true",
+        help="Revoke previously authorized workspace browser sessions",
+    )
 
     enrich_parser = subparsers.add_parser(
         "enrich",

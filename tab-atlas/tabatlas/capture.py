@@ -346,6 +346,10 @@ def store_snapshot(
             )
             for ordinal, tab in enumerate(normalized["tabs"]):
                 canonical_url, host, kind = canonicalize_url(tab["url"])
+                if _is_workspace_resource(connection, canonical_url):
+                    continue
+                if _is_tabatlas_bridge_popup(canonical_url):
+                    continue
                 is_extension_resource = canonical_url.startswith(
                     TABATLAS_EXTENSION_URL_PREFIX
                 )
@@ -463,6 +467,34 @@ def _capture_resource_count(connection: sqlite3.Connection, capture_id: str) -> 
         (capture_id,),
     ).fetchone()
     return int(row["count"])
+
+
+def _is_workspace_resource(connection: sqlite3.Connection, canonical_url: str) -> bool:
+    """Keep TabAtlas' own workspace page out of the resource catalog."""
+    try:
+        candidate = urlsplit(canonical_url)
+    except ValueError:
+        return False
+    rows = connection.execute(
+        "SELECT value FROM meta WHERE key IN ('workspace_origin', 'workspace_origins')"
+    ).fetchall()
+    for row in rows:
+        for value in str(row["value"] or "").splitlines():
+            try:
+                workspace = urlsplit(value)
+            except ValueError:
+                continue
+            if (
+                candidate.scheme == workspace.scheme
+                and candidate.netloc == workspace.netloc
+                and (candidate.path or "/") == (workspace.path or "/")
+            ):
+                return True
+    return False
+
+
+def _is_tabatlas_bridge_popup(canonical_url: str) -> bool:
+    return canonical_url.startswith(f"{TABATLAS_EXTENSION_URL_PREFIX}popup.html")
 
 
 def latest_capture_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:

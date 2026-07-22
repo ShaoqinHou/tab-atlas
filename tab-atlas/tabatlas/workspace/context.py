@@ -43,12 +43,15 @@ def _workspace_agent_context(
     request_text: str,
 ) -> dict[str, Any]:
     resources = library_resources(connection)
+    tracked_resources = library_resources(
+        connection, {"accepted", "candidate", "dismissed"}
+    )
     selected = None
     if selected_resource_id:
         selected = next(
             (
                 resource
-                for resource in resources
+                for resource in tracked_resources
                 if resource["resourceId"] == selected_resource_id
             ),
             None,
@@ -162,13 +165,15 @@ def _resource_by_id(connection: sqlite3.Connection, resource_id: str) -> dict[st
     resource = next(
         (
             item
-            for item in library_resources(connection)
+            for item in library_resources(
+                connection, {"accepted", "candidate", "dismissed"}
+            )
             if item["resourceId"] == resource_id
         ),
         None,
     )
     if not resource:
-        raise ValueError("Accepted resource was not found")
+        raise ValueError("Resource was not found")
     return resource
 
 
@@ -178,6 +183,7 @@ def _bounded_resource_context(resource: dict[str, Any] | None) -> dict[str, Any]
     presentation = resource_presentation(resource)
     return {
         "resourceId": resource["resourceId"],
+        "libraryState": str(resource.get("libraryState") or "accepted"),
         "title": str(resource.get("title") or "")[:300],
         "brief": str(resource.get("brief") or "")[:600],
         "detail": str(resource.get("detail") or "")[:800],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import contextlib
 import json
 import sqlite3
 import sys
@@ -42,6 +43,7 @@ from tabatlas.workspace import (  # noqa: E402
 import tabatlas.workspace.runtime as workspace_server_module  # noqa: E402
 from tabatlas.workspace.context import _workspace_agent_context  # noqa: E402
 from tabatlas.workspace.browser_sync import BrowserSyncCoordinator  # noqa: E402
+from tabatlas.database import workspace_access_token  # noqa: E402
 from tabatlas.workspace import (  # noqa: E402
     create_workspace_server,
 )
@@ -699,6 +701,34 @@ class WorkspaceDataTests(unittest.TestCase):
         )
         self.assertFalse(proposal_is_current(self.connection, completed["proposalId"]))
 
+    def test_candidate_supports_notes_and_scoped_codex_context(self) -> None:
+        seed_candidate_resource(self.connection, CANDIDATE_ID, "Pending course")
+        note = create_text_note(
+            self.connection,
+            CANDIDATE_ID,
+            "Review this as a possible learning resource.",
+            "candidate-note-idempotency-01",
+        )
+        context = _workspace_agent_context(
+            self.connection,
+            CANDIDATE_ID,
+            "Suggest a useful purpose for this candidate.",
+        )
+
+        self.assertEqual(note["resourceId"], CANDIDATE_ID)
+        self.assertEqual(context["selectedResource"]["resourceId"], CANDIDATE_ID)
+        self.assertEqual(context["selectedResource"]["libraryState"], "candidate")
+        self.assertEqual(context["selectedResource"]["title"], "Pending course")
+
+    def test_workspace_access_token_persists_until_explicit_rotation(self) -> None:
+        first = workspace_access_token(self.connection)
+        second = workspace_access_token(self.connection)
+        rotated = workspace_access_token(self.connection, rotate=True)
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, rotated)
+        self.assertEqual(rotated, workspace_access_token(self.connection))
+
     def test_schema_upgrade_creates_integrity_checked_backup(self) -> None:
         self.connection.execute("UPDATE meta SET value='8' WHERE key='schema_version'")
         self.connection.commit()
@@ -746,6 +776,14 @@ class BrowserSyncCoordinatorTests(unittest.TestCase):
                 state,
                 lambda: published.append(True),
                 capture_runner=capture_runner,
+                review_preparer=lambda *_args: {
+                    "state": "complete",
+                    "eligible": 5,
+                    "alreadyCached": 3,
+                    "prepared": 2,
+                    "motionPrepared": 1,
+                    "failed": 0,
+                },
                 timeout_seconds=1,
             )
             first = coordinator.start(("chrome",), trigger="user")
@@ -762,6 +800,7 @@ class BrowserSyncCoordinatorTests(unittest.TestCase):
             self.assertEqual(status["phase"], "complete")
             self.assertEqual(status["browsers"]["chrome"]["tabs"], 12)
             self.assertEqual(status["newResources"], 3)
+            self.assertEqual(status["previews"]["prepared"], 2)
             self.assertEqual(published, [True])
 
     def test_unpaired_browser_fails_without_starting_a_receiver(self) -> None:
@@ -801,6 +840,11 @@ class BrowserSyncCoordinatorTests(unittest.TestCase):
                         }
                     },
                 ),
+                review_preparer=lambda *_args: {
+                    "state": "complete",
+                    "prepared": 0,
+                    "failed": 0,
+                },
             )
             coordinator.start(("chrome", "edge"))
             deadline = time.monotonic() + 2
@@ -812,6 +856,87 @@ class BrowserSyncCoordinatorTests(unittest.TestCase):
             self.assertEqual(status["phase"], "partial")
             self.assertEqual(status["browsers"]["chrome"]["state"], "captured")
             self.assertEqual(status["browsers"]["edge"]["state"], "unavailable")
+
+    def test_preview_failure_does_not_discard_a_successful_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            database = state / "atlas.sqlite"
+            connection = connect(database)
+            save_pairing(connection, "chrome", "a" * 32, "secret")
+            connection.close()
+            coordinator = BrowserSyncCoordinator(
+                database,
+                state,
+                lambda: None,
+                capture_runner=lambda *_args: (
+                    True,
+                    {
+                        "chrome": {
+                            "tab_count": 2,
+                            "resource_count": 2,
+                            "candidate_resource_count": 1,
+                        }
+                    },
+                ),
+                review_preparer=lambda *_args: (_ for _ in ()).throw(
+                    OSError("private details must not escape")
+                ),
+            )
+            coordinator.start(("chrome",))
+            deadline = time.monotonic() + 2
+            while coordinator.status()["phase"] not in {"complete", "failed"}:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+
+            status = coordinator.status()
+            self.assertEqual(status["phase"], "complete")
+            self.assertEqual(status["previews"]["state"], "failed")
+            self.assertEqual(status["previews"]["error"], "os")
+
+    def test_browser_launcher_status_is_reported_without_changing_capture(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            database = state / "atlas.sqlite"
+            connection = connect(database)
+            save_pairing(connection, "edge", "a" * 32, "secret")
+            connection.close()
+
+            @contextlib.contextmanager
+            def launcher(_browsers):
+                yield {"edge": {"launched": True}}
+
+            coordinator = BrowserSyncCoordinator(
+                database,
+                state,
+                lambda: None,
+                capture_runner=lambda *_args: (
+                    True,
+                    {
+                        "edge": {
+                            "tab_count": 4,
+                            "resource_count": 4,
+                            "candidate_resource_count": 1,
+                        }
+                    },
+                ),
+                review_preparer=lambda *_args: {
+                    "state": "complete",
+                    "prepared": 0,
+                    "failed": 0,
+                },
+                browser_launcher=launcher,
+            )
+            coordinator.start(("edge",))
+            deadline = time.monotonic() + 2
+            while coordinator.status()["phase"] not in {"complete", "failed"}:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+
+            status = coordinator.status()
+            self.assertEqual(status["phase"], "complete")
+            self.assertTrue(status["browsers"]["edge"]["launchedBySync"])
 
 
 class WorkspaceServerTests(unittest.TestCase):
@@ -934,15 +1059,23 @@ class WorkspaceServerTests(unittest.TestCase):
                 "127.0.0.1", server.server_port, timeout=10
             )
             try:
+                client.request("GET", "/", headers={"Host": server.expected_host})
+                response = client.getresponse()
+                unauthorized = response.read().decode("utf-8")
+                self.assertEqual(response.status, 401)
+                self.assertIn("Connect this browser to TabAtlas", unauthorized)
+
                 client.request(
                     "GET",
                     f"/?bootstrap={server.session_token}",
                     headers={"Host": server.expected_host},
                 )
                 response = client.getresponse()
-                cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+                cookie_header = response.getheader("Set-Cookie")
+                cookie = cookie_header.split(";", 1)[0]
                 response.read()
                 self.assertEqual(response.status, 303)
+                self.assertIn("Max-Age=", cookie_header)
 
                 client.request(
                     "GET",

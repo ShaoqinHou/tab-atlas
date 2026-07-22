@@ -6,6 +6,7 @@ import re
 import sqlite3
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,9 @@ from .common import _atomic_write
 from .constants import PUBLIC_PREVIEW_USER_AGENT
 from .database import utc_now
 from .media import _provider_url_allowed, _x_motion_url_allowed, _youtube_video_id
+
+
+PREVIEW_FAILURE_RETRY_HOURS = 24
 
 
 class _OpenGraphParser(HTMLParser):
@@ -109,11 +113,19 @@ def cache_public_previews(
     preview_dir = state_dir / "previews"
     preview_dir.mkdir(parents=True, exist_ok=True)
     resources = library_resources(connection, {"accepted", "candidate"})
+    retry_after_by_resource = {
+        row["resource_id"]: row["retry_after"]
+        for row in connection.execute(
+            "SELECT resource_id, retry_after FROM resource_preview_attempts"
+        )
+    }
     candidates: list[dict[str, Any]] = []
     provider_stats: dict[str, Counter[str]] = defaultdict(Counter)
     eligible = 0
     cached = 0
+    deferred = 0
     preserved_screenshots = 0
+    current_time = utc_now()
     for resource in resources:
         candidate = _public_preview_candidate(resource, preview_dir)
         if not candidate:
@@ -138,11 +150,20 @@ def cache_public_previews(
         )
         if not needs_image and not needs_motion:
             continue
+        if (
+            not refresh
+            and retry_after_by_resource.get(resource["resourceId"], "") > current_time
+        ):
+            deferred += 1
+            provider_stats[provider]["deferred"] += 1
+            continue
         candidate["downloadImage"] = needs_image
         candidates.append(candidate)
 
     downloaded: list[tuple[str, dict[str, Any]]] = []
     motion_updates: list[tuple[str, dict[str, str] | None]] = []
+    failed_resources: set[str] = set()
+    successful_resources: set[str] = set()
     failed = 0
     with ThreadPoolExecutor(max_workers=max(1, min(16, workers))) as executor:
         futures = {
@@ -156,21 +177,32 @@ def cache_public_previews(
                 result = future.result()
             except (HTTPError, URLError, OSError, UnicodeError, ValueError):
                 failed += 1
+                failed_resources.add(candidate["resourceId"])
                 provider_stats[provider]["failed"] += 1
                 continue
             if result.get("preview"):
                 downloaded.append((candidate["resourceId"], result["preview"]))
+                successful_resources.add(candidate["resourceId"])
                 provider_stats[provider]["downloaded"] += 1
             elif result.get("previewFailed"):
                 failed += 1
+                failed_resources.add(candidate["resourceId"])
                 provider_stats[provider]["failed"] += 1
             if result.get("motionChecked"):
                 motion_updates.append((candidate["resourceId"], result.get("motion")))
+                if not result.get("previewFailed"):
+                    successful_resources.add(candidate["resourceId"])
                 provider_stats[provider]["motionChecked"] += 1
                 if result.get("motion"):
                     provider_stats[provider]["motionResolved"] += 1
 
     now = utc_now()
+    retry_after = (
+        (datetime.now(timezone.utc) + timedelta(hours=PREVIEW_FAILURE_RETRY_HOURS))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
     state_root = state_dir.resolve()
     with connection:
         for resource_id_value, result in downloaded:
@@ -219,9 +251,26 @@ def cache_public_previews(
                     now,
                 ),
             )
+        for resource_id_value in failed_resources:
+            connection.execute(
+                """
+                INSERT INTO resource_preview_attempts(resource_id, attempted_at, retry_after)
+                VALUES(?, ?, ?)
+                ON CONFLICT(resource_id) DO UPDATE SET
+                  attempted_at=excluded.attempted_at,
+                  retry_after=excluded.retry_after
+                """,
+                (resource_id_value, now, retry_after),
+            )
+        for resource_id_value in successful_resources - failed_resources:
+            connection.execute(
+                "DELETE FROM resource_preview_attempts WHERE resource_id=?",
+                (resource_id_value,),
+            )
     return {
         "eligible": eligible,
         "alreadyCached": cached,
+        "deferred": deferred,
         "preservedScreenshots": preserved_screenshots,
         "downloaded": len(downloaded),
         "motionChecked": len(motion_updates),
@@ -233,6 +282,7 @@ def cache_public_previews(
                 for key in (
                     "eligible",
                     "alreadyCached",
+                    "deferred",
                     "downloaded",
                     "motionChecked",
                     "motionResolved",

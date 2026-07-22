@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import os
 import re
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -152,6 +153,12 @@ CREATE TABLE IF NOT EXISTS resource_previews (
   width INTEGER,
   height INTEGER,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS resource_preview_attempts (
+  resource_id TEXT PRIMARY KEY REFERENCES resources(id) ON DELETE CASCADE,
+  attempted_at TEXT NOT NULL,
+  retry_after TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS resource_motion_previews (
@@ -437,6 +444,58 @@ def connect(database_path: Path) -> sqlite3.Connection:
     )
     connection.commit()
     return connection
+
+
+def workspace_access_token(
+    connection: sqlite3.Connection, *, rotate: bool = False
+) -> str:
+    """Return the private durable token used to authorize local browser sessions."""
+    row = connection.execute(
+        "SELECT value FROM meta WHERE key='workspace_access_token'"
+    ).fetchone()
+    token = str(row["value"] if row else "")
+    if not rotate and re.fullmatch(r"[A-Za-z0-9_-]{40,100}", token):
+        return token
+    token = secrets.token_urlsafe(48)
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO meta(key, value) VALUES('workspace_access_token', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (token,),
+        )
+    return token
+
+
+def remember_workspace_origin(
+    connection: sqlite3.Connection, origin: str, *, history_limit: int = 8
+) -> None:
+    """Remember recent loopback workspace origins so captures can ignore them."""
+    if not re.fullmatch(r"http://127\.0\.0\.1:[0-9]{1,5}", origin):
+        raise ValueError("Workspace origin must be an HTTP loopback origin")
+    origins: list[str] = []
+    for row in connection.execute(
+        "SELECT value FROM meta WHERE key IN ('workspace_origin', 'workspace_origins')"
+    ):
+        origins.extend(value for value in str(row["value"] or "").splitlines() if value)
+    origins.append(origin)
+    remembered = list(dict.fromkeys(origins))[-max(1, min(history_limit, 32)) :]
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO meta(key, value) VALUES('workspace_origin', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (origin,),
+        )
+        connection.execute(
+            """
+            INSERT INTO meta(key, value) VALUES('workspace_origins', ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            ("\n".join(remembered),),
+        )
 
 
 def _backup_before_schema_upgrade(database_path: Path) -> None:

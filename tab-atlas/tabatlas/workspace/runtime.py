@@ -1,55 +1,30 @@
 from __future__ import annotations
 
 import json
-import os
-import queue
 import secrets
 import sqlite3
-import subprocess
-import sys
 import threading
-import time
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
 
-from ..database import connect, open_connection
+from ..database import (
+    connect,
+    open_connection,
+    remember_workspace_origin,
+    workspace_access_token,
+)
 from ..presentation import generate_report, report_payload
-from .agent import (
-    AgentBusy,
-    AgentUnavailable,
-    CodexAppServer,
-    build_note_prompt,
-    build_workspace_prompt,
-)
-from .agent_requests import (
-    complete_agent_request,
-    defer_agent_request,
-    mark_agent_request_failed,
-    mark_agent_request_running,
-    queued_agent_requests,
-    recover_agent_requests,
-)
+from .agent_worker import WorkspaceAgentWorker
 from .browser_sync import BrowserSyncCoordinator
-from .context import _note_agent_context, _safe_error_code, _workspace_agent_context
 from .directory import action_list_summaries, workspace_directory_summaries
 from .lease import WorkspaceLease
 from .notes import note_counts
-from .transcription import (
-    audio_note_source,
-    complete_audio_transcription,
-    fail_audio_transcription,
-    mark_audio_transcription_running,
-    queued_audio_transcriptions,
-)
+from .product_browsers import launch_closed_product_browsers
 from .semantics import proposal_is_current
-from .server_constants import (
-    AGENT_IDLE_SECONDS,
-    TRANSCRIPTION_TIMEOUT_SECONDS,
-    WORKSPACE_HOST,
-)
-from .support import ConflictError
+from .server_constants import AGENT_IDLE_SECONDS, WORKSPACE_HOST
+from .transcription_worker import AudioTranscriptionWorker
 
 
 class TabAtlasWorkspaceServer(ThreadingHTTPServer):
@@ -72,50 +47,72 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
         self.workspace_root = workspace_root.resolve()
         self.state_dir = state_dir.resolve()
         self.database_path = database_path.resolve()
+        self.expected_host = f"{WORKSPACE_HOST}:{self.server_port}"
+        self.origin = f"http://{self.expected_host}"
         initialized = connect(self.database_path)
+        self.session_token = workspace_access_token(initialized)
+        remember_workspace_origin(initialized, self.origin)
         initialized.close()
         self.report_dir = report_dir.resolve()
         self.report_assets = report_assets.resolve()
         self.lease = lease
-        self.session_token = secrets.token_urlsafe(32)
         self.csrf_token = secrets.token_urlsafe(32)
-        self.expected_host = f"{WORKSPACE_HOST}:{self.server_port}"
-        self.origin = f"http://{self.expected_host}"
-        self.agent = CodexAppServer(self.workspace_root, self.state_dir)
-        self.agent_handed_off = False
-        self._ownership_lock = threading.Lock()
-        self._agent_idle_lock = threading.Lock()
-        self._agent_idle_timer: threading.Timer | None = None
         self._report_lock = threading.Lock()
+        self._stop_event = threading.Event()
         self.browser_sync = BrowserSyncCoordinator(
             self.database_path,
             self.state_dir,
             self.regenerate_report,
+            browser_launcher=launch_closed_product_browsers,
         )
-        self._request_queue: queue.Queue[str | None] = queue.Queue()
-        self._queued_ids: set[str] = set()
-        self._queued_lock = threading.Lock()
-        self._transcription_queue: queue.Queue[str | None] = queue.Queue()
-        self._transcription_ids: set[str] = set()
-        self._transcription_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._worker = threading.Thread(
-            target=self._agent_worker,
-            name="tabatlas-agent-worker",
-            daemon=True,
+        self._agent_jobs = WorkspaceAgentWorker(
+            self.workspace_root,
+            self.state_dir,
+            self.database,
+            self.regenerate_report,
+            self._stop_event,
+            lambda: AGENT_IDLE_SECONDS,
         )
-        self._worker.start()
-        self._transcription_worker = threading.Thread(
-            target=self._audio_transcription_worker,
-            name="tabatlas-transcription-worker",
-            daemon=True,
+        self._transcription_jobs = AudioTranscriptionWorker(
+            self.workspace_root,
+            self.state_dir,
+            self.database,
+            lambda path: self._run_local_transcriber(path),
+            self._stop_event,
         )
-        self._transcription_worker.start()
-        with self.database() as connection:
-            for request in recover_agent_requests(connection, 100):
-                self.enqueue_agent_request(request["id"])
-            for note in queued_audio_transcriptions(connection, 100):
-                self.enqueue_audio_transcription(note["id"])
+        self._expose_worker_compatibility_attributes()
+        self._agent_jobs.start()
+        self._transcription_jobs.start()
+        self._agent_jobs.recover()
+        self._transcription_jobs.recover()
+
+    def _expose_worker_compatibility_attributes(self) -> None:
+        self._request_queue = self._agent_jobs.queue
+        self._queued_ids = self._agent_jobs.queued_ids
+        self._queued_lock = self._agent_jobs.queued_lock
+        self._ownership_lock = self._agent_jobs.ownership_lock
+        self._agent_idle_lock = self._agent_jobs.idle_lock
+        self._worker = self._agent_jobs.thread
+        self._transcription_queue = self._transcription_jobs.queue
+        self._transcription_ids = self._transcription_jobs.queued_ids
+        self._transcription_lock = self._transcription_jobs.queued_lock
+        self._transcription_worker = self._transcription_jobs.thread
+
+    @property
+    def agent(self) -> Any:
+        return self._agent_jobs.agent
+
+    @agent.setter
+    def agent(self, value: Any) -> None:
+        self._agent_jobs.agent = value
+
+    @property
+    def agent_handed_off(self) -> bool:
+        return self._agent_jobs.handed_off
+
+    @agent_handed_off.setter
+    def agent_handed_off(self, value: bool) -> None:
+        self._agent_jobs.handed_off = value
 
     @contextmanager
     def database(self) -> Iterator[sqlite3.Connection]:
@@ -126,19 +123,10 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
             connection.close()
 
     def enqueue_agent_request(self, request_id: str) -> None:
-        self._cancel_agent_idle_stop()
-        with self._queued_lock:
-            if request_id in self._queued_ids:
-                return
-            self._queued_ids.add(request_id)
-        self._request_queue.put(request_id)
+        self._agent_jobs.enqueue(request_id)
 
     def enqueue_audio_transcription(self, note_id: str) -> None:
-        with self._transcription_lock:
-            if note_id in self._transcription_ids:
-                return
-            self._transcription_ids.add(note_id)
-        self._transcription_queue.put(note_id)
+        self._transcription_jobs.enqueue(note_id)
 
     def regenerate_report(self) -> None:
         with self._report_lock, self.database() as connection:
@@ -160,10 +148,8 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         self._stop_event.set()
-        self._cancel_agent_idle_stop()
-        self._request_queue.put(None)
-        self._transcription_queue.put(None)
-        self.agent.stop()
+        self._agent_jobs.close()
+        self._transcription_jobs.close()
         super().server_close()
         self.lease.close()
 
@@ -265,232 +251,28 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
         }
 
     def handoff_agent(self) -> dict[str, Any]:
-        self._cancel_agent_idle_stop()
-        if not self._ownership_lock.acquire(blocking=False):
-            raise ConflictError(
-                "Wait for the current Codex turn before opening it in desktop"
-            )
-        try:
-            if not self.agent.thread_id:
-                self.agent.start()
-            if self.agent.busy:
-                raise ConflictError(
-                    "Wait for the current Codex turn before opening it in desktop"
-                )
-            deep_link = self.agent.deep_link
-            self.agent.stop()
-            self.agent_handed_off = True
-            return {"ownership": "codex_desktop", "deepLink": deep_link}
-        finally:
-            self._ownership_lock.release()
+        return self._agent_jobs.handoff()
 
     def reclaim_agent(self) -> dict[str, Any]:
-        with self._ownership_lock:
-            self.agent_handed_off = False
-            status = self.agent.start()
-        with self.database() as connection:
-            for request in queued_agent_requests(connection, 100):
-                self.enqueue_agent_request(request["id"])
-        self._schedule_agent_idle_stop()
-        return {**status, "ownership": "workspace"}
-
-    def _audio_transcription_worker(self) -> None:
-        while not self._stop_event.is_set():
-            note_id = self._transcription_queue.get()
-            if note_id is None:
-                return
-            try:
-                self._process_audio_transcription(note_id)
-            finally:
-                with self._transcription_lock:
-                    self._transcription_ids.discard(note_id)
+        return self._agent_jobs.reclaim()
 
     def _process_audio_transcription(self, note_id: str) -> None:
-        try:
-            with self.database() as connection:
-                note = mark_audio_transcription_running(connection, note_id)
-                if (
-                    note.get("processing", {}).get("transcription", {}).get("state")
-                    == "succeeded"
-                ):
-                    return
-                source = audio_note_source(connection, self.state_dir, note_id)
-            result = self._run_local_transcriber(source["path"])
-            with self.database() as connection:
-                complete_audio_transcription(
-                    connection,
-                    note_id,
-                    result["text"],
-                    result["model"],
-                )
-        except Exception as error:
-            if self._stop_event.is_set():
-                return
-            with self.database() as connection:
-                try:
-                    fail_audio_transcription(
-                        connection, note_id, _safe_error_code(error)
-                    )
-                except ValueError:
-                    pass
+        self._transcription_jobs.process(note_id)
 
     def _run_local_transcriber(self, audio_path: Path) -> dict[str, str]:
-        script = self.workspace_root / "scripts" / "tab_atlas_transcribe.py"
-        if not script.is_file():
-            raise RuntimeError("local_transcriber_missing")
-        environment = os.environ.copy()
-        environment.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-        environment.setdefault("TOKENIZERS_PARALLELISM", "false")
-        creation_flags = (
-            getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-        )
-        process = subprocess.Popen(
-            [sys.executable, str(script), str(audio_path)],
-            cwd=str(self.workspace_root),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=environment,
-            creationflags=creation_flags,
-        )
-        deadline = time.monotonic() + TRANSCRIPTION_TIMEOUT_SECONDS
-        while process.poll() is None:
-            if self._stop_event.wait(0.25):
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-                raise RuntimeError("workspace_stopped")
-            if time.monotonic() >= deadline:
-                process.kill()
-                process.wait(timeout=5)
-                raise RuntimeError("local_transcription_timeout")
-        stdout, _stderr = process.communicate()
-        try:
-            payload = json.loads(stdout or "{}")
-        except json.JSONDecodeError as error:
-            raise RuntimeError("local_transcriber_invalid_output") from error
-        if (
-            process.returncode
-            or not isinstance(payload, dict)
-            or not payload.get("text")
-        ):
-            code = str(payload.get("error") or "local_transcription_failed")
-            raise RuntimeError(code)
-        return {
-            "text": str(payload["text"]),
-            "model": str(payload.get("model") or "local_whisper"),
-        }
-
-    def _agent_worker(self) -> None:
-        while not self._stop_event.is_set():
-            request_id = self._request_queue.get()
-            if request_id is None:
-                return
-            try:
-                self._process_agent_request(request_id)
-            finally:
-                with self._queued_lock:
-                    self._queued_ids.discard(request_id)
+        return self._transcription_jobs.run_local_transcriber(audio_path)
 
     def _process_agent_request(self, request_id: str) -> None:
-        with self._ownership_lock:
-            if self.agent_handed_off:
-                return
-            self._process_agent_request_owned(request_id)
-            self._schedule_agent_idle_stop()
+        self._agent_jobs.process(request_id)
 
     def _cancel_agent_idle_stop(self) -> None:
-        with self._agent_idle_lock:
-            timer = self._agent_idle_timer
-            self._agent_idle_timer = None
-        if timer:
-            timer.cancel()
+        self._agent_jobs.cancel_idle_stop()
 
     def _schedule_agent_idle_stop(self) -> None:
-        self._cancel_agent_idle_stop()
-        if self._stop_event.is_set():
-            return
-        timer = threading.Timer(AGENT_IDLE_SECONDS, self._stop_idle_agent)
-        timer.daemon = True
-        with self._agent_idle_lock:
-            self._agent_idle_timer = timer
-        timer.start()
+        self._agent_jobs.schedule_idle_stop()
 
     def _stop_idle_agent(self) -> None:
-        with self._agent_idle_lock:
-            self._agent_idle_timer = None
-        if not self._ownership_lock.acquire(blocking=False):
-            return
-        try:
-            if (
-                not self.agent_handed_off
-                and not self.agent.busy
-                and self._request_queue.empty()
-            ):
-                self.agent.stop()
-        finally:
-            self._ownership_lock.release()
+        self._agent_jobs.stop_idle_agent()
 
     def _process_agent_request_owned(self, request_id: str) -> None:
-        request = None
-        with self.database() as connection:
-            try:
-                request = connection.execute(
-                    "SELECT * FROM agent_requests WHERE id=?",
-                    (request_id,),
-                ).fetchone()
-                if not request or request["status"] != "queued":
-                    return
-                mark_agent_request_running(connection, request_id)
-                if request["kind"] == "interpret_note":
-                    context = _note_agent_context(
-                        connection,
-                        request["resource_id"],
-                        request["note_id"],
-                    )
-                    prompt = build_note_prompt(context)
-                else:
-                    context = _workspace_agent_context(
-                        connection,
-                        request["resource_id"],
-                        str(request["request_text"] or ""),
-                    )
-                    prompt = build_workspace_prompt(
-                        context, str(request["request_text"] or "")
-                    )
-            except Exception as error:
-                if request and request["status"] == "queued":
-                    try:
-                        mark_agent_request_failed(
-                            connection, request_id, _safe_error_code(error)
-                        )
-                    except ValueError:
-                        pass
-                return
-
-        try:
-            response = self.agent.turn(prompt)
-            with self.database() as connection:
-                complete_agent_request(
-                    connection,
-                    request_id,
-                    response,
-                    self.agent.thread_id,
-                    self.agent.model,
-                )
-            self.regenerate_report()
-        except (AgentUnavailable, AgentBusy) as error:
-            self.agent.stop()
-            with self.database() as connection:
-                defer_agent_request(connection, request_id, _safe_error_code(error))
-        except (ValueError, json.JSONDecodeError) as error:
-            with self.database() as connection:
-                mark_agent_request_failed(
-                    connection, request_id, _safe_error_code(error)
-                )
+        self._agent_jobs.process_owned(request_id)

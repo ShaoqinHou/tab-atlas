@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 TABATLAS_EXTENSION_ID = "ohgpplkophdikjnbefigdhikdooehmkh"
 TABATLAS_EXTENSION_URL_PREFIX = f"chrome-extension://{TABATLAS_EXTENSION_ID}/"
 LEGACY_CAPTURE_PROTOCOL_VERSION = 2

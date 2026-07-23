@@ -80,13 +80,26 @@ function resourceFooter(resource, placement) {
       node("span", "", "Not yet in the durable library")
     );
     const actions = node("span", "resource-footer-actions");
-    const accept = node("button", "resource-action-command accept-resource-command", "Add to library");
+    const accept = node("button", "resource-action-command accept-resource-command", "Add");
     accept.type = "button";
     accept.addEventListener("click", () => requestDiscoveryAcceptance(resource));
+    const openTabs = liveTabs(resource).length;
+    if (openTabs) {
+      const acceptAndClose = node(
+        "button",
+        "resource-action-command accept-close-resource-command",
+        openTabs === 1 ? "Add + close tab" : `Add + close ${formatNumber(openTabs)} tabs`
+      );
+      acceptAndClose.type = "button";
+      acceptAndClose.title = "Save this page first, then close only its freshly captured browser tab after exact revalidation.";
+      acceptAndClose.addEventListener("click", () => requestDiscoveryAcceptance(resource, true));
+      actions.append(acceptAndClose);
+    }
     const dismiss = node("button", "resource-action-command dismiss-resource-command", "Dismiss");
     dismiss.type = "button";
     dismiss.addEventListener("click", () => requestDiscoveryDismissal(resource));
-    actions.append(accept, dismiss);
+    actions.prepend(accept);
+    actions.append(dismiss);
     wrapper.append(copy, actions);
     return wrapper;
   }

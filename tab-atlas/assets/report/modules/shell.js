@@ -42,7 +42,7 @@ app.innerHTML = `
       </div>
     </form>
   </aside>
-  <div id="actionStatus" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>`;
+  <div id="actionStatus" class="action-status" role="status" aria-live="polite" aria-atomic="true"></div>`;
 
 const elements = {
   topbar: document.querySelector(".topbar"),

@@ -22,6 +22,10 @@ def handle_read_get(request: ApiRequest, path: str) -> bool:
     if path == "/api/v1/browser-sync":
         request._send_json(server.browser_sync.status())
         return True
+    match = re.fullmatch(rf"/api/v1/tab-closures/({OPAQUE_ID_PATTERN})", path)
+    if match:
+        request._send_json(server.tab_closure.status(match.group(1)))
+        return True
     match = re.fullmatch(rf"/api/v1/resources/({RESOURCE_ID_PATTERN})/notes", path)
     if match:
         with server.database() as connection:

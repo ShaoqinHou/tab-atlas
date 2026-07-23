@@ -109,6 +109,26 @@
   .sync-control[aria-busy="true"] .sync-command::before { animation: none; }
 }
 
+.action-status {
+  position: fixed;
+  z-index: 80;
+  right: 18px;
+  bottom: 76px;
+  width: min(430px, calc(100vw - 36px));
+  border: 1px solid #9fb2aa;
+  border-radius: 6px;
+  padding: 11px 13px;
+  color: #263c34;
+  background: #f6faf8;
+  box-shadow: 0 8px 26px rgba(31, 49, 42, .16);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.action-status:empty { display: none; }
+.action-status[data-tone="progress"] { border-color: #93aabd; background: #f3f7fa; }
+.action-status[data-tone="warning"] { border-color: #c7a56c; background: #fff9ef; }
+.action-status[data-tone="error"] { border-color: #c58b85; color: #6f302c; background: #fff5f4; }
+
 .primary-nav {
   display: grid;
   grid-template-columns: repeat(3, minmax(100px, 145px));

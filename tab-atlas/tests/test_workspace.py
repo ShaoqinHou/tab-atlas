@@ -15,7 +15,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tabatlas import apply_annotations, connect, generate_report, save_pairing, utc_now  # noqa: E402
+from tabatlas import (  # noqa: E402
+    apply_annotations,
+    connect,
+    generate_report,
+    save_pairing,
+    set_discovery_state,
+    store_snapshot,
+    utc_now,
+)
 from tabatlas.workspace import (  # noqa: E402
     ConflictError,
     add_audio_transcript,
@@ -44,6 +52,7 @@ import tabatlas.workspace.runtime as workspace_server_module  # noqa: E402
 from tabatlas.workspace.context import _workspace_agent_context  # noqa: E402
 from tabatlas.workspace.browser_sync import BrowserSyncCoordinator  # noqa: E402
 from tabatlas.database import workspace_access_token  # noqa: E402
+from tabatlas.workspace.tab_closure import TabClosureCoordinator  # noqa: E402
 from tabatlas.workspace import (  # noqa: E402
     create_workspace_server,
 )
@@ -939,6 +948,207 @@ class BrowserSyncCoordinatorTests(unittest.TestCase):
             self.assertTrue(status["browsers"]["edge"]["launchedBySync"])
 
 
+class TabClosureCoordinatorTests(unittest.TestCase):
+    def test_unpaired_close_request_keeps_the_saved_page_and_reports_the_blocker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            database = state / "atlas.sqlite"
+            connection = connect(database)
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "edge",
+                    "capturedAt": "2026-07-23T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 20,
+                            "windowId": 2,
+                            "index": 0,
+                            "groupId": -1,
+                            "title": "Saved before close",
+                            "url": "https://example.com/saved-before-close",
+                        }
+                    ],
+                },
+                "extension_live",
+                new_resource_state="candidate",
+            )
+            resource_id = connection.execute(
+                "SELECT id FROM resources WHERE library_state='candidate'"
+            ).fetchone()["id"]
+            set_discovery_state(connection, "accepted", {resource_id})
+            connection.close()
+
+            coordinator = TabClosureCoordinator(
+                database,
+                state,
+                lambda: None,
+                mutation_runner=lambda *_args: self.fail("mutation must not start"),
+            )
+            started = coordinator.start({resource_id})
+            deadline = time.monotonic() + 2
+            status = coordinator.status(started["id"])
+            while status["phase"] not in {"complete", "partial", "failed"}:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+                status = coordinator.status(started["id"])
+
+            connection = connect(database)
+            try:
+                library_state = connection.execute(
+                    "SELECT library_state FROM resources WHERE id=?", (resource_id,)
+                ).fetchone()["library_state"]
+            finally:
+                connection.close()
+            self.assertEqual(status["phase"], "failed")
+            self.assertIn("Edge is not paired", status["error"])
+            self.assertEqual(library_state, "accepted")
+
+    def test_close_job_is_resource_bounded_and_post_capture_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            database = state / "atlas.sqlite"
+            connection = connect(database)
+            save_pairing(connection, "chrome", "a" * 32, "secret")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-23T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 10,
+                            "windowId": 1,
+                            "index": 0,
+                            "groupId": -1,
+                            "title": "Close this page",
+                            "url": "https://example.com/close-this",
+                        },
+                        {
+                            "id": 11,
+                            "windowId": 1,
+                            "index": 1,
+                            "groupId": -1,
+                            "title": "Keep this page",
+                            "url": "https://example.com/keep-this",
+                        },
+                    ],
+                },
+                "extension_live",
+                new_resource_state="candidate",
+            )
+            resource_ids = {
+                row["canonical_url"]: row["id"]
+                for row in connection.execute(
+                    "SELECT id, canonical_url FROM resources WHERE library_state='candidate'"
+                )
+            }
+            selected_id = resource_ids["https://example.com/close-this"]
+            retained_id = resource_ids["https://example.com/keep-this"]
+            set_discovery_state(connection, "accepted", resource_ids.values())
+            connection.close()
+            observed_targets = []
+            published = []
+
+            def mutation_runner(_database, _state, plan, _timeout):
+                targets = plan["browsers"]["chrome"]["targets"]
+                observed_targets.extend(targets)
+                return True, {
+                    "chrome": {
+                        "closedCount": 1,
+                        "skippedCount": 0,
+                        "controlTabId": 99,
+                        "controlWindowId": 1,
+                        "results": [
+                            {
+                                "tabId": targets[0]["targetTabId"],
+                                "status": "closed",
+                                "reason": "captured_and_archived",
+                            }
+                        ],
+                    }
+                }
+
+            def capture_runner(_database, _state, browsers, _timeout):
+                self.assertEqual(browsers, {"chrome"})
+                current = connect(database)
+                try:
+                    capture = store_snapshot(
+                        current,
+                        state,
+                        {
+                            "browser": "chrome",
+                            "capturedAt": "2026-07-23T00:01:00Z",
+                            "tabs": [
+                                {
+                                    "id": 11,
+                                    "windowId": 1,
+                                    "index": 0,
+                                    "groupId": -1,
+                                    "title": "Keep this page",
+                                    "url": "https://example.com/keep-this",
+                                },
+                                {
+                                    "id": 99,
+                                    "windowId": 1,
+                                    "index": 1,
+                                    "groupId": -1,
+                                    "title": "Archive verification",
+                                    "url": "chrome-extension://ohgpplkophdikjnbefigdhikdooehmkh/archive_complete.html",
+                                },
+                            ],
+                        },
+                        "extension_live",
+                    )
+                finally:
+                    current.close()
+                return True, {"chrome": capture}
+
+            coordinator = TabClosureCoordinator(
+                database,
+                state,
+                lambda: published.append(True),
+                mutation_runner=mutation_runner,
+                capture_runner=capture_runner,
+                cleanup_runner=lambda *_args: (
+                    True,
+                    {"chrome": {"status": "closed"}},
+                ),
+                timeout_seconds=1,
+            )
+            started = coordinator.start({selected_id})
+            deadline = time.monotonic() + 3
+            status = coordinator.status(started["id"])
+            while status["phase"] not in {"complete", "partial", "failed"}:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+                status = coordinator.status(started["id"])
+
+            connection = connect(database)
+            try:
+                selected_status = connection.execute(
+                    "SELECT status FROM resources WHERE id=?", (selected_id,)
+                ).fetchone()["status"]
+                retained_status = connection.execute(
+                    "SELECT status FROM resources WHERE id=?", (retained_id,)
+                ).fetchone()["status"]
+            finally:
+                connection.close()
+
+            self.assertEqual(status["phase"], "complete", status)
+            self.assertEqual(status["plannedTabs"], 1)
+            self.assertEqual(status["closedTabs"], 1)
+            self.assertEqual(len(observed_targets), 1)
+            self.assertEqual(observed_targets[0]["resourceId"], selected_id)
+            self.assertEqual(selected_status, "saved")
+            self.assertEqual(retained_status, "open")
+            self.assertEqual(published, [True])
+
+
 class WorkspaceServerTests(unittest.TestCase):
     def test_server_transcription_worker_persists_local_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1053,6 +1263,15 @@ class WorkspaceServerTests(unittest.TestCase):
                 0,
             )
             server.agent_handed_off = True
+            close_requests = []
+            server.start_tab_closure = lambda resource_ids: (
+                close_requests.append(set(resource_ids))
+                or {
+                    "id": "close_" + "d" * 24,
+                    "phase": "queued",
+                    "plannedTabs": 0,
+                }
+            )
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             client = http.client.HTTPConnection(
@@ -1129,9 +1348,9 @@ class WorkspaceServerTests(unittest.TestCase):
                     sync_result["browsers"]["chrome"]["state"], "unavailable"
                 )
 
-                decision_body = json.dumps({"resourceIds": [CANDIDATE_ID]}).encode(
-                    "utf-8"
-                )
+                decision_body = json.dumps(
+                    {"resourceIds": [CANDIDATE_ID], "closeTabs": True}
+                ).encode("utf-8")
                 decision_headers["Content-Length"] = str(len(decision_body))
                 client.request(
                     "POST",
@@ -1144,6 +1363,8 @@ class WorkspaceServerTests(unittest.TestCase):
                 self.assertEqual(response.status, 200, accepted)
                 self.assertEqual(accepted["state"], "accepted")
                 self.assertEqual(accepted["updated"], 1)
+                self.assertEqual(accepted["tabClosure"]["phase"], "queued")
+                self.assertEqual(close_requests, [{CANDIDATE_ID}])
 
                 decision_body = json.dumps({"resourceIds": [DISMISSED_ID]}).encode(
                     "utf-8"

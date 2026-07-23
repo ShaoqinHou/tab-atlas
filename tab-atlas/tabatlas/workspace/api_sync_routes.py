@@ -29,9 +29,16 @@ def handle_sync_post(request: ApiRequest, path: str) -> bool:
     if not isinstance(resource_ids, list) or not resource_ids:
         raise ValueError("resourceIds must be a non-empty list")
     target_state = "accepted" if match.group(1) == "accept" else "dismissed"
+    close_tabs = document.get("closeTabs", False)
+    if not isinstance(close_tabs, bool):
+        raise ValueError("closeTabs must be true or false")
+    if close_tabs and target_state != "accepted":
+        raise ValueError("Only accepted discoveries can close browser tabs")
     with server.database() as connection:
         result = set_discovery_state(connection, target_state, resource_ids)
         result["inventory"] = inventory(connection)
-    server.regenerate_report()
+    if close_tabs:
+        result["tabClosure"] = server.start_tab_closure(set(result["resourceIds"]))
+    server.schedule_report_regeneration()
     request._send_json(result)
     return True

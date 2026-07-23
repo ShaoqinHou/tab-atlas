@@ -10,11 +10,11 @@ function requestCapturedTabArchive() {
   });
 }
 
-async function requestDiscoveryAcceptance(resource = null) {
+async function requestDiscoveryAcceptance(resource = null, closeTabs = false) {
   const selected = resource
     ? [resource.resourceId]
     : discoveries.map(item => item.resourceId);
-  await requestDiscoveryDecision("accept", selected);
+  await requestDiscoveryDecision("accept", selected, { closeTabs });
 }
 
 async function requestDiscoveryDismissal(resource) {
@@ -22,7 +22,7 @@ async function requestDiscoveryDismissal(resource) {
   await requestDiscoveryDecision("dismiss", [resource.resourceId]);
 }
 
-async function requestDiscoveryDecision(decision, selected) {
+async function requestDiscoveryDecision(decision, selected, options = {}) {
   const resourceIds = unique(selected.filter(resourceId => resourceById.has(resourceId)));
   if (!resourceIds.length) return;
   if (!workspace.interactive) {
@@ -36,25 +36,93 @@ async function requestDiscoveryDecision(decision, selected) {
     );
     return;
   }
-  const buttons = [...document.querySelectorAll(".accept-resource-command, .dismiss-resource-command")];
+  const selectedSet = new Set(resourceIds);
+  const buttons = [
+    ...document.querySelectorAll(
+      ".accept-resource-command, .accept-close-resource-command, .dismiss-resource-command"
+    )
+  ].filter(button => {
+    const scope = button.closest("[data-resource-id]");
+    return !scope || selectedSet.has(scope.dataset.resourceId);
+  });
   buttons.forEach(button => { button.disabled = true; });
+  setActionFeedback(
+    decision === "accept" ? "Adding to the local library..." : "Saving dismissal...",
+    "progress"
+  );
   try {
     const result = await workspaceRequest(`/api/v1/discoveries/${decision}`, {
       method: "POST",
-      json: { resourceIds }
+      json: { resourceIds, closeTabs: Boolean(options.closeTabs) }
     });
     const restored = decision === "accept" && resourceIds.some(resourceId => resourceById.get(resourceId)?.libraryState === "dismissed");
-    elements.actionStatus.textContent = decision === "dismiss"
-      ? `${formatNumber(result.updated)} resource${result.updated === 1 ? "" : "s"} dismissed. Browser tabs were unchanged.`
-      : `${formatNumber(result.updated)} resource${result.updated === 1 ? "" : "s"} ${restored ? "restored" : "added"} to the library.`;
-    await refreshCatalogSnapshot().catch(error => {
-      showWorkspaceError(error, "The decision was saved, but the updated catalog could not be loaded.");
-    });
+    applyDiscoveryDecisionLocally(decision, result.resourceIds || resourceIds, result.inventory);
+    renderPreservingViewport(result.resourceIds || resourceIds);
+    if (result.tabClosure?.id) {
+      setActionFeedback(
+        `${formatNumber(result.updated)} resource${result.updated === 1 ? "" : "s"} saved. Waiting for the browser to verify and close its captured tab${result.tabClosure.plannedTabs === 1 ? "" : "s"}...`,
+        "progress"
+      );
+      watchTabClosure(result.tabClosure);
+    } else {
+      setActionFeedback(
+        decision === "dismiss"
+          ? `${formatNumber(result.updated)} resource${result.updated === 1 ? "" : "s"} dismissed. Browser tabs were left open.`
+          : `${formatNumber(result.updated)} resource${result.updated === 1 ? "" : "s"} ${restored ? "restored" : "added"}. Browser tabs were left open.`,
+        "success"
+      );
+    }
   } catch (error) {
     showWorkspaceError(error, "The discovery decision could not be saved.");
   } finally {
     buttons.forEach(button => { button.disabled = false; });
   }
+}
+
+function watchTabClosure(initial) {
+  const jobId = String(initial?.id || "");
+  if (!jobId || workspace.tabClosurePolls.has(jobId)) return;
+  const poll = async () => {
+    try {
+      const status = await workspaceRequest(`/api/v1/tab-closures/${jobId}`);
+      if (["complete", "partial", "failed"].includes(status.phase)) {
+        workspace.tabClosurePolls.delete(jobId);
+        if (status.phase === "complete") {
+          const closed = Number(status.closedTabs || 0);
+          setActionFeedback(
+            closed
+              ? `Saved and verified ${formatNumber(closed)} closed browser tab${closed === 1 ? "" : "s"}.`
+              : "Saved to the library. No matching browser tab was still open.",
+            "success"
+          );
+        } else {
+          setActionFeedback(
+            `Saved to the library. ${status.error || "The browser tab was left open because closure could not be verified."}`,
+            "warning"
+          );
+        }
+        refreshCatalogSnapshot({ preserveViewport: true }).catch(error => {
+          showWorkspaceError(error, "The tab decision is safe, but the latest browser state could not be loaded.");
+        });
+        return;
+      }
+      const label = {
+        queued: "Close request queued",
+        planning: "Checking the latest capture",
+        waiting_for_extension: "Waiting for the passive browser extension",
+        verifying: "Verifying the tab is closed",
+        cleaning: "Finishing browser verification"
+      }[status.phase] || "Verifying browser closure";
+      setActionFeedback(`${label}... You can continue using TabAtlas.`, "progress");
+      const timer = window.setTimeout(poll, 800);
+      workspace.tabClosurePolls.set(jobId, timer);
+    } catch (error) {
+      workspace.tabClosurePolls.delete(jobId);
+      showWorkspaceError(error, "The page was saved, but tab-close progress could not be loaded.");
+    }
+  };
+  const timer = window.setTimeout(poll, 350);
+  workspace.tabClosurePolls.set(jobId, timer);
 }
 
 function requestDuplicateClose(resource = null) {

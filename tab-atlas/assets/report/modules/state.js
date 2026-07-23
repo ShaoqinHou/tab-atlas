@@ -46,6 +46,7 @@ const workspace = {
   noteLoads: new Map(),
   notePolls: new Map(),
   requestPolls: new Map(),
+  tabClosurePolls: new Map(),
   latestAuditByResource: new Map(),
   messages: [],
   recording: null,
@@ -81,7 +82,7 @@ const state = {
   agentOpen: false
 };
 
-function replaceCatalogSnapshot(snapshot) {
+function replaceCatalogSnapshot(snapshot, options = {}) {
   const next = snapshot && typeof snapshot === "object" ? snapshot : {};
   const nextResources = Array.isArray(next.resources) ? next.resources : [];
   const nextDiscoveries = Array.isArray(next.discoveries) ? next.discoveries : [];
@@ -115,5 +116,33 @@ function replaceCatalogSnapshot(snapshot) {
     state.lastFocus = null;
   }
   renderFreshness();
-  render();
+  if (options.preserveViewport) renderPreservingViewport();
+  else render();
+}
+
+function applyDiscoveryDecisionLocally(decision, resourceIds, inventory) {
+  const selected = new Set(resourceIds);
+  const changed = trackedResources.filter(resource => selected.has(resource.resourceId));
+  const changedAt = new Date().toISOString();
+  for (const resource of changed) {
+    resource.libraryState = decision === "accept" ? "accepted" : "dismissed";
+    if (decision === "accept") {
+      resource.acceptedAt = changedAt;
+      resource.dismissedAt = "";
+    } else {
+      resource.dismissedAt = changedAt;
+    }
+  }
+  discoveries = discoveries.filter(resource => !selected.has(resource.resourceId));
+  dismissed = dismissed.filter(resource => !selected.has(resource.resourceId));
+  resources = resources.filter(resource => !selected.has(resource.resourceId));
+  if (decision === "accept") resources = [...changed, ...resources];
+  else dismissed = [...changed, ...dismissed];
+  allResources = [...discoveries, ...resources];
+  trackedResources = [...allResources, ...dismissed];
+  resourceById = new Map(trackedResources.map(resource => [resource.resourceId, resource]));
+  data.resources = resources;
+  data.discoveries = discoveries;
+  data.dismissed = dismissed;
+  if (inventory && typeof inventory === "object") data.inventory = inventory;
 }

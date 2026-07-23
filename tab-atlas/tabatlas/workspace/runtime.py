@@ -22,7 +22,9 @@ from .directory import action_list_summaries, workspace_directory_summaries
 from .lease import WorkspaceLease
 from .notes import note_counts
 from .product_browsers import launch_closed_product_browsers
+from .report_updates import DeferredReportPublisher
 from .semantics import proposal_is_current
+from .tab_closure import TabClosureCoordinator
 from .server_constants import AGENT_IDLE_SECONDS, WORKSPACE_HOST
 from .transcription_worker import AudioTranscriptionWorker
 
@@ -58,13 +60,22 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
         self.lease = lease
         self.csrf_token = secrets.token_urlsafe(32)
         self._report_lock = threading.Lock()
+        self._browser_operation_lock = threading.Lock()
         self._stop_event = threading.Event()
         self.browser_sync = BrowserSyncCoordinator(
             self.database_path,
             self.state_dir,
             self.regenerate_report,
             browser_launcher=launch_closed_product_browsers,
+            operation_lock=self._browser_operation_lock,
         )
+        self.tab_closure = TabClosureCoordinator(
+            self.database_path,
+            self.state_dir,
+            self.regenerate_report,
+            operation_lock=self._browser_operation_lock,
+        )
+        self._deferred_report = DeferredReportPublisher(self.regenerate_report)
         self._agent_jobs = WorkspaceAgentWorker(
             self.workspace_root,
             self.state_dir,
@@ -134,6 +145,12 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
                 connection, self.report_dir, self.report_assets, self.state_dir
             )
 
+    def schedule_report_regeneration(self) -> None:
+        self._deferred_report.schedule()
+
+    def start_tab_closure(self, resource_ids: set[str]) -> dict[str, Any]:
+        return self.tab_closure.start(resource_ids)
+
     def catalog_snapshot(self) -> dict[str, Any]:
         with self.database() as connection:
             return report_payload(connection)
@@ -148,6 +165,7 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         self._stop_event.set()
+        self._deferred_report.close()
         self._agent_jobs.close()
         self._transcription_jobs.close()
         super().server_close()

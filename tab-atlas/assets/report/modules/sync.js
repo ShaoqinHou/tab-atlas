@@ -221,7 +221,7 @@ async function refreshCatalogSnapshot(options = {}) {
   if (!snapshot || !Array.isArray(snapshot.resources) || !Array.isArray(snapshot.discoveries)) {
     throw new Error("The catalog endpoint returned an invalid snapshot.");
   }
-  replaceCatalogSnapshot(snapshot);
+  replaceCatalogSnapshot(snapshot, { preserveViewport: options.preserveViewport !== false });
   if (options.announce) {
     elements.actionStatus.textContent = "Browser sync finished and the catalog was updated.";
   }

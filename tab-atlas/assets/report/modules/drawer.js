@@ -19,6 +19,7 @@ function renderDrawer() {
     if (event.target === backdrop) closeDetails();
   });
   const drawer = node("aside", "detail-drawer");
+  drawer.dataset.resourceId = resource.resourceId;
   drawer.setAttribute("role", "dialog");
   drawer.setAttribute("aria-modal", "true");
   drawer.setAttribute("aria-label", `Details for ${resourceDisplayTitle(resource)}`);

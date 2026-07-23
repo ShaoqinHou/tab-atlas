@@ -88,14 +88,20 @@ The receiver exists only during a requested operation and binds to
 1. Start the workspace. Its initial sync stages unseen canonical resources.
 2. Review **New discoveries**. Candidates use the same cards, previews, notes,
    inspector, source actions, and scoped Ask Codex context as accepted resources.
-   Accept useful resources or dismiss unwanted ones.
+   **Add** saves a resource and deliberately leaves its browser tabs open.
+   **Add + close** saves first, then queues only that resource's freshly captured
+   tabs for exact URL and context revalidation through the paired extension.
+   Review position stays anchored while the close and post-close verification run
+   in the background. If the extension is unavailable or the tab changed, the
+   durable resource remains saved and the tab is left open with a visible reason.
 3. Use Home and Library to browse by purpose, project, action, or source.
 4. Add typed or local voice notes when page metadata does not express your
    intent. Ask Codex for a proposal only when interpretation is useful.
 5. Use **Sync now** after opening more tabs. Known resources update provenance;
    only unseen canonical resources return to review.
-6. Close browser tabs only through a separately previewed and approved mutation
-   when verified closure is wanted.
+6. Use the full archive action only when closing a reviewed batch. Per-resource
+   **Add + close** uses the same backup, signed mutation, and post-capture evidence
+   path without blocking the review interface.
 
 When working through an active Codex task, say **“sync and prepare new
 discoveries.”** Codex can review the staged batch against the whole library and

@@ -1,8 +1,38 @@
 function showWorkspaceError(error, fallback) {
   const message = error?.message || fallback;
-  elements.actionStatus.textContent = message;
+  setActionFeedback(message, "error");
   workspace.messages.push({ role: "assistant", text: message });
   renderAgentPanel();
+}
+
+function setActionFeedback(message, tone = "info") {
+  elements.actionStatus.textContent = String(message || "");
+  elements.actionStatus.dataset.tone = tone;
+}
+
+function renderPreservingViewport(excludedResourceIds = []) {
+  const excluded = new Set(excludedResourceIds);
+  const viewportTop = elements.primaryNav.getBoundingClientRect().bottom;
+  const cards = [...elements.screen.querySelectorAll(".resource-card[data-resource-id]")];
+  const anchor = cards.find(card => {
+    if (excluded.has(card.dataset.resourceId)) return false;
+    return card.getBoundingClientRect().bottom > viewportTop;
+  });
+  const anchorId = anchor?.dataset.resourceId || "";
+  const anchorTop = anchor?.getBoundingClientRect().top ?? 0;
+  const previousScroll = window.scrollY;
+  render();
+  requestAnimationFrame(() => {
+    const nextAnchor = anchorId
+      ? [...elements.screen.querySelectorAll(".resource-card[data-resource-id]")]
+          .find(card => card.dataset.resourceId === anchorId)
+      : null;
+    if (nextAnchor) {
+      window.scrollBy({ top: nextAnchor.getBoundingClientRect().top - anchorTop });
+    } else {
+      window.scrollTo({ top: previousScroll });
+    }
+  });
 }
 
 function factChip(value) {

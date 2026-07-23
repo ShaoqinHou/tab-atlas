@@ -32,6 +32,7 @@ class BrowserSyncCoordinator:
         capture_runner: CaptureRunner = run_capture,
         review_preparer: ReviewPreparer = prepare_visual_review,
         browser_launcher: BrowserLauncher = no_product_browser_launch,
+        operation_lock: threading.Lock | None = None,
         timeout_seconds: int = 45,
     ) -> None:
         self.database_path = database_path.resolve()
@@ -40,6 +41,7 @@ class BrowserSyncCoordinator:
         self.capture_runner = capture_runner
         self.review_preparer = review_preparer
         self.browser_launcher = browser_launcher
+        self.operation_lock = operation_lock or threading.Lock()
         self.timeout_seconds = timeout_seconds
         self._lock = threading.Lock()
         self._job = self._idle_job()
@@ -119,6 +121,10 @@ class BrowserSyncCoordinator:
         return result
 
     def _run(self, targets: set[str]) -> None:
+        with self.operation_lock:
+            self._run_exclusive(targets)
+
+    def _run_exclusive(self, targets: set[str]) -> None:
         self._set_phase("waiting_for_extension")
         launch_context = self.browser_launcher(targets)
         launched: dict[str, Any] = {}

@@ -18,11 +18,17 @@ def build_archive_plan(
     browsers: set[str],
     capture_ids: dict[str, str] | None = None,
     include_dismissed: bool = False,
+    resource_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     requested = {normalize_browser(browser) for browser in browsers}
     if not requested or not requested.issubset({"chrome", "edge"}):
         raise ValueError("Captured-tab archiving supports Chrome and Edge only")
     captures = _resolve_plan_captures(connection, requested, capture_ids)
+    selected_resources = {
+        str(resource_id).strip()
+        for resource_id in (resource_ids or set())
+        if str(resource_id).strip()
+    }
 
     targets_by_browser: dict[str, list[dict[str, Any]]] = {
         browser: [] for browser in requested
@@ -38,6 +44,8 @@ def build_archive_plan(
         [captures[browser]["id"] for browser in sorted(requested)],
         include_extension_tabs=True,
     ):
+        if selected_resources and resource["resourceId"] not in selected_resources:
+            continue
         resource_browsers = {str(tab.get("browser") or "") for tab in resource["tabs"]}
         if not resource_browsers.intersection(requested):
             continue

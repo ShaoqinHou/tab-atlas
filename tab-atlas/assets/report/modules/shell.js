@@ -21,7 +21,7 @@ app.innerHTML = `
   <nav id="primaryNav" class="primary-nav" aria-label="Primary views" role="tablist">
     <button type="button" role="tab" data-view="home">Home</button>
     <button type="button" role="tab" data-view="library">Library</button>
-    <button type="button" role="tab" data-view="review">Review <span id="navLiveCount" class="nav-count" hidden>0</span></button>
+    <button type="button" role="tab" data-view="review">Manage <span id="navLiveCount" class="nav-count" hidden>0</span></button>
   </nav>
   <main id="screen" class="screen"></main>
   <div id="drawerHost"></div>

@@ -33,6 +33,7 @@ REPORT_SCRIPT_PATHS = (
     # Catalog selectors and reusable navigation controls.
     "modules/catalog-selection.js",
     "modules/directory-controls.js",
+    "modules/organization-batch.js",
     # Resource presentation and inspector features.
     "modules/preview.js",
     "modules/resource-controls.js",

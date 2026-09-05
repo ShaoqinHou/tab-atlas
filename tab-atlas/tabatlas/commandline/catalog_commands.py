@@ -19,6 +19,7 @@ from ..database import pairing_status
 from ..files import copy_extension, import_file
 from ..presentation import generate_report
 from ..previews import cache_public_previews, register_local_preview
+from ..workspace.organization_batches import stage_organization_batch
 from .approvals import _require_inside
 from .context import CommandContext
 from .formatting import _query_result, output
@@ -127,6 +128,26 @@ def apply(context: CommandContext) -> int:
     return 0
 
 
+def stage_organization(context: CommandContext) -> int:
+    path = context.args.path.resolve()
+    if not path.is_file():
+        raise ValueError(f"Organization plan does not exist: {path}")
+    with path.open("r", encoding="utf-8-sig") as handle:
+        document = json.load(handle)
+    batch = stage_organization_batch(context.connection, document)
+    output(
+        {
+            "batchId": batch["id"],
+            "scope": batch["scope"],
+            "status": batch["status"],
+            "analyzedCount": batch["analyzedCount"],
+            "counts": batch["counts"],
+            "notice": "Proposals are staged only; no library organization was applied.",
+        }
+    )
+    return 0
+
+
 def query(context: CommandContext) -> int:
     limit = max(1, min(100, context.args.limit))
     matches = query_resources(context.connection, context.args.text, limit)
@@ -194,6 +215,7 @@ CATALOG_HANDLERS: dict[str, Callable[[CommandContext], int]] = {
     "remove": remove,
     "batch": batch,
     "apply": apply,
+    "stage-organization": stage_organization,
     "query": query,
     "enrich": enrich,
     "register-preview": register_preview,

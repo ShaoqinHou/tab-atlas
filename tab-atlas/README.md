@@ -95,6 +95,14 @@ The receiver exists only during a requested operation and binds to
    in the background. If the extension is unavailable or the tab changed, the
    durable resource remains saved and the tab is left open with a visible reason.
 3. Use Home and Library to browse by purpose, project, action, or source.
+   **Saved, not organized** is not another approval queue: those resources are
+   already accepted, searchable library entries. It is also not a claim that
+   Codex has analyzed them. The Manage screen separately reports how many were
+   analyzed as one cohort, how many have inert suggestions ready, how many need
+   user context, and how many arrived after the latest analysis. Use
+   **Organization proposals** to review the saved-only cohort or a complete
+   whole-library reorganization pass. Apply one suggestion or the current batch;
+   uncertain, unchanged, and stale items are never included automatically.
 4. Add typed or local voice notes when page metadata does not express your
    intent. Ask Codex for a proposal only when interpretation is useful.
 5. Use **Sync now** after opening more tabs. Known resources update provenance;
@@ -127,6 +135,11 @@ sign-in. It does not require an API key. Codex can explain, retrieve, or propose
 organization and action-list changes. The workspace validates each proposal and
 requires explicit acceptance before changing semantic state. Browser closure is
 never an agent proposal side effect.
+
+Codex can stage an exact, whole-cohort plan with `stage-organization`. Staging
+creates reviewable per-resource proposals but applies none of them. Batch apply
+uses the existing resource-level semantic decisions and audit records, so each
+successful change remains individually inspectable and undoable.
 
 ## Storage And Reports
 

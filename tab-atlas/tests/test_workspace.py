@@ -39,11 +39,15 @@ from tabatlas.workspace import (  # noqa: E402
     mark_audio_transcription_running,
     mark_agent_request_running,
     note_detail,
+    organization_batch_detail,
     proposal_is_current,
     queued_audio_transcriptions,
     reject_semantic_proposal,
     recover_agent_requests,
     set_note_active,
+    stage_organization_batch,
+    decide_organization_batch,
+    defer_organization_batch,
     undo_semantic_audit,
     update_action_progress,
     workspace_directory_summaries,
@@ -194,6 +198,146 @@ class WorkspaceDataTests(unittest.TestCase):
         html = (report / "index.html").read_text(encoding="utf-8")
         self.assertNotIn("Must watch this for LLM mathematics", html)
         self.assertIn('"noteCount":1', html)
+
+    def test_whole_cohort_organization_plan_is_inert_and_explicitly_applied(
+        self,
+    ) -> None:
+        context_id = "res_" + "d" * 24
+        unchanged_id = "res_" + "e" * 24
+        now = utc_now()
+        for resource_id, title in [
+            (context_id, "Ambiguous saved page"),
+            (unchanged_id, "Already suitable page"),
+        ]:
+            self.connection.execute(
+                """
+                INSERT INTO resources(
+                  id, canonical_url, host, kind, title, first_seen_at, last_seen_at,
+                  brief, status, library_state, accepted_at
+                ) VALUES(?, ?, 'example.com', 'web_page', ?, ?, ?, '', 'saved', 'accepted', ?)
+                """,
+                (
+                    resource_id,
+                    f"https://example.com/{resource_id}",
+                    title,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        self.connection.commit()
+        plan = {
+            "schemaVersion": 1,
+            "scope": "unorganized",
+            "catalogRevision": "catalog-test-1",
+            "model": "test-model",
+            "threadId": "test-thread",
+            "targetResourceIds": [RESOURCE_ID, context_id, unchanged_id],
+            "strategy": {
+                "summary": "Compared the complete saved, unorganized cohort.",
+                "principles": ["Prefer purpose over source."],
+                "groups": [
+                    {
+                        "path": ["Understand AI Models", "Models & Evaluation"],
+                        "count": 1,
+                        "reason": "One clear learning resource.",
+                    }
+                ],
+            },
+            "items": [
+                {
+                    "resourceId": RESOURCE_ID,
+                    "analysisState": "proposed",
+                    "baseRevision": 0,
+                    "confidence": 0.96,
+                    "evidenceClass": "brief_and_title",
+                    "rationale": "Clear learning purpose in the available metadata.",
+                    "memberships": agent_response()["memberships"][:2],
+                },
+                {
+                    "resourceId": context_id,
+                    "analysisState": "needs_context",
+                    "baseRevision": 0,
+                    "confidence": 0.2,
+                    "evidenceClass": "weak_metadata",
+                    "rationale": "The available evidence does not establish a safe purpose.",
+                },
+                {
+                    "resourceId": unchanged_id,
+                    "analysisState": "unchanged",
+                    "baseRevision": 0,
+                    "confidence": 0.7,
+                    "evidenceClass": "existing_structure",
+                    "rationale": "No organization change is warranted.",
+                },
+            ],
+        }
+
+        batch = stage_organization_batch(self.connection, plan, source="test")
+        duplicate = stage_organization_batch(self.connection, plan, source="test")
+        self.assertEqual(batch["id"], duplicate["id"])
+        self.assertEqual(
+            batch["counts"],
+            {
+                "proposed": 1,
+                "needsContext": 1,
+                "unchanged": 1,
+                "accepted": 0,
+                "rejected": 0,
+                "stale": 0,
+                "superseded": 0,
+            },
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM resource_collections"
+            ).fetchone()[0],
+            0,
+        )
+
+        result = decide_organization_batch(
+            self.connection,
+            batch["id"],
+            "accept",
+            "workspace_user",
+            "organization-test-batch-0001",
+        )
+        self.assertEqual(result["decided"], 1)
+        self.assertEqual(result["skipped"], 0)
+        detail = organization_batch_detail(self.connection, batch["id"])
+        self.assertEqual(detail["counts"]["accepted"], 1)
+        self.assertEqual(detail["counts"]["needsContext"], 1)
+        self.assertGreater(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM resource_collections WHERE resource_id=?",
+                (RESOURCE_ID,),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM semantic_audits WHERE resource_id=?",
+                (RESOURCE_ID,),
+            ).fetchone()[0],
+            1,
+        )
+
+        deferred = defer_organization_batch(
+            self.connection,
+            batch["id"],
+            "workspace_user",
+            "organization-test-defer-0001",
+        )
+        repeated = defer_organization_batch(
+            self.connection,
+            batch["id"],
+            "workspace_user",
+            "organization-test-defer-0001",
+        )
+        self.assertEqual(deferred["decided"], 1)
+        self.assertEqual(repeated["decided"], 1)
+        self.assertEqual(deferred["batch"]["counts"]["needsContext"], 0)
+        self.assertEqual(deferred["batch"]["counts"]["unchanged"], 2)
 
     def test_voice_note_stays_local_until_editable_transcript(self) -> None:
         wav = b"RIFF" + (36).to_bytes(4, "little") + b"WAVE" + b"fmt " + b"\x00" * 24

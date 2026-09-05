@@ -1,10 +1,11 @@
 // Review labels and user-visible navigation transitions.
 function reviewDescription(mode) {
-  if (mode === "discoveries") return "Provisionally organized resources from the latest capture. Accept them into the library or dismiss them before closing browser tabs.";
+  if (mode === "discoveries") return "Newly captured resources that are not in the library yet. Add or dismiss them; this is the only queue that needs an approval decision.";
   if (mode === "dismissed") return "Reviewed resources kept outside the library. Restore any mistake before running the verified close batch.";
   if (mode === "duplicates") return "Exact URL matches within the same browser window and group. Protected tabs remain visible and excluded from safe candidates.";
   if (mode === "open") return "Resources represented by the latest captured browser state. Their metadata and reopen links remain in the durable library after tabs close.";
-  return "Stored or open resources without a purpose space. Organize them without keeping browser tabs alive.";
+  if (mode === "organization") return "Review suggestions produced by comparing a complete cohort together. Nothing is reorganized until you explicitly apply a suggestion.";
+  return "Already-saved library resources without a purpose space. They stay searchable here; organizing them is optional.";
 }
 
 function reviewEmptyMessage(mode) {
@@ -12,7 +13,8 @@ function reviewEmptyMessage(mode) {
   if (mode === "dismissed") return "No resources have been dismissed.";
   if (mode === "duplicates") return "No exact duplicate sets are present in the current capture.";
   if (mode === "open") return "No captured tabs are currently open. The retained library remains available in Spaces and search.";
-  return "Every library resource has a purpose space.";
+  if (mode === "organization") return "No current organization suggestions are waiting for review.";
+  return "Every saved library resource has a purpose space.";
 }
 
 function openReview(mode) {

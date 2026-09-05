@@ -13,7 +13,7 @@ function renderHome() {
   const introCopy = node("div", "home-copy");
   introCopy.append(
     node("p", "eyebrow", "Durable library"),
-    node("h2", "", "Browse what was captured, then clear the browser"),
+    node("h2", "", "Your saved library is separate from your open tabs"),
     node("p", "scope-summary", openTabs
       ? `${formatNumber(libraryResources)} library resources; ${formatNumber(liveResources)} are represented by ${formatNumber(openTabs)} open tabs.`
       : `${formatNumber(libraryResources)} library resources. No captured tabs are currently open.`)
@@ -22,11 +22,11 @@ function renderHome() {
   fragment.append(intro);
 
   const attention = node("section", "attention-section");
-  attention.append(sectionHeading("Library status", "Organize uncertain resources or clear browser state already retained here."));
+  attention.append(sectionHeading("Library status", "Only new discoveries need a decision. Organization is optional after an item is saved."));
   const attentionRow = node("div", "attention-row");
   attentionRow.append(
-    attentionButton("New discoveries", pendingDiscoveries, "Awaiting library review", () => openReview("discoveries")),
-    attentionButton("Inbox", inbox.length, "No purpose space", () => openReview("inbox")),
+    attentionButton("Needs approval", pendingDiscoveries, "Not in the library yet", () => openReview("discoveries")),
+    attentionButton("Saved, not organized", inbox.length, unorganizedAnalysisStatus(), () => openReview("inbox")),
     attentionButton("Safe exact duplicates", safeDuplicates, "Closeable extras", () => openReview("duplicates")),
     attentionButton("Open tabs", openTabs, `${formatNumber(liveResources)} live resources`, () => openReview("open"))
   );
@@ -82,18 +82,15 @@ function continueButton(discoveryCount, inboxCount, duplicateCount, openTabCount
   let onClick = () => openReview("open");
   if (discoveryCount) {
     count = discoveryCount;
-    label = "Review new discoveries";
-    detail = "Accept selected resources or add the complete batch to the durable library.";
+    label = "Decide on new discoveries";
+    detail = "Add individual resources, dismiss them, or accept the complete batch.";
     onClick = () => openReview("discoveries");
-  } else if (!openTabCount && inboxCount) {
-    count = inboxCount;
-    label = "Work through Inbox";
-    detail = "Give unplaced library resources a useful purpose space.";
-    onClick = () => openReview("inbox");
-  } else if (!openTabCount && !inboxCount) {
+  } else if (!openTabCount) {
     count = libraryResourceCount();
-    label = "Open purpose spaces";
-    detail = "Browse the retained library by the work each resource supports.";
+    label = "Browse your saved library";
+    detail = inboxCount
+      ? `${formatNumber(inboxCount)} saved resources are not organized yet. That is optional; nothing is waiting for approval.`
+      : "Browse the retained library by the work each resource supports.";
     onClick = () => setView("spaces");
   }
   button.append(

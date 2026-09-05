@@ -283,6 +283,45 @@ CREATE TABLE IF NOT EXISTS semantic_decisions (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS organization_batches (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL CHECK (scope IN ('unorganized', 'library')),
+  source TEXT NOT NULL,
+  catalog_revision TEXT NOT NULL,
+  plan_hash TEXT NOT NULL UNIQUE,
+  strategy_json TEXT NOT NULL DEFAULT '{}',
+  target_count INTEGER NOT NULL CHECK (target_count >= 0),
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS organization_batch_items (
+  batch_id TEXT NOT NULL REFERENCES organization_batches(id) ON DELETE CASCADE,
+  resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+  proposal_id TEXT UNIQUE REFERENCES semantic_proposals(id) ON DELETE SET NULL,
+  analysis_state TEXT NOT NULL
+    CHECK (analysis_state IN ('proposed', 'needs_context', 'unchanged')),
+  base_revision INTEGER NOT NULL,
+  confidence REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+  evidence_class TEXT NOT NULL,
+  proposed_path_json TEXT NOT NULL DEFAULT '[]',
+  rationale TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (batch_id, resource_id)
+);
+
+CREATE INDEX IF NOT EXISTS organization_batch_items_resource
+ON organization_batch_items(resource_id, batch_id);
+
+CREATE TABLE IF NOT EXISTS organization_batch_actions (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES organization_batches(id) ON DELETE CASCADE,
+  action TEXT NOT NULL CHECK (action IN ('defer_context')),
+  actor TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  affected_count INTEGER NOT NULL CHECK (affected_count >= 0),
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS resource_collection_progress (
   resource_id TEXT NOT NULL,
   collection_id TEXT NOT NULL,

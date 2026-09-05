@@ -403,7 +403,7 @@ def _ensure_collection(
     parent_id: str | None,
 ) -> str:
     existing = connection.execute(
-        "SELECT id, kind FROM collections WHERE name=? COLLATE NOCASE",
+        "SELECT id, kind, parent_id FROM collections WHERE name=? COLLATE NOCASE",
         (item["name"],),
     ).fetchone()
     if existing:
@@ -411,9 +411,13 @@ def _ensure_collection(
             raise ValueError(
                 f"Collection name already belongs to {existing['kind']}: {item['name']}"
             )
-        if parent_id:
+        if parent_id and existing["parent_id"] and existing["parent_id"] != parent_id:
+            raise ConflictError(
+                f"Collection already belongs to a different parent: {item['name']}"
+            )
+        if parent_id and not existing["parent_id"]:
             connection.execute(
-                "UPDATE collections SET parent_id=COALESCE(parent_id, ?), updated_at=? WHERE id=?",
+                "UPDATE collections SET parent_id=?, updated_at=? WHERE id=?",
                 (parent_id, utc_now(), existing["id"]),
             )
         return str(existing["id"])

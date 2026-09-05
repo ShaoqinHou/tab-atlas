@@ -12,6 +12,7 @@ let data = window.__TAB_ATLAS__ || {
   projectSummaries: [],
   actionListSummaries: [],
   sourceSummaries: [],
+  organizationBatches: [],
   facets: {},
   workspace: {}
 };
@@ -31,6 +32,7 @@ let spaceSummaries = hasSpaceContract
 let projectSummaries = data.projectSummaries || [];
 let actionListSummaries = data.actionListSummaries || [];
 let sourceSummaries = Array.isArray(data.sourceSummaries) ? data.sourceSummaries : [];
+let organizationBatches = Array.isArray(data.organizationBatches) ? data.organizationBatches : [];
 const galleryLoaders = new WeakMap();
 const galleryObservers = new Set();
 const galleryLoadTimers = new Set();
@@ -75,6 +77,8 @@ const state = {
   topic: "all",
   focus: "all",
   reviewMode: discoveries.length ? "discoveries" : "inbox",
+  organizationScope: "unorganized",
+  organizationItemState: "proposed",
   filters: { format: "all", browser: "all", group: "all" },
   visibleLimit: PAGE_SIZE,
   selectedResource: null,
@@ -108,6 +112,7 @@ function replaceCatalogSnapshot(snapshot, options = {}) {
   projectSummaries = Array.isArray(next.projectSummaries) ? next.projectSummaries : [];
   actionListSummaries = Array.isArray(next.actionListSummaries) ? next.actionListSummaries : [];
   sourceSummaries = Array.isArray(next.sourceSummaries) ? next.sourceSummaries : [];
+  if (Array.isArray(next.organizationBatches)) organizationBatches = next.organizationBatches;
   workspace.catalogRevision = String(next.revision || "");
   window.__TAB_ATLAS__ = next;
 

@@ -116,7 +116,8 @@ function resourceFooter(resource, placement) {
     wrapper.append(copy, restore);
     return wrapper;
   }
-  if (duplicateCount) {
+  const organizationReview = state.view === "review" && ["inbox", "organization"].includes(state.reviewMode);
+  if (duplicateCount && !organizationReview) {
     wrapper.classList.add("has-command");
     const copy = node("span", "resource-footer-copy");
     copy.append(
@@ -130,6 +131,104 @@ function resourceFooter(resource, placement) {
     button.addEventListener("click", () => requestDuplicateClose(resource));
     wrapper.append(copy, button);
     return wrapper;
+  }
+
+  const isSavedUnorganized = resource.libraryState === "accepted"
+    && !resourceSpace(resource)
+    && state.view === "review"
+    && state.reviewMode === "inbox";
+  if (isSavedUnorganized) {
+    wrapper.classList.add("has-command", "is-stored", "is-unorganized");
+    const item = organizationBatchItem(resource, "unorganized");
+    const copy = node("span", "resource-footer-copy");
+    if (item?.effectiveState === "proposed") {
+      copy.append(
+        node("strong", "", "Analyzed — suggestion ready"),
+        node("span", "", item.proposedPath?.join(" → ") || "Purpose path proposed")
+      );
+      const actions = node("span", "resource-footer-actions");
+      const apply = node("button", "resource-action-command organize-resource-command", "Apply");
+      apply.type = "button";
+      apply.addEventListener("click", () => requestOrganizationProposalDecision(item, "accept", apply));
+      const keep = node("button", "resource-action-command", "Keep as-is");
+      keep.type = "button";
+      keep.addEventListener("click", () => requestOrganizationProposalDecision(item, "reject", keep));
+      actions.append(apply, keep);
+      wrapper.append(copy, actions);
+    } else if (item?.effectiveState === "needsContext") {
+      copy.append(node("strong", "", "Analyzed — needs your context"), node("span", "", item.rationale || "Codex could not infer a safe purpose path"));
+      const context = node("button", "resource-action-command organize-resource-command", "Add context");
+      context.type = "button";
+      context.addEventListener("click", () => requestResourceReclassification(resource));
+      wrapper.append(copy, context);
+    } else if (item?.effectiveState === "rejected") {
+      copy.append(node("strong", "", "Suggestion declined"), node("span", "", "Saved and searchable as-is"));
+      wrapper.append(copy);
+    } else if (item?.effectiveState === "unchanged") {
+      copy.append(node("strong", "", "Left unorganized"), node("span", "", "Saved, searchable, and no longer waiting for attention"));
+      wrapper.append(copy);
+    } else if (item) {
+      copy.append(node("strong", "", "Analyzed — no change suggested"), node("span", "", "Saved and searchable as-is"));
+      wrapper.append(copy);
+    } else {
+      copy.append(node("strong", "", "Saved — not analyzed in this batch"), node("span", "", "Still in the library and searchable"));
+      const organize = node("button", "resource-action-command organize-resource-command", "Add context");
+      organize.type = "button";
+      organize.title = "Tell Codex what this saved resource means to you.";
+      organize.addEventListener("click", () => requestResourceReclassification(resource));
+      wrapper.append(copy, organize);
+    }
+    return wrapper;
+  }
+
+  if (state.view === "review" && state.reviewMode === "organization") {
+    const item = organizationBatchItem(resource);
+    if (item?.effectiveState === "proposed") {
+      wrapper.classList.add("has-command", "is-stored", "is-unorganized");
+      const copy = node("span", "resource-footer-copy");
+      copy.append(node("strong", "", "Organization suggested"), node("span", "", item.proposedPath?.join(" → ") || "Purpose path proposed"));
+      const actions = node("span", "resource-footer-actions");
+      const apply = node("button", "resource-action-command organize-resource-command", "Apply");
+      apply.type = "button";
+      apply.addEventListener("click", () => requestOrganizationProposalDecision(item, "accept", apply));
+      const keep = node("button", "resource-action-command", "Keep as-is");
+      keep.type = "button";
+      keep.addEventListener("click", () => requestOrganizationProposalDecision(item, "reject", keep));
+      actions.append(apply, keep);
+      wrapper.append(copy, actions);
+      return wrapper;
+    }
+    if (item?.effectiveState === "needsContext") {
+      wrapper.classList.add("has-command", "is-stored", "is-unorganized");
+      const copy = node("span", "resource-footer-copy");
+      copy.append(node("strong", "", "Analyzed — needs your context"), node("span", "", item.rationale || "A safe purpose could not be inferred"));
+      const context = node("button", "resource-action-command organize-resource-command", "Add context");
+      context.type = "button";
+      context.addEventListener("click", () => requestResourceReclassification(resource));
+      wrapper.append(copy, context);
+      return wrapper;
+    }
+    if (item?.effectiveState === "unchanged") {
+      wrapper.classList.add("is-stored");
+      const copy = node("span", "resource-footer-copy");
+      copy.append(
+        node("strong", "", latestOrganizationBatch()?.scope === "unorganized" ? "Left unorganized" : "Analyzed — no change suggested"),
+        node("span", "", item.rationale || "Saved and searchable as-is")
+      );
+      wrapper.append(copy);
+      return wrapper;
+    }
+    if (["accepted", "rejected", "superseded"].includes(item?.effectiveState)) {
+      wrapper.classList.add("is-stored");
+      const copy = node("span", "resource-footer-copy");
+      const applied = ["accepted", "superseded"].includes(item.effectiveState);
+      copy.append(
+        node("strong", "", applied ? "Suggestion applied" : "Suggestion declined"),
+        node("span", "", item.effectiveState === "superseded" ? "Organized by another approved batch" : (applied ? "Recorded with an individual undo trail" : "Resource kept as-is"))
+      );
+      wrapper.append(copy);
+      return wrapper;
+    }
   }
 
   wrapper.classList.add(openCount ? "is-open" : "is-stored");

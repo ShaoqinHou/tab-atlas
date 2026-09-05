@@ -112,6 +112,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     apply_parser.add_argument("path", type=Path)
 
+    organization_parser = subparsers.add_parser(
+        "stage-organization",
+        help="Stage one whole-cohort organization plan for explicit review",
+    )
+    organization_parser.add_argument("path", type=Path)
+
     query_parser = subparsers.add_parser(
         "query", help="Search the current local library"
     )

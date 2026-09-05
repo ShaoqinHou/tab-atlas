@@ -21,6 +21,7 @@ from .browser_sync import BrowserSyncCoordinator
 from .directory import action_list_summaries, workspace_directory_summaries
 from .lease import WorkspaceLease
 from .notes import note_counts
+from .organization_batches import organization_batch_summaries
 from .product_browsers import launch_closed_product_browsers
 from .report_updates import DeferredReportPublisher
 from .semantics import proposal_is_current
@@ -219,7 +220,8 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
                 FROM semantic_proposals p
                 LEFT JOIN semantic_decisions d ON d.proposal_id=p.id
                 LEFT JOIN agent_requests ar ON ar.id=p.request_id
-                WHERE d.id IS NULL
+                LEFT JOIN organization_batch_items obi ON obi.proposal_id=p.id
+                WHERE d.id IS NULL AND obi.proposal_id IS NULL
                 ORDER BY p.created_at DESC, p.rowid DESC LIMIT 50
                 """
             ):
@@ -241,6 +243,7 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
                         "response": response,
                     }
                 )
+            organization_batches = organization_batch_summaries(connection)
         agent = self.agent.status()
         return {
             "interactive": True,
@@ -259,6 +262,7 @@ class TabAtlasWorkspaceServer(ThreadingHTTPServer):
             "projectSummaries": directories["projects"],
             "recentAudits": recent_audits,
             "pendingProposals": pending_proposals,
+            "organizationBatches": organization_batches,
             "browserSync": self.browser_sync.status(),
             "voice": {
                 "recording": True,

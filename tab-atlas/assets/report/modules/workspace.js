@@ -20,6 +20,9 @@ async function initializeWorkspace() {
 
 function mergeWorkspaceSession(session) {
   workspace.agent = session.agent || {};
+  organizationBatches = Array.isArray(session.organizationBatches)
+    ? session.organizationBatches
+    : organizationBatches;
   spaceSummaries = Array.isArray(session.spaceSummaries) ? session.spaceSummaries : spaceSummaries;
   projectSummaries = Array.isArray(session.projectSummaries) ? session.projectSummaries : projectSummaries;
   actionListSummaries = Array.isArray(session.actionLists) ? session.actionLists : actionListSummaries;

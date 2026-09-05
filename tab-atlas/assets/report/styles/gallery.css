@@ -405,6 +405,8 @@
 .accept-resource-command:hover { border-color: #26785f; background: var(--green-soft); }
 .accept-close-resource-command { border-color: #6d8ca6; color: #315d7d; }
 .accept-close-resource-command:hover { border-color: #477493; background: #edf4f8; }
+.organize-resource-command { border-color: #5c9881; color: #145e49; }
+.organize-resource-command:hover { border-color: #26785f; background: var(--green-soft); }
 .gallery-sentinel {
   display: flex;
   min-height: 44px;

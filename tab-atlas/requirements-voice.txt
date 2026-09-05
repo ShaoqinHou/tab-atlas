@@ -1,0 +1,6 @@
+# Install a Torch build appropriate for the machine before using this file when
+# the default PyPI build is not suitable for the available GPU.
+numpy>=1.26,<3
+safetensors>=0.5,<1
+torch>=2.6,<3
+transformers>=4.52,<5

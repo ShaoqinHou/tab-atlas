@@ -3,6 +3,7 @@ const elements = {
   mode: document.getElementById("mode"),
   modeLabel: document.getElementById("modeLabel"),
   pairing: document.getElementById("pairing"),
+  build: document.getElementById("build"),
   lastCapture: document.getElementById("lastCapture"),
   pairPanel: document.getElementById("pairPanel"),
   code: document.getElementById("code"),
@@ -27,17 +28,26 @@ elements.pair.addEventListener("click", () => run(async () => {
   render(await status());
 }));
 
-elements.capture.addEventListener("click", () => run(async () => {
+elements.capture.addEventListener("click", () => run(captureWaitingReceiver));
+
+run(async () => {
+  render(await status());
+  if (new URLSearchParams(location.search).get("capture") === "1") {
+    await captureWaitingReceiver();
+  }
+});
+
+async function captureWaitingReceiver() {
   say("Checking for a capture request...");
   const result = await send({ type: "tabatlas:capture-now" });
   if (!result.ok && !result.idle) throw new Error(result.error || "Capture failed.");
   if (result.captured) say(`Captured ${result.tabCount} tabs.`);
   else if (result.mutated) say(`Closed ${result.closedCount} verified duplicate tabs.`);
+  else if (result.archived) say(`Archived and closed ${result.closedCount} captured tabs.`);
+  else if (result.cleaned) say("Archive verification finished.");
   else say("No receiver is waiting.");
   render(await status());
-}));
-
-run(async () => render(await status()));
+}
 
 async function status() {
   return send({ type: "tabatlas:status" });
@@ -69,6 +79,9 @@ function render(value) {
   elements.mode.checked = mode;
   elements.modeLabel.textContent = mode ? "ON" : "OFF";
   elements.pairing.textContent = value.paired ? "Paired" : "Unpaired";
+  elements.build.textContent = value.version && value.protocolVersion
+    ? `v${value.version} / protocol ${value.protocolVersion}`
+    : "Unavailable";
   elements.lastCapture.textContent = value.lastCaptureAt ? new Date(value.lastCaptureAt).toLocaleString() : "Never";
   elements.pairPanel.hidden = Boolean(value.paired);
   elements.mode.disabled = !value.paired;

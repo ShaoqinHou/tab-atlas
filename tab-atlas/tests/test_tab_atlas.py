@@ -9,42 +9,70 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-sys.path.insert(0, str(SCRIPTS))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-from tab_atlas_core import (  # noqa: E402
+from tabatlas import (  # noqa: E402
     apply_annotations,
+    build_archive_cleanup_plan,
+    build_archive_plan,
     build_exact_duplicate_plan,
+    cache_public_previews,
     connect,
     current_resources,
+    discovery_batch,
+    discovery_resources,
     generate_report,
+    finalize_archive_plan,
     finalize_mutation_plan,
     inventory,
+    library_resources,
+    MUTATION_PROTOCOL_VERSION,
     normalize_snapshot_document,
+    pairing_status,
     pairing_secret,
     protocol_proof,
     report_payload,
+    record_archive_plan,
     record_mutation_plan,
+    remove_library_resources,
+    register_local_preview,
     resource_presentation,
     revoke_pairing,
     save_pairing,
+    set_discovery_state,
     store_snapshot,
     token_hash,
 )
-from tab_atlas_receiver import (  # noqa: E402
+from tabatlas.database import remember_workspace_origin  # noqa: E402
+from tabatlas.media import _x_motion_url_allowed  # noqa: E402
+from tabatlas.previews import (  # noqa: E402
+    _AllowlistedRedirectHandler,
+    _OpenGraphParser,
+    _preview_image_allowed,
+    _public_preview_candidate,
+    _public_preview_source,
+    _x_motion_from_json_ld,
+)
+from tabatlas.browser.receiver import (  # noqa: E402
     EXPECTED_EXTENSION_ID,
+    run_archive_cleanup,
     run_capture,
     run_mutation,
     run_pairing,
     run_revocation,
 )
-from tab_atlas import (  # noqa: E402
+from tabatlas.report_server import create_report_server  # noqa: E402
+from tabatlas.commandline import (  # noqa: E402
     DEFAULT_STATE,
+    _load_archive_approval,
     _load_standing_approval,
+    _write_archive_approval,
     _write_standing_approval,
     build_parser,
 )
@@ -54,11 +82,548 @@ ORIGIN = f"chrome-extension://{EXPECTED_EXTENSION_ID}"
 
 
 class CatalogTests(unittest.TestCase):
+    def test_workspace_page_is_observed_but_never_catalogued(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            remember_workspace_origin(connection, "http://127.0.0.1:8789")
+            remember_workspace_origin(connection, "http://127.0.0.1:8790")
+            stored = store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-22T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "title": "TabAtlas",
+                            "url": "http://127.0.0.1:8790/?bootstrap=private",
+                        },
+                        {
+                            "id": 2,
+                            "windowId": 1,
+                            "index": 1,
+                            "title": "Old TabAtlas port",
+                            "url": "http://127.0.0.1:8789/",
+                        },
+                        {
+                            "id": 3,
+                            "windowId": 1,
+                            "index": 2,
+                            "title": "Bridge popup",
+                            "url": f"{ORIGIN}/popup.html?capture=1",
+                        },
+                        {
+                            "id": 4,
+                            "windowId": 1,
+                            "index": 3,
+                            "title": "Useful page",
+                            "url": "https://example.com/useful",
+                        },
+                    ],
+                },
+                "extension_live",
+                new_resource_state="candidate",
+            )
+            rows = connection.execute(
+                "SELECT canonical_url FROM resources ORDER BY canonical_url"
+            ).fetchall()
+            connection.close()
+
+            self.assertEqual(stored["tab_count"], 4)
+            self.assertEqual(stored["resource_count"], 1)
+            self.assertEqual(stored["new_resource_count"], 1)
+            self.assertEqual(
+                [row["canonical_url"] for row in rows], ["https://example.com/useful"]
+            )
+
+    def test_live_discoveries_require_acceptance_and_known_urls_are_not_readded(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "title": "Known",
+                            "url": "https://example.com/known",
+                        },
+                    ],
+                },
+                "preserved_import",
+            )
+            first_live = store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T01:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "title": "Known again",
+                            "url": "https://example.com/known",
+                        },
+                        {
+                            "id": 2,
+                            "windowId": 1,
+                            "index": 1,
+                            "title": "New",
+                            "url": "https://example.com/new",
+                        },
+                    ],
+                },
+                "extension_live",
+                new_resource_state="candidate",
+            )
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T02:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "title": "Known",
+                            "url": "https://example.com/known",
+                        },
+                        {
+                            "id": 2,
+                            "windowId": 1,
+                            "index": 1,
+                            "title": "New again",
+                            "url": "https://example.com/new",
+                        },
+                    ],
+                },
+                "extension_live",
+                new_resource_state="candidate",
+            )
+
+            before = inventory(connection)
+            pending = discovery_resources(connection)
+            apply_annotations(
+                connection,
+                {
+                    "resources": [
+                        {
+                            "resourceId": pending[0]["resourceId"],
+                            "brief": "A concise decision summary for the staged resource.",
+                            "collections": [
+                                {
+                                    "name": "Review topic",
+                                    "kind": "topic",
+                                    "parentName": "Review space",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+            review_batch = discovery_batch(connection, 10)
+            staged_report = report_payload(connection)
+            self.assertEqual(staged_report["contractVersion"], 1)
+            self.assertRegex(staged_report["revision"], r"^[0-9a-f]{24}$")
+            self.assertEqual(
+                staged_report["revision"], report_payload(connection)["revision"]
+            )
+            decision = set_discovery_state(
+                connection,
+                "accepted",
+                {pending[0]["resourceId"]},
+            )
+            after = inventory(connection)
+            accepted = library_resources(connection)
+            accepted_membership = connection.execute(
+                "SELECT accepted, authority FROM resource_collections WHERE resource_id=?",
+                (pending[0]["resourceId"],),
+            ).fetchone()
+            connection.close()
+
+            self.assertEqual(first_live["new_resource_count"], 1)
+            self.assertEqual(before["libraryResources"], 1)
+            self.assertEqual(before["pendingDiscoveries"], 1)
+            self.assertEqual(before["currentKnownResources"], 1)
+            self.assertEqual(before["currentDiscoveryResources"], 1)
+            self.assertEqual(
+                review_batch["resources"][0]["brief"],
+                "A concise decision summary for the staged resource.",
+            )
+            self.assertEqual(
+                review_batch["resources"][0]["collections"][0]["name"],
+                "Review topic",
+            )
+            self.assertEqual(len(staged_report["resources"]), 1)
+            self.assertEqual(len(staged_report["discoveries"]), 1)
+            self.assertEqual(staged_report["dismissed"], [])
+            self.assertEqual(
+                staged_report["discoveries"][0]["libraryState"], "candidate"
+            )
+            self.assertEqual(decision["updated"], 1)
+            self.assertEqual(after["libraryResources"], 2)
+            self.assertEqual(after["pendingDiscoveries"], 0)
+            self.assertEqual({item["libraryState"] for item in accepted}, {"accepted"})
+            self.assertEqual(accepted_membership["accepted"], 1)
+            self.assertEqual(accepted_membership["authority"], "accepted_stable")
+
+    def test_archive_plan_blocks_unreviewed_and_requires_opt_in_for_dismissed_resources(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "edge",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "title": "Candidate",
+                            "url": "https://example.com/candidate",
+                        },
+                        {
+                            "id": 2,
+                            "windowId": 1,
+                            "index": 1,
+                            "title": "Candidate 2",
+                            "url": "https://example.com/dismiss",
+                        },
+                        {
+                            "id": 3,
+                            "windowId": 1,
+                            "index": 2,
+                            "title": "Candidate 3",
+                            "url": "https://example.com/pending",
+                        },
+                    ],
+                },
+                "extension_live",
+                new_resource_state="candidate",
+            )
+            pending = {
+                item["canonicalUrl"]: item["resourceId"]
+                for item in discovery_resources(connection)
+            }
+            set_discovery_state(
+                connection,
+                "accepted",
+                {pending["https://example.com/candidate"]},
+            )
+            set_discovery_state(
+                connection,
+                "dismissed",
+                {pending["https://example.com/dismiss"]},
+            )
+
+            plan = build_archive_plan(connection, {"edge"})
+            discard_plan = build_archive_plan(
+                connection,
+                {"edge"},
+                include_dismissed=True,
+            )
+            connection.close()
+
+            self.assertEqual(plan["summary"]["plannedClosures"], 1)
+            self.assertEqual(plan["summary"]["pendingDiscoveryCount"], 1)
+            self.assertEqual(plan["summary"]["dismissedOpenResourceCount"], 1)
+            self.assertEqual(plan["summary"]["plannedDiscardedClosures"], 0)
+            self.assertFalse(plan["summary"]["includeDismissed"])
+            self.assertEqual(discard_plan["summary"]["plannedClosures"], 2)
+            self.assertEqual(discard_plan["summary"]["plannedRetainedClosures"], 1)
+            self.assertEqual(discard_plan["summary"]["plannedDiscardedClosures"], 1)
+            self.assertTrue(discard_plan["summary"]["includeDismissed"])
+            self.assertEqual(
+                {
+                    target["retention"]
+                    for target in discard_plan["browsers"]["edge"]["targets"]
+                },
+                {"retain", "discard"},
+            )
+            self.assertNotIn("https://", json.dumps(plan))
+
+    def test_dismissed_discovery_can_be_listed_and_restored_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "edge",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 7,
+                            "windowId": 1,
+                            "index": 0,
+                            "title": "Review later",
+                            "url": "https://example.com/reconsider",
+                        }
+                    ],
+                },
+                "extension_live",
+                new_resource_state="candidate",
+            )
+            resource_id = discovery_resources(connection)[0]["resourceId"]
+            set_discovery_state(connection, "dismissed", {resource_id})
+
+            dismissed = discovery_batch(connection, 10, state="dismissed")
+            dismissed_report = report_payload(connection)
+            restored = set_discovery_state(connection, "accepted", {resource_id})
+            plan = build_archive_plan(connection, {"edge"})
+            connection.close()
+
+            self.assertEqual(dismissed["state"], "dismissed")
+            self.assertEqual(dismissed["total"], 1)
+            self.assertEqual(len(dismissed_report["dismissed"]), 1)
+            self.assertEqual(
+                dismissed_report["dismissed"][0]["libraryState"], "dismissed"
+            )
+            self.assertEqual(restored["updated"], 1)
+            self.assertEqual(plan["summary"]["dismissedOpenResourceCount"], 0)
+            self.assertEqual(plan["summary"]["plannedClosures"], 1)
+
+    def test_library_removal_is_recoverable_and_preserves_resource_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 7,
+                            "windowId": 1,
+                            "index": 0,
+                            "title": "Retained evidence",
+                            "url": "https://example.com/remove-me",
+                        }
+                    ],
+                },
+                "extension_live",
+            )
+            resource = library_resources(connection)[0]
+            apply_annotations(
+                connection,
+                [
+                    {
+                        "resourceId": resource["resourceId"],
+                        "brief": "Useful retained context.",
+                    }
+                ],
+            )
+
+            removed = remove_library_resources(connection, {resource["resourceId"]})
+            dismissed = library_resources(connection, {"dismissed"})[0]
+            restored = set_discovery_state(
+                connection, "accepted", {resource["resourceId"]}
+            )
+            accepted = library_resources(connection)[0]
+            connection.close()
+
+            self.assertTrue(removed["recoverable"])
+            self.assertEqual(removed["updated"], 1)
+            self.assertEqual(dismissed["brief"], "Useful retained context.")
+            self.assertEqual(dismissed["canonicalUrl"], "https://example.com/remove-me")
+            self.assertEqual(restored["updated"], 1)
+            self.assertEqual(accepted["resourceId"], resource["resourceId"])
+
+    def test_close_plans_bind_to_explicit_fresh_capture_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            future = store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2099-01-01T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 90,
+                            "windowId": 9,
+                            "index": 0,
+                            "groupId": -1,
+                            "title": "Future clock",
+                            "url": "https://example.com/future",
+                        }
+                    ],
+                },
+                "extension_live",
+            )
+            fresh = store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "groupId": -1,
+                            "title": "A",
+                            "url": "https://example.com/same",
+                        },
+                        {
+                            "id": 2,
+                            "windowId": 1,
+                            "index": 1,
+                            "groupId": -1,
+                            "title": "B",
+                            "url": "https://example.com/same",
+                        },
+                    ],
+                },
+                "extension_live",
+            )
+
+            archive = build_archive_plan(
+                connection,
+                {"chrome"},
+                {"chrome": fresh["id"]},
+            )
+            duplicate = build_exact_duplicate_plan(
+                connection,
+                {"chrome"},
+                capture_ids={"chrome": fresh["id"]},
+            )
+            current = current_resources(connection)
+            connection.close()
+
+            self.assertNotEqual(future["id"], fresh["id"])
+            self.assertEqual(
+                archive["browsers"]["chrome"]["beforeCaptureId"], fresh["id"]
+            )
+            self.assertEqual(archive["summary"]["plannedClosures"], 2)
+            self.assertEqual(
+                duplicate["browsers"]["chrome"]["beforeCaptureId"], fresh["id"]
+            )
+            self.assertEqual(duplicate["summary"]["plannedClosures"], 1)
+            self.assertEqual(current[0]["canonicalUrl"], "https://example.com/same")
+            self.assertEqual(len(current[0]["tabs"]), 2)
+
+    def test_collection_hierarchy_preserves_space_topic_and_focus_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            result = store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "title": "Agent UI",
+                            "url": "https://example.com/agent-ui",
+                        },
+                    ],
+                },
+                "extension_live",
+            )
+            resource = library_resources(connection)[0]
+            apply_annotations(
+                connection,
+                {
+                    "resources": [
+                        {
+                            "resourceId": resource["resourceId"],
+                            "replaceCollections": True,
+                            "collections": [
+                                {"name": "Build Software & Agents", "kind": "space"},
+                                {"name": "Coding Agents", "kind": "topic"},
+                                {
+                                    "name": "Review workflows",
+                                    "kind": "focus",
+                                    "parent": "Coding Agents",
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "another parent"):
+                apply_annotations(
+                    connection,
+                    {
+                        "resources": [
+                            {
+                                "resourceId": resource["resourceId"],
+                                "collections": [
+                                    {
+                                        "name": "Review workflows",
+                                        "kind": "focus",
+                                        "parent": "Product & UI",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                )
+            payload = report_payload(connection)
+            connection.close()
+
+            self.assertEqual(result["resource_count"], 1)
+            topic = next(
+                item
+                for item in payload["topicSummaries"]
+                if item["name"] == "Coding Agents"
+            )
+            focus = next(
+                item
+                for item in payload["focusSummaries"]
+                if item["name"] == "Review workflows"
+            )
+            self.assertEqual(topic["parentName"], "Build Software & Agents")
+            self.assertEqual(focus["parentName"], "Coding Agents")
+            self.assertEqual(
+                payload["resources"][0]["presentation"]["focuses"], ["Review workflows"]
+            )
+
     def test_batch_filter_does_not_overwrite_the_state_directory(self) -> None:
         args = build_parser().parse_args(["batch", "--state", "all"])
 
         self.assertEqual(args.state, DEFAULT_STATE)
         self.assertEqual(args.batch_state, "all")
+
+    def test_view_command_uses_the_read_only_loopback_viewer(self) -> None:
+        args = build_parser().parse_args(["view", "--port", "9876", "--open"])
+
+        self.assertEqual(args.command, "view")
+        self.assertEqual(args.port, 9876)
+        self.assertTrue(args.open_report)
 
     def test_standing_duplicate_approval_is_private_and_revocable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -72,11 +637,33 @@ class CatalogTests(unittest.TestCase):
             _write_standing_approval(state, "revoked", False)
             self.assertEqual(_load_standing_approval(state), "")
 
+    def test_standing_archive_approval_is_private_and_revocable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            scope = "Archive every tab proven by a fresh trusted capture."
+
+            path = _write_archive_approval(state, scope, True)
+            self.assertEqual(_load_archive_approval(state), scope)
+            self.assertTrue(path.is_relative_to(state))
+
+            _write_archive_approval(state, "revoked", False)
+            self.assertEqual(_load_archive_approval(state), "")
+
     def test_uppercase_legacy_rows_are_grouped_by_browser(self) -> None:
         snapshots = normalize_snapshot_document(
             [
-                {"Browser": "Chrome", "Title": "One", "Url": "https://example.com/a", "Rank": "2"},
-                {"Browser": "Edge", "Title": "Two", "Url": "https://example.com/b", "Rank": "3"},
+                {
+                    "Browser": "Chrome",
+                    "Title": "One",
+                    "Url": "https://example.com/a",
+                    "Rank": "2",
+                },
+                {
+                    "Browser": "Edge",
+                    "Title": "Two",
+                    "Url": "https://example.com/b",
+                    "Rank": "3",
+                },
             ]
         )
 
@@ -92,10 +679,32 @@ class CatalogTests(unittest.TestCase):
                 "browser": "edge",
                 "capturedAt": "2026-07-19T00:00:00Z",
                 "windows": [{"id": 1, "focused": True, "tabCount": 2}],
-                "groups": [{"id": 7, "windowId": 1, "title": "Research", "color": "blue", "collapsed": True}],
+                "groups": [
+                    {
+                        "id": 7,
+                        "windowId": 1,
+                        "title": "Research",
+                        "color": "blue",
+                        "collapsed": True,
+                    }
+                ],
                 "tabs": [
-                    {"id": 10, "windowId": 1, "index": 0, "groupId": 7, "title": "A", "url": "https://example.com/page?utm_source=x"},
-                    {"id": 11, "windowId": 1, "index": 1, "groupId": 7, "title": "B", "url": "https://example.com/page"},
+                    {
+                        "id": 10,
+                        "windowId": 1,
+                        "index": 0,
+                        "groupId": 7,
+                        "title": "A",
+                        "url": "https://example.com/page?utm_source=x",
+                    },
+                    {
+                        "id": 11,
+                        "windowId": 1,
+                        "index": 1,
+                        "groupId": 7,
+                        "title": "B",
+                        "url": "https://example.com/page",
+                    },
                 ],
             }
 
@@ -111,10 +720,14 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(totals["currentResources"], 1)
             self.assertEqual(totals["duplicateTabInstances"], 1)
             self.assertEqual(totals["groups"], 1)
-            self.assertEqual({tab["groupTitle"] for tab in resources[0]["tabs"]}, {"Research"})
+            self.assertEqual(
+                {tab["groupTitle"] for tab in resources[0]["tabs"]}, {"Research"}
+            )
             self.assertTrue(all(tab["groupCollapsed"] for tab in resources[0]["tabs"]))
 
-    def test_exact_duplicate_plan_only_closes_same_context_public_web_tabs(self) -> None:
+    def test_exact_duplicate_plan_only_closes_same_context_public_web_tabs(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
             connection = connect(state / "atlas.sqlite")
@@ -126,15 +739,81 @@ class CatalogTests(unittest.TestCase):
                     "capturedAt": "2026-07-19T00:00:00Z",
                     "groups": [{"id": 7, "windowId": 1, "title": "One"}],
                     "tabs": [
-                        {"id": 1, "windowId": 1, "index": 0, "groupId": -1, "active": True, "title": "A", "url": "https://example.com/a"},
-                        {"id": 2, "windowId": 1, "index": 1, "groupId": -1, "title": "A copy", "url": "https://example.com/a"},
-                        {"id": 3, "windowId": 1, "index": 2, "groupId": 7, "title": "A grouped", "url": "https://example.com/a"},
-                        {"id": 4, "windowId": 1, "index": 3, "groupId": -1, "title": "File", "url": "file:///C:/private.txt"},
-                        {"id": 5, "windowId": 1, "index": 4, "groupId": -1, "title": "File copy", "url": "file:///C:/private.txt"},
-                        {"id": 6, "windowId": 1, "index": 5, "groupId": -1, "title": "Local", "url": "http://127.0.0.1:9000/app"},
-                        {"id": 7, "windowId": 1, "index": 6, "groupId": -1, "title": "Local copy", "url": "http://127.0.0.1:9000/app"},
-                        {"id": 8, "windowId": 2, "index": 0, "groupId": -1, "active": True, "title": "Selected", "url": "https://example.com/selected"},
-                        {"id": 9, "windowId": 2, "index": 1, "groupId": -1, "highlighted": True, "title": "Selected copy", "url": "https://example.com/selected"},
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "groupId": -1,
+                            "active": True,
+                            "title": "A",
+                            "url": "https://example.com/a",
+                        },
+                        {
+                            "id": 2,
+                            "windowId": 1,
+                            "index": 1,
+                            "groupId": -1,
+                            "title": "A copy",
+                            "url": "https://example.com/a",
+                        },
+                        {
+                            "id": 3,
+                            "windowId": 1,
+                            "index": 2,
+                            "groupId": 7,
+                            "title": "A grouped",
+                            "url": "https://example.com/a",
+                        },
+                        {
+                            "id": 4,
+                            "windowId": 1,
+                            "index": 3,
+                            "groupId": -1,
+                            "title": "File",
+                            "url": "file:///C:/private.txt",
+                        },
+                        {
+                            "id": 5,
+                            "windowId": 1,
+                            "index": 4,
+                            "groupId": -1,
+                            "title": "File copy",
+                            "url": "file:///C:/private.txt",
+                        },
+                        {
+                            "id": 6,
+                            "windowId": 1,
+                            "index": 5,
+                            "groupId": -1,
+                            "title": "Local",
+                            "url": "http://127.0.0.1:9000/app",
+                        },
+                        {
+                            "id": 7,
+                            "windowId": 1,
+                            "index": 6,
+                            "groupId": -1,
+                            "title": "Local copy",
+                            "url": "http://127.0.0.1:9000/app",
+                        },
+                        {
+                            "id": 8,
+                            "windowId": 2,
+                            "index": 0,
+                            "groupId": -1,
+                            "active": True,
+                            "title": "Selected",
+                            "url": "https://example.com/selected",
+                        },
+                        {
+                            "id": 9,
+                            "windowId": 2,
+                            "index": 1,
+                            "groupId": -1,
+                            "highlighted": True,
+                            "title": "Selected copy",
+                            "url": "https://example.com/selected",
+                        },
                     ],
                 },
                 "test",
@@ -150,7 +829,270 @@ class CatalogTests(unittest.TestCase):
             self.assertNotIn("file:///", json.dumps(plan))
             self.assertNotIn("127.0.0.1", json.dumps(plan))
 
-    def test_mutation_audit_verifies_closed_target_absent_and_keeper_present(self) -> None:
+    def test_library_survives_a_new_empty_live_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "groupId": 4,
+                            "title": "Stored",
+                            "url": "https://example.com/stored",
+                        }
+                    ],
+                    "groups": [{"id": 4, "windowId": 1, "title": "Reference"}],
+                },
+                "test",
+            )
+            store_snapshot(
+                connection,
+                state,
+                {"browser": "chrome", "capturedAt": "2026-07-20T00:01:00Z", "tabs": []},
+                "test",
+            )
+
+            self.assertEqual(current_resources(connection), [])
+            library = library_resources(connection)
+            payload = report_payload(connection)
+            connection.close()
+
+            self.assertEqual(len(library), 1)
+            self.assertEqual(library[0]["openTabCount"], 0)
+            self.assertEqual(library[0]["contexts"][0]["groupTitle"], "Reference")
+            self.assertEqual(len(payload["resources"]), 1)
+            self.assertEqual(payload["inventory"]["currentTabs"], 0)
+            self.assertEqual(payload["inventory"]["libraryResources"], 1)
+            self.assertEqual(payload["groups"], [])
+
+    def test_archive_plan_backs_up_catalog_and_preserves_closed_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "groupId": -1,
+                            "active": True,
+                            "title": "Web",
+                            "url": "https://example.com/a",
+                        },
+                        {
+                            "id": 2,
+                            "windowId": 1,
+                            "index": 1,
+                            "groupId": -1,
+                            "pinned": True,
+                            "title": "Local",
+                            "url": "file:///C:/reference.txt",
+                        },
+                        {
+                            "id": 3,
+                            "windowId": 1,
+                            "index": 2,
+                            "groupId": -1,
+                            "title": "Discard",
+                            "url": "https://example.com/discard",
+                        },
+                        {
+                            "id": 4,
+                            "windowId": 1,
+                            "index": 3,
+                            "groupId": -1,
+                            "title": "TabAtlas",
+                            "url": f"chrome-extension://{EXPECTED_EXTENSION_ID}/archive_complete.html",
+                        },
+                    ],
+                },
+                "test",
+                new_resource_state="candidate",
+            )
+            pending = {
+                item["canonicalUrl"]: item["resourceId"]
+                for item in discovery_resources(connection)
+            }
+            set_discovery_state(
+                connection,
+                "accepted",
+                {
+                    pending["https://example.com/a"],
+                    pending["file:///C:/reference.txt"],
+                },
+            )
+            set_discovery_state(
+                connection,
+                "dismissed",
+                {pending["https://example.com/discard"]},
+            )
+            plan = build_archive_plan(
+                connection,
+                {"chrome"},
+                include_dismissed=True,
+            )
+            evidence_path = record_archive_plan(
+                connection,
+                state,
+                plan,
+                "User approved closing every freshly captured tab after durable backup.",
+            )
+            post = store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:01:00Z",
+                    "tabs": [
+                        {
+                            "id": 99,
+                            "windowId": 1,
+                            "index": 0,
+                            "groupId": -1,
+                            "title": "Archive verification",
+                            "url": f"chrome-extension://{EXPECTED_EXTENSION_ID}/archive_complete.html",
+                        }
+                    ],
+                },
+                "extension_live",
+            )
+            results = {
+                "chrome": {
+                    "closedCount": 3,
+                    "skippedCount": 0,
+                    "controlTabId": 99,
+                    "controlWindowId": 1,
+                    "results": [
+                        {
+                            "tabId": target["targetTabId"],
+                            "status": "closed",
+                            "reason": "captured_and_archived",
+                        }
+                        for target in plan["browsers"]["chrome"]["targets"]
+                    ],
+                }
+            }
+            totals = finalize_archive_plan(
+                connection,
+                state,
+                plan,
+                results,
+                {"chrome": post},
+            )
+            library = library_resources(connection)
+            live = current_resources(connection)
+            statuses = {
+                row["library_state"]: row["status"]
+                for row in connection.execute(
+                    "SELECT library_state, status FROM resources "
+                    "WHERE canonical_url NOT LIKE 'chrome-extension:%'"
+                )
+            }
+            connection.close()
+
+            self.assertEqual(plan["summary"]["plannedClosures"], 3)
+            self.assertEqual(plan["summary"]["plannedRetainedClosures"], 2)
+            self.assertEqual(plan["summary"]["plannedDiscardedClosures"], 1)
+            self.assertEqual(plan["summary"]["plannedOperationalClosures"], 0)
+            self.assertNotIn("https://", json.dumps(plan))
+            self.assertNotIn("file:///", json.dumps(plan))
+            self.assertEqual(totals["closed"], 3)
+            self.assertEqual(totals["verifiedBrowsers"], 1)
+            self.assertEqual(totals["archivedResources"], 2)
+            self.assertEqual(totals["discardedResources"], 1)
+            self.assertEqual(totals["operationalResources"], 0)
+            self.assertEqual(live, [])
+            self.assertEqual(len(library), 2)
+            self.assertEqual(statuses, {"accepted": "saved", "dismissed": "archived"})
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            backup_path = state / evidence["durability"]["backupPath"]
+            self.assertTrue(backup_path.is_file())
+            self.assertEqual(evidence["durability"]["catalogIntegrity"], "ok")
+            self.assertEqual(evidence["durability"]["durableResourceCount"], 2)
+            self.assertEqual(evidence["durability"]["reviewedDiscardResourceCount"], 1)
+            self.assertEqual(evidence["durability"]["operationalResourceCount"], 0)
+            self.assertNotIn("example.com", evidence_path.read_text(encoding="utf-8"))
+
+    def test_archive_finalization_rejects_unknown_post_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            before = store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "groupId": -1,
+                            "title": "Stored",
+                            "url": "https://example.com/stored",
+                        }
+                    ],
+                },
+                "extension_live",
+            )
+            plan = build_archive_plan(
+                connection,
+                {"chrome"},
+                {"chrome": before["id"]},
+            )
+            record_archive_plan(connection, state, plan, "Bound archive safety test")
+            target = plan["browsers"]["chrome"]["targets"][0]
+            totals = finalize_archive_plan(
+                connection,
+                state,
+                plan,
+                {
+                    "chrome": {
+                        "closedCount": 1,
+                        "skippedCount": 0,
+                        "controlTabId": 99,
+                        "controlWindowId": 1,
+                        "results": [
+                            {"tabId": target["targetTabId"], "status": "closed"}
+                        ],
+                    }
+                },
+                {"chrome": {"id": "cap_missing", "tab_count": 0}},
+            )
+            audit = connection.execute(
+                "SELECT status, after_capture_id FROM mutation_audits "
+                "WHERE action='archive_captured_tabs'"
+            ).fetchone()
+            resource_status = connection.execute(
+                "SELECT status FROM resources WHERE id=?",
+                (target["resourceId"],),
+            ).fetchone()["status"]
+            connection.close()
+
+            self.assertEqual(totals["verifiedBrowsers"], 0)
+            self.assertEqual(totals["archivedResources"], 0)
+            self.assertEqual(audit["status"], "partial")
+            self.assertIsNone(audit["after_capture_id"])
+            self.assertEqual(resource_status, "open")
+
+    def test_mutation_audit_verifies_closed_target_absent_and_keeper_present(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
             connection = connect(state / "atlas.sqlite")
@@ -161,8 +1103,23 @@ class CatalogTests(unittest.TestCase):
                     "browser": "chrome",
                     "capturedAt": "2026-07-19T00:00:00Z",
                     "tabs": [
-                        {"id": 1, "windowId": 1, "index": 0, "groupId": -1, "active": True, "title": "A", "url": "https://example.com/a"},
-                        {"id": 2, "windowId": 1, "index": 1, "groupId": -1, "title": "A copy", "url": "https://example.com/a"},
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "groupId": -1,
+                            "active": True,
+                            "title": "A",
+                            "url": "https://example.com/a",
+                        },
+                        {
+                            "id": 2,
+                            "windowId": 1,
+                            "index": 1,
+                            "groupId": -1,
+                            "title": "A copy",
+                            "url": "https://example.com/a",
+                        },
                     ],
                 },
                 "test",
@@ -181,17 +1138,37 @@ class CatalogTests(unittest.TestCase):
                     "browser": "chrome",
                     "capturedAt": "2026-07-19T00:01:00Z",
                     "tabs": [
-                        {"id": 1, "windowId": 1, "index": 0, "groupId": -1, "active": True, "title": "A", "url": "https://example.com/a"}
+                        {
+                            "id": 1,
+                            "windowId": 1,
+                            "index": 0,
+                            "groupId": -1,
+                            "active": True,
+                            "title": "A",
+                            "url": "https://example.com/a",
+                        }
                     ],
                 },
-                "test",
+                "extension_live",
             )
             target_id = plan["browsers"]["chrome"]["targets"][0]["targetTabId"]
             totals = finalize_mutation_plan(
                 connection,
                 state,
                 plan,
-                {"chrome": {"closedCount": 1, "skippedCount": 0, "results": [{"tabId": target_id, "status": "closed", "reason": "exact_duplicate"}]}},
+                {
+                    "chrome": {
+                        "closedCount": 1,
+                        "skippedCount": 0,
+                        "results": [
+                            {
+                                "tabId": target_id,
+                                "status": "closed",
+                                "reason": "exact_duplicate",
+                            }
+                        ],
+                    }
+                },
                 {"chrome": after},
             )
             audit = connection.execute("SELECT * FROM mutation_audits").fetchone()
@@ -208,9 +1185,13 @@ class CatalogTests(unittest.TestCase):
             connection = connect(Path(temporary) / "atlas.sqlite")
             save_pairing(connection, "chrome", EXPECTED_EXTENSION_ID, "test-token")
 
-            self.assertTrue(pairing_secret(connection, "chrome", EXPECTED_EXTENSION_ID)["enabled"])
+            self.assertTrue(
+                pairing_secret(connection, "chrome", EXPECTED_EXTENSION_ID)["enabled"]
+            )
             self.assertTrue(revoke_pairing(connection, "chrome"))
-            self.assertFalse(pairing_secret(connection, "chrome", EXPECTED_EXTENSION_ID)["enabled"])
+            self.assertFalse(
+                pairing_secret(connection, "chrome", EXPECTED_EXTENSION_ID)["enabled"]
+            )
             self.assertFalse(revoke_pairing(connection, "chrome"))
             connection.close()
 
@@ -228,12 +1209,19 @@ class CatalogTests(unittest.TestCase):
                 {
                     "browser": "chrome",
                     "capturedAt": "2026-07-19T00:00:00Z",
-                    "tabs": [{"title": "</script><script>bad()</script>", "url": "https://example.com/"}],
+                    "tabs": [
+                        {
+                            "title": "</script><script>bad()</script>",
+                            "url": "https://example.com/",
+                        }
+                    ],
                 },
                 "test",
             )
 
-            report = generate_report(connection, root / "report", assets).read_text(encoding="utf-8")
+            report = generate_report(connection, root / "report", assets).read_text(
+                encoding="utf-8"
+            )
             connection.close()
 
             self.assertNotIn("</script><script>bad()", report)
@@ -261,7 +1249,9 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(resource["canonicalUrl"], "https://example.com/app")
             self.assertEqual(resource["openUrl"], exact)
 
-    def test_recovery_candidate_cannot_replace_the_trusted_current_capture(self) -> None:
+    def test_recovery_candidate_cannot_replace_the_trusted_current_capture(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
             connection = connect(state / "atlas.sqlite")
@@ -271,7 +1261,9 @@ class CatalogTests(unittest.TestCase):
                 {
                     "browser": "chrome",
                     "capturedAt": "2026-07-18T00:00:00Z",
-                    "tabs": [{"title": "Trusted", "url": "https://example.com/trusted"}],
+                    "tabs": [
+                        {"title": "Trusted", "url": "https://example.com/trusted"}
+                    ],
                 },
                 "extension_live",
             )
@@ -281,7 +1273,9 @@ class CatalogTests(unittest.TestCase):
                 {
                     "browser": "chrome",
                     "capturedAt": "2026-07-19T00:00:00Z",
-                    "tabs": [{"title": "Candidate", "url": "https://example.com/candidate"}],
+                    "tabs": [
+                        {"title": "Candidate", "url": "https://example.com/candidate"}
+                    ],
                 },
                 "isolated_recovery",
                 trust_state="candidate",
@@ -289,11 +1283,19 @@ class CatalogTests(unittest.TestCase):
 
             totals = inventory(connection)
             resources = current_resources(connection)
+            library = library_resources(connection)
+            discoveries = discovery_resources(connection)
             connection.close()
 
             self.assertEqual(totals["candidateCaptures"], 1)
-            self.assertEqual(totals["captures"][0]["capturedAt"], "2026-07-18T00:00:00Z")
+            self.assertEqual(
+                totals["captures"][0]["capturedAt"], "2026-07-18T00:00:00Z"
+            )
             self.assertEqual(resources[0]["title"], "Trusted")
+            self.assertEqual(len(library), 1)
+            self.assertEqual(library[0]["title"], "Trusted")
+            self.assertEqual(len(discoveries), 1)
+            self.assertEqual(discoveries[0]["title"], "Candidate")
 
     def test_a_brief_without_a_collection_stays_in_the_review_queue(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -313,14 +1315,19 @@ class CatalogTests(unittest.TestCase):
                 "SELECT resource_id FROM tab_instances WHERE capture_id=?",
                 (stored["id"],),
             ).fetchone()["resource_id"]
-            apply_annotations(connection, [{"resourceId": resource, "brief": "Context is still unclear."}])
+            apply_annotations(
+                connection,
+                [{"resourceId": resource, "brief": "Context is still unclear."}],
+            )
 
             totals = inventory(connection)
             connection.close()
 
             self.assertEqual(totals["unclassifiedResources"], 1)
 
-    def test_presentation_exposes_decision_signals_without_loading_remote_media(self) -> None:
+    def test_presentation_exposes_decision_signals_without_loading_remote_media(
+        self,
+    ) -> None:
         presentation = resource_presentation(
             {
                 "openUrl": "https://www.youtube.com/watch?v=abc123XYZ00&utm_source=test",
@@ -343,6 +1350,8 @@ class CatalogTests(unittest.TestCase):
 
         self.assertEqual(presentation["format"], "Video")
         self.assertEqual(presentation["displayTitle"], "Example video")
+        self.assertEqual(presentation["sourceGroup"], "YouTube")
+        self.assertEqual(presentation["publisher"], "")
         self.assertEqual(presentation["intent"], "Watch")
         self.assertEqual(presentation["queue"], "needs_context")
         self.assertTrue(presentation["preview"]["requiresUserLoad"])
@@ -350,6 +1359,467 @@ class CatalogTests(unittest.TestCase):
             presentation["preview"]["remoteImage"],
             "https://i.ytimg.com/vi/abc123XYZ00/mqdefault.jpg",
         )
+        self.assertEqual(presentation["preview"]["metadataLabel"], "Video metadata")
+        self.assertEqual(presentation["preview"]["requestLabel"], "video thumbnail")
+        self.assertEqual(
+            presentation["preview"]["motion"],
+            {
+                "kind": "youtube",
+                "videoId": "abc123XYZ00",
+                "label": "Play video preview",
+            },
+        )
+
+    def test_presentation_names_rich_evidence_and_suppresses_unsafe_requests(
+        self,
+    ) -> None:
+        x_post = resource_presentation(
+            {
+                "resourceId": "res_111111111111111111111111",
+                "openUrl": "https://x.com/example/status/1234567890123456789",
+                "canonicalUrl": "https://x.com/example/status/1234567890123456789",
+                "host": "x.com",
+                "kind": "web_page",
+                "title": "Example post",
+                "previewLocalPath": "previews/res_111111111111111111111111.jpg",
+                "previewSource": "x_public_video_thumbnail",
+                "motionKind": "x_mp4",
+                "motionUrl": (
+                    "https://video.twimg.com/amplify_video/123/vid/avc1/"
+                    "720x720/example.mp4?tag=1"
+                ),
+                "collections": [],
+                "tasks": [],
+                "tabs": [],
+            }
+        )
+        conversation = resource_presentation(
+            {
+                "openUrl": "https://chatgpt.com/c/example",
+                "canonicalUrl": "https://chatgpt.com/c/example",
+                "host": "chatgpt.com",
+                "kind": "web_page",
+                "title": "Private conversation",
+                "collections": [],
+                "tasks": [],
+                "tabs": [],
+            }
+        )
+
+        self.assertEqual(x_post["preview"]["evidenceLabel"], "Video poster")
+        self.assertEqual(x_post["preview"]["metadataLabel"], "Post metadata")
+        self.assertEqual(x_post["preview"]["strategy"], "public_media")
+        self.assertEqual(x_post["preview"]["motion"]["kind"], "x_mp4")
+        self.assertEqual(
+            x_post["preview"]["motion"]["url"],
+            "https://video.twimg.com/amplify_video/123/vid/avc1/"
+            "720x720/example.mp4?tag=1",
+        )
+        self.assertEqual(conversation["format"], "Conversation")
+        self.assertEqual(conversation["preview"]["metadataLabel"], "Private summary")
+        self.assertFalse(conversation["preview"]["canRequestRicher"])
+
+    def test_source_lens_uses_reliable_owner_signals_and_groups_other_sites(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "edge",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "title": "Post A",
+                            "url": "https://x.com/example_dev/status/100",
+                        },
+                        {
+                            "title": "Post B",
+                            "url": "https://x.com/example_dev/status/200",
+                        },
+                        {"title": "Guide", "url": "https://docs.example.test/guide"},
+                        {
+                            "title": "Repository",
+                            "url": "https://github.com/example-owner/project",
+                        },
+                    ],
+                },
+                "test",
+            )
+
+            payload = report_payload(connection)
+            connection.close()
+
+            summaries = {item["name"]: item for item in payload["sourceSummaries"]}
+            x_summary = summaries["X"]
+            other_summary = summaries["Other websites"]
+            github_resource = next(
+                item
+                for item in payload["resources"]
+                if item["presentation"]["source"] == "GitHub"
+            )
+            browser_presentation = resource_presentation(
+                {
+                    "openUrl": "chrome-extension://efaidnbmnnnibpcajpcglclefindmkaj/index.html",
+                    "host": "efaidnbmnnnibpcajpcglclefindmkaj",
+                    "kind": "web_page",
+                    "title": "Document viewer",
+                    "collections": [],
+                    "tasks": [],
+                    "tabs": [],
+                }
+            )
+
+            self.assertEqual(x_summary["resourceCount"], 2)
+            self.assertEqual(x_summary["publishers"][0]["name"], "@example_dev")
+            self.assertEqual(x_summary["publishers"][0]["resourceCount"], 2)
+            self.assertEqual(
+                other_summary["publishers"][0]["name"], "docs.example.test"
+            )
+            self.assertEqual(
+                github_resource["presentation"]["publisher"], "example-owner"
+            )
+            self.assertEqual(browser_presentation["sourceGroup"], "Browser")
+
+    def test_local_preview_registration_validates_and_persists_private_image_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "title": "Preview target",
+                            "url": "https://example.com/preview",
+                        }
+                    ],
+                },
+                "test",
+            )
+            resource_id = library_resources(connection)[0]["resourceId"]
+            image = state / "capture.bin"
+            image.write_bytes(
+                bytes.fromhex(
+                    "89504e470d0a1a0a0000000d4948445200000001000000010804000000"
+                    "b51c0c020000000b4944415478da63fcff1f0003030200efa57eea00000000"
+                    "49454e44ae426082"
+                )
+            )
+
+            result = register_local_preview(connection, state, resource_id, image)
+            stored = library_resources(connection)[0]
+            connection.close()
+
+            self.assertEqual(result["kind"], "screenshot")
+            self.assertEqual(stored["previewKind"], "screenshot")
+            self.assertEqual(stored["previewSource"], "agent_local_capture")
+            self.assertTrue((state / stored["previewLocalPath"]).is_file())
+
+    def test_public_preview_adapters_are_source_specific_and_media_bounded(
+        self,
+    ) -> None:
+        preview_dir = Path("previews")
+        x_candidate = _public_preview_candidate(
+            {
+                "resourceId": "res_111111111111111111111111",
+                "canonicalUrl": "https://x.com/example/status/1234567890123456789",
+            },
+            preview_dir,
+        )
+        github_candidate = _public_preview_candidate(
+            {
+                "resourceId": "res_222222222222222222222222",
+                "canonicalUrl": "https://github.com/example/project/issues/12",
+            },
+            preview_dir,
+        )
+        reddit_candidate = _public_preview_candidate(
+            {
+                "resourceId": "res_333333333333333333333333",
+                "canonicalUrl": "https://www.reddit.com/r/example/comments/abc123/post/",
+            },
+            preview_dir,
+        )
+
+        self.assertEqual(x_candidate["provider"], "x_post")
+        self.assertEqual(github_candidate["provider"], "github")
+        self.assertEqual(reddit_candidate["provider"], "reddit_post")
+        self.assertIsNone(
+            _public_preview_candidate(
+                {
+                    "resourceId": "res_444444444444444444444444",
+                    "canonicalUrl": "https://x.com/example",
+                },
+                preview_dir,
+            )
+        )
+        self.assertIsNone(
+            _public_preview_candidate(
+                {
+                    "resourceId": "res_555555555555555555555555",
+                    "canonicalUrl": "https://user@x.com/example/status/123",
+                },
+                preview_dir,
+            )
+        )
+        self.assertTrue(
+            _preview_image_allowed(
+                "x_post",
+                "https://pbs.twimg.com/amplify_video_thumb/123/img/poster.jpg",
+                ("pbs.twimg.com",),
+            )
+        )
+        self.assertFalse(
+            _preview_image_allowed(
+                "x_post",
+                "https://pbs.twimg.com/profile_images/123/avatar.jpg",
+                ("pbs.twimg.com",),
+            )
+        )
+        self.assertFalse(
+            _preview_image_allowed(
+                "x_post",
+                "https://example.com/amplify_video_thumb/123/img/poster.jpg",
+                ("pbs.twimg.com",),
+            )
+        )
+        self.assertFalse(
+            _preview_image_allowed(
+                "x_post",
+                "https://pbs.twimg.com:444/amplify_video_thumb/123/img/poster.jpg",
+                ("pbs.twimg.com",),
+            )
+        )
+        self.assertEqual(
+            _public_preview_source(
+                "x_post",
+                "https://pbs.twimg.com/amplify_video_thumb/123/img/poster.jpg",
+            ),
+            "x_public_video_thumbnail",
+        )
+
+    def test_open_graph_parser_handles_attribute_order_without_page_scraping(
+        self,
+    ) -> None:
+        parser = _OpenGraphParser()
+        parser.feed("""
+            <html><head>
+              <meta content="Poster title" property="og:title">
+              <meta content="https://pbs.twimg.com/media/example.jpg" name="twitter:image">
+              <meta property="og:image:width" content="1080">
+              <meta content="1080" property="og:image:height">
+              <meta property="unrelated" content="ignored">
+              <script type="application/ld+json">
+                {"@type":"VideoObject","contentUrl":"https://video.twimg.com/amplify_video/123/vid/avc1/720x720/example.mp4?tag=1"}
+              </script>
+            </head><body>Private page body is not parsed into fields.</body></html>
+        """)
+
+        self.assertEqual(parser.values["og:title"], "Poster title")
+        self.assertEqual(
+            parser.values["twitter:image"],
+            "https://pbs.twimg.com/media/example.jpg",
+        )
+        self.assertEqual(parser.values["og:image:width"], "1080")
+        self.assertNotIn("unrelated", parser.values)
+        self.assertEqual(
+            _x_motion_from_json_ld(parser.json_ld),
+            {
+                "kind": "x_mp4",
+                "url": (
+                    "https://video.twimg.com/amplify_video/123/vid/avc1/"
+                    "720x720/example.mp4?tag=1"
+                ),
+                "source": "x_public_json_ld_video",
+            },
+        )
+        self.assertFalse(
+            _x_motion_url_allowed(
+                "https://video.twimg.com/profile_images/123/example.mp4"
+            )
+        )
+        self.assertFalse(
+            _x_motion_url_allowed("http://127.0.0.1/amplify_video/123/example.mp4")
+        )
+        self.assertFalse(
+            _x_motion_url_allowed(
+                "https://sub.video.twimg.com/amplify_video/123/example.mp4"
+            )
+        )
+
+    def test_public_preview_redirects_cannot_leave_the_provider_allowlist(self) -> None:
+        handler = _AllowlistedRedirectHandler(("pbs.twimg.com",))
+        request = Request("https://pbs.twimg.com/media/example.jpg")
+
+        with self.assertRaisesRegex(ValueError, "provider allowlist"):
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "http://127.0.0.1/private",
+            )
+        with self.assertRaisesRegex(ValueError, "provider allowlist"):
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "https://example.com/unrelated.jpg",
+            )
+
+    def test_refresh_preserves_agent_captures_over_automatic_public_previews(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-20T00:00:00Z",
+                    "tabs": [
+                        {
+                            "title": "Post with a manual capture",
+                            "url": "https://x.com/example/status/1234567890123456789",
+                        }
+                    ],
+                },
+                "test",
+            )
+            resource_id = library_resources(connection)[0]["resourceId"]
+            image = state / "capture.bin"
+            image.write_bytes(
+                bytes.fromhex(
+                    "89504e470d0a1a0a0000000d4948445200000001000000010804000000"
+                    "b51c0c020000000b4944415478da63fcff1f0003030200efa57eea00000000"
+                    "49454e44ae426082"
+                )
+            )
+            register_local_preview(connection, state, resource_id, image)
+
+            motion_url = (
+                "https://video.twimg.com/amplify_video/123/vid/avc1/"
+                "720x720/example.mp4?tag=1"
+            )
+            with patch(
+                "tabatlas.previews._download_public_preview",
+                return_value={
+                    "preview": None,
+                    "previewFailed": False,
+                    "motionChecked": True,
+                    "motion": {
+                        "kind": "x_mp4",
+                        "url": motion_url,
+                        "source": "x_public_json_ld_video",
+                    },
+                },
+            ) as downloader:
+                result = cache_public_previews(
+                    connection, state, refresh=True, workers=1
+                )
+            stored = library_resources(connection)[0]
+            connection.close()
+
+            downloader.assert_called_once()
+            self.assertEqual(result["eligible"], 1)
+            self.assertEqual(result["preservedScreenshots"], 1)
+            self.assertEqual(result["downloaded"], 0)
+            self.assertEqual(result["motionResolved"], 1)
+            self.assertEqual(stored["previewKind"], "screenshot")
+            self.assertEqual(stored["previewSource"], "agent_local_capture")
+            self.assertEqual(stored["motionKind"], "x_mp4")
+            self.assertEqual(stored["motionUrl"], motion_url)
+
+    def test_failed_public_preview_uses_backoff_until_forced_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            connection = connect(state / "atlas.sqlite")
+            store_snapshot(
+                connection,
+                state,
+                {
+                    "browser": "chrome",
+                    "capturedAt": "2026-07-22T00:00:00Z",
+                    "tabs": [
+                        {
+                            "title": "Unavailable public video thumbnail",
+                            "url": "https://www.youtube.com/watch?v=Backoff0001",
+                        }
+                    ],
+                },
+                "test",
+            )
+
+            with patch(
+                "tabatlas.previews._download_public_preview",
+                side_effect=URLError("unavailable"),
+            ) as downloader:
+                first = cache_public_previews(connection, state, workers=1)
+                deferred = cache_public_previews(connection, state, workers=1)
+                forced = cache_public_previews(
+                    connection, state, refresh=True, workers=1
+                )
+            attempt = connection.execute(
+                "SELECT attempted_at, retry_after FROM resource_preview_attempts"
+            ).fetchone()
+            connection.close()
+
+            self.assertEqual(downloader.call_count, 2)
+            self.assertEqual(first["failed"], 1)
+            self.assertEqual(first["deferred"], 0)
+            self.assertEqual(deferred["failed"], 0)
+            self.assertEqual(deferred["deferred"], 1)
+            self.assertEqual(forced["failed"], 1)
+            self.assertIsNotNone(attempt)
+            self.assertGreater(attempt["retry_after"], attempt["attempted_at"])
+
+    def test_report_server_is_loopback_read_only_and_sends_safe_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report"
+            report.mkdir()
+            for name, content in (
+                ("index.html", "<!doctype html><title>TabAtlas</title>"),
+                ("app.js", "void 0;"),
+                ("app.css", "body {}"),
+            ):
+                (report / name).write_text(content, encoding="utf-8")
+            server, url = create_report_server(report, 0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urlopen(url, timeout=3) as response:
+                    body = response.read().decode("utf-8")
+                    self.assertEqual(
+                        response.headers["X-Content-Type-Options"], "nosniff"
+                    )
+                    self.assertEqual(
+                        response.headers["Referrer-Policy"],
+                        "strict-origin-when-cross-origin",
+                    )
+                self.assertIn("TabAtlas", body)
+                self.assertEqual(server.server_address[0], "127.0.0.1")
+                request = Request(url, data=b"write", method="POST")
+                with self.assertRaises(HTTPError) as rejected:
+                    urlopen(request, timeout=3)
+                self.assertEqual(rejected.exception.code, 405)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
 
     def test_report_keeps_duplicate_group_titles_as_distinct_groups(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -362,12 +1832,31 @@ class CatalogTests(unittest.TestCase):
                     "browser": "chrome",
                     "capturedAt": "2026-07-19T00:00:00Z",
                     "groups": [
-                        {"id": 7, "windowId": 1, "title": "Research", "color": "orange"},
+                        {
+                            "id": 7,
+                            "windowId": 1,
+                            "title": "Research",
+                            "color": "orange",
+                        },
                         {"id": 8, "windowId": 1, "title": "Research", "color": "cyan"},
                     ],
                     "tabs": [
-                        {"id": 10, "windowId": 1, "index": 0, "groupId": 7, "title": "A", "url": "https://example.com/a"},
-                        {"id": 11, "windowId": 1, "index": 1, "groupId": 8, "title": "B", "url": "https://example.com/b"},
+                        {
+                            "id": 10,
+                            "windowId": 1,
+                            "index": 0,
+                            "groupId": 7,
+                            "title": "A",
+                            "url": "https://example.com/a",
+                        },
+                        {
+                            "id": 11,
+                            "windowId": 1,
+                            "index": 1,
+                            "groupId": 8,
+                            "title": "B",
+                            "url": "https://example.com/b",
+                        },
                     ],
                 },
                 "test",
@@ -394,10 +1883,26 @@ class CatalogTests(unittest.TestCase):
                 {
                     "browser": "edge",
                     "capturedAt": "2026-07-19T00:00:00Z",
-                    "groups": [{"id": 4, "windowId": 1, "title": "Ordered", "color": "blue"}],
+                    "groups": [
+                        {"id": 4, "windowId": 1, "title": "Ordered", "color": "blue"}
+                    ],
                     "tabs": [
-                        {"id": 10, "windowId": 1, "index": 0, "groupId": 4, "title": "Z first", "url": "https://example.com/z"},
-                        {"id": 11, "windowId": 1, "index": 1, "groupId": 4, "title": "A second", "url": "https://example.com/a"},
+                        {
+                            "id": 10,
+                            "windowId": 1,
+                            "index": 0,
+                            "groupId": 4,
+                            "title": "Z first",
+                            "url": "https://example.com/z",
+                        },
+                        {
+                            "id": 11,
+                            "windowId": 1,
+                            "index": 1,
+                            "groupId": 4,
+                            "title": "A second",
+                            "url": "https://example.com/a",
+                        },
                     ],
                 },
                 "test",
@@ -405,12 +1910,17 @@ class CatalogTests(unittest.TestCase):
 
             payload = report_payload(connection)
             connection.close()
-            resources_by_id = {item["resourceId"]: item for item in payload["resources"]}
-            ordered_titles = [resources_by_id[resource_id]["title"] for resource_id in payload["groups"][0]["resourceIds"]]
+            resources_by_id = {
+                item["resourceId"]: item for item in payload["resources"]
+            }
+            ordered_titles = [
+                resources_by_id[resource_id]["title"]
+                for resource_id in payload["groups"][0]["resourceIds"]
+            ]
 
             self.assertEqual(ordered_titles, ["Z first", "A second"])
 
-    def test_exported_report_decision_is_annotation_compatible(self) -> None:
+    def test_status_annotation_remains_compatible(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
             connection = connect(state / "atlas.sqlite")
@@ -420,7 +1930,9 @@ class CatalogTests(unittest.TestCase):
                 {
                     "browser": "chrome",
                     "capturedAt": "2026-07-19T00:00:00Z",
-                    "tabs": [{"title": "Decision", "url": "https://example.com/decision"}],
+                    "tabs": [
+                        {"title": "Decision", "url": "https://example.com/decision"}
+                    ],
                 },
                 "test",
             )
@@ -433,7 +1945,9 @@ class CatalogTests(unittest.TestCase):
                 connection,
                 {
                     "schemaVersion": 1,
-                    "resources": [{"resourceId": resource_id, "status": "close_candidate"}],
+                    "resources": [
+                        {"resourceId": resource_id, "status": "close_candidate"}
+                    ],
                 },
             )
             resource = current_resources(connection)[0]
@@ -450,7 +1964,9 @@ class ReceiverIntegrationTests(unittest.TestCase):
             codes: queue.Queue[str] = queue.Queue()
             pair_result: list[object] = []
             pair_thread = threading.Thread(
-                target=lambda: pair_result.extend(run_pairing(database, state, "chrome", 5, codes.put)),
+                target=lambda: pair_result.extend(
+                    run_pairing(database, state, "chrome", 5, codes.put)
+                ),
                 daemon=True,
             )
             pair_thread.start()
@@ -492,7 +2008,9 @@ class ReceiverIntegrationTests(unittest.TestCase):
 
             capture_result: list[object] = []
             capture_thread = threading.Thread(
-                target=lambda: capture_result.extend(run_capture(database, state, {"chrome"}, 5)),
+                target=lambda: capture_result.extend(
+                    run_capture(database, state, {"chrome"}, 5)
+                ),
                 daemon=True,
             )
             capture_thread.start()
@@ -500,7 +2018,9 @@ class ReceiverIntegrationTests(unittest.TestCase):
                 self._retry_request("/health")
             self.assertEqual(health_error.exception.code, 404)
             with self.assertRaises(HTTPError) as bearer_error:
-                self._retry_request("/v1/command", headers={"Authorization": f"Bearer {token}"})
+                self._retry_request(
+                    "/v1/command", headers={"Authorization": f"Bearer {token}"}
+                )
             self.assertEqual(bearer_error.exception.code, 401)
 
             command_nonce = "2" * 32
@@ -530,7 +2050,15 @@ class ReceiverIntegrationTests(unittest.TestCase):
                 "capturedAt": "2026-07-19T00:00:00Z",
                 "windows": [{"id": 1, "focused": False, "tabCount": 1}],
                 "groups": [],
-                "tabs": [{"id": 4, "windowId": 1, "index": 0, "title": "Example", "url": "https://example.com/"}],
+                "tabs": [
+                    {
+                        "id": 4,
+                        "windowId": 1,
+                        "index": 0,
+                        "title": "Example",
+                        "url": "https://example.com/",
+                    }
+                ],
             }
             snapshot_nonce = "3" * 32
             body_hash = hashlib.sha256(json.dumps(snapshot).encode("utf-8")).hexdigest()
@@ -565,19 +2093,25 @@ class ReceiverIntegrationTests(unittest.TestCase):
                 ),
             )
 
-    def test_revocation_notification_is_signed_before_the_extension_forgets_its_key(self) -> None:
+    def test_revocation_notification_is_signed_before_the_extension_forgets_its_key(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
             database = state / "atlas.sqlite"
             connection = connect(database)
-            save_pairing(connection, "chrome", EXPECTED_EXTENSION_ID, "revocation-token")
+            save_pairing(
+                connection, "chrome", EXPECTED_EXTENSION_ID, "revocation-token"
+            )
             key = token_hash("revocation-token")
             revoke_pairing(connection, "chrome")
             connection.close()
 
             result: list[bool] = []
             thread = threading.Thread(
-                target=lambda: result.append(run_revocation(database, state, "chrome", 5)),
+                target=lambda: result.append(
+                    run_revocation(database, state, "chrome", 5)
+                ),
                 daemon=True,
             )
             thread.start()
@@ -606,33 +2140,151 @@ class ReceiverIntegrationTests(unittest.TestCase):
                 ),
             )
 
-    def test_mutation_command_and_results_are_bound_to_the_exact_target_hash(self) -> None:
+    def test_legacy_worker_can_capture_but_cannot_receive_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
             database = state / "atlas.sqlite"
             connection = connect(database)
-            save_pairing(connection, "chrome", EXPECTED_EXTENSION_ID, "mutation-token")
+            save_pairing(connection, "chrome", EXPECTED_EXTENSION_ID, "legacy-token")
+            connection.close()
+            key = token_hash("legacy-token")
+
+            capture_result: list[object] = []
+            thread = threading.Thread(
+                target=lambda: capture_result.extend(
+                    run_capture(database, state, {"chrome"}, 5)
+                ),
+                daemon=True,
+            )
+            thread.start()
+            command_nonce = "9" * 32
+            command = self._retry_request(
+                "/v1/command",
+                headers=self._signed_headers(
+                    key,
+                    "command",
+                    command_nonce,
+                    protocol_version=None,
+                ),
+            )
+            self.assertEqual(command["action"], "capture")
+            self.assertEqual(
+                command["serverProof"],
+                protocol_proof(
+                    key,
+                    "response",
+                    "chrome",
+                    EXPECTED_EXTENSION_ID,
+                    command_nonce,
+                    command["requestId"],
+                    "capture",
+                ),
+            )
+
+            snapshot = {
+                "schemaVersion": 1,
+                "requestId": command["requestId"],
+                "browser": "chrome",
+                "extensionId": EXPECTED_EXTENSION_ID,
+                "capturedAt": "2026-07-20T00:00:00Z",
+                "windows": [{"id": 1, "focused": False, "tabCount": 1}],
+                "groups": [],
+                "tabs": [
+                    {
+                        "id": 4,
+                        "windowId": 1,
+                        "index": 0,
+                        "title": "Legacy capture",
+                        "url": "https://example.com/legacy",
+                    }
+                ],
+            }
+            encoded = json.dumps(snapshot).encode("utf-8")
+            snapshot_nonce = "a" * 32
+            self._json_request(
+                "/v1/snapshot",
+                method="POST",
+                headers=self._signed_headers(
+                    key,
+                    "snapshot",
+                    snapshot_nonce,
+                    command["requestId"],
+                    hashlib.sha256(encoded).hexdigest(),
+                    protocol_version=None,
+                ),
+                body=snapshot,
+            )
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(capture_result[0])
+
+            connection = connect(database)
+            status = pairing_status(connection)[0]
+            connection.close()
+            self.assertEqual(status["protocol_version"], 2)
+
+            targets = [{"targetTabId": 4}]
+            targets_hash = hashlib.sha256(
+                json.dumps(targets, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(
+                ValueError,
+                f"protocol {MUTATION_PROTOCOL_VERSION}.*Reload",
+            ):
+                run_mutation(
+                    database,
+                    state,
+                    {
+                        "requestId": "legacy-mutation",
+                        "action": "close_exact_duplicates",
+                        "browsers": {
+                            "chrome": {"targets": targets, "targetsHash": targets_hash}
+                        },
+                    },
+                    1,
+                )
+
+    def test_mutation_command_and_results_are_bound_to_the_exact_target_hash(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            database = state / "atlas.sqlite"
+            connection = connect(database)
+            save_pairing(
+                connection,
+                "chrome",
+                EXPECTED_EXTENSION_ID,
+                "mutation-token",
+                protocol_version=MUTATION_PROTOCOL_VERSION,
+            )
             connection.close()
             key = token_hash("mutation-token")
-            targets = [{
-                "targetTabId": 12,
-                "keeperTabId": 11,
-                "expectedUrlHash": "a" * 64,
-                "windowId": "1",
-                "groupId": "-1",
-                "targetInstanceId": "tab_target",
-                "keeperInstanceId": "tab_keeper",
-            }]
+            targets = [
+                {
+                    "targetTabId": 12,
+                    "keeperTabId": 11,
+                    "expectedUrlHash": "a" * 64,
+                    "windowId": "1",
+                    "groupId": "-1",
+                    "targetInstanceId": "tab_target",
+                    "keeperInstanceId": "tab_keeper",
+                }
+            ]
             targets_hash = hashlib.sha256(
                 json.dumps(targets, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
             plan = {
                 "requestId": "request-mutation",
-                "browsers": {"chrome": {"targets": targets, "targetsHash": targets_hash}},
+                "browsers": {
+                    "chrome": {"targets": targets, "targetsHash": targets_hash}
+                },
             }
             mutation_result: list[object] = []
             thread = threading.Thread(
-                target=lambda: mutation_result.extend(run_mutation(database, state, plan, 5)),
+                target=lambda: mutation_result.extend(
+                    run_mutation(database, state, plan, 5)
+                ),
                 daemon=True,
             )
             thread.start()
@@ -663,7 +2315,9 @@ class ReceiverIntegrationTests(unittest.TestCase):
                 "targetsHash": targets_hash,
                 "browser": "chrome",
                 "extensionId": EXPECTED_EXTENSION_ID,
-                "results": [{"tabId": 12, "status": "closed", "reason": "exact_duplicate"}],
+                "results": [
+                    {"tabId": 12, "status": "closed", "reason": "exact_duplicate"}
+                ],
             }
             encoded = json.dumps(body).encode("utf-8")
             result_nonce = "6" * 32
@@ -697,6 +2351,89 @@ class ReceiverIntegrationTests(unittest.TestCase):
                     targets_hash,
                     "1",
                     "0",
+                ),
+            )
+
+    def test_archive_cleanup_records_the_actual_close_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            database = state / "atlas.sqlite"
+            connection = connect(database)
+            save_pairing(
+                connection,
+                "chrome",
+                EXPECTED_EXTENSION_ID,
+                "cleanup-token",
+                protocol_version=MUTATION_PROTOCOL_VERSION,
+            )
+            connection.close()
+            key = token_hash("cleanup-token")
+            plan = build_archive_cleanup_plan(
+                {"requestId": "archive-request"},
+                {"chrome": {"controlTabId": 99, "controlWindowId": 4}},
+            )
+            cleanup_result: list[object] = []
+            thread = threading.Thread(
+                target=lambda: cleanup_result.extend(
+                    run_archive_cleanup(database, state, plan, 5)
+                ),
+                daemon=True,
+            )
+            thread.start()
+
+            command_nonce = "7" * 32
+            command = self._retry_request(
+                "/v1/command",
+                headers=self._signed_headers(key, "command", command_nonce),
+            )
+            browser_plan = plan["browsers"]["chrome"]
+            self.assertEqual(command["action"], "close_archive_control")
+            self.assertEqual(command["targetsHash"], browser_plan["targetsHash"])
+
+            body = {
+                "requestId": plan["requestId"],
+                "targetsHash": browser_plan["targetsHash"],
+                "browser": "chrome",
+                "extensionId": EXPECTED_EXTENSION_ID,
+                "controlTabId": 99,
+                "controlWindowId": 4,
+                "status": "closed",
+                "reason": "removed",
+            }
+            encoded = json.dumps(body).encode("utf-8")
+            cleanup_nonce = "8" * 32
+            accepted = self._json_request(
+                "/v1/cleanup",
+                method="POST",
+                headers=self._signed_headers(
+                    key,
+                    "cleanup",
+                    cleanup_nonce,
+                    plan["requestId"],
+                    browser_plan["targetsHash"],
+                    hashlib.sha256(encoded).hexdigest(),
+                ),
+                body=body,
+            )
+            thread.join(timeout=3)
+
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(cleanup_result[0])
+            self.assertEqual(cleanup_result[1]["chrome"]["status"], "closed")
+            self.assertEqual(
+                accepted["serverProof"],
+                protocol_proof(
+                    key,
+                    "cleanup-accepted",
+                    "chrome",
+                    EXPECTED_EXTENSION_ID,
+                    cleanup_nonce,
+                    plan["requestId"],
+                    browser_plan["targetsHash"],
+                    "99",
+                    "4",
+                    "closed",
+                    "removed",
                 ),
             )
 
@@ -746,7 +2483,12 @@ class ReceiverIntegrationTests(unittest.TestCase):
         request_headers = {"Origin": ORIGIN, **(headers or {})}
         if data is not None:
             request_headers["Content-Type"] = "application/json"
-        request = Request(f"http://127.0.0.1:9786{path}", data=data, headers=request_headers, method=method)
+        request = Request(
+            f"http://127.0.0.1:9786{path}",
+            data=data,
+            headers=request_headers,
+            method=method,
+        )
         with urlopen(request, timeout=2) as response:
             return json.loads(response.read().decode("utf-8"))
 
@@ -756,8 +2498,9 @@ class ReceiverIntegrationTests(unittest.TestCase):
         purpose: str,
         nonce: str,
         *extra_parts: str,
+        protocol_version: int | None = MUTATION_PROTOCOL_VERSION,
     ) -> dict[str, str]:
-        return {
+        headers = {
             "X-TabAtlas-Browser": "chrome",
             "X-TabAtlas-Extension": EXPECTED_EXTENSION_ID,
             "X-TabAtlas-Nonce": nonce,
@@ -770,6 +2513,9 @@ class ReceiverIntegrationTests(unittest.TestCase):
                 *extra_parts,
             ),
         }
+        if protocol_version is not None:
+            headers["X-TabAtlas-Protocol"] = str(protocol_version)
+        return headers
 
 
 if __name__ == "__main__":

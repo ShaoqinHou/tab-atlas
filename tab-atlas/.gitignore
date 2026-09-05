@@ -1,0 +1,9 @@
+/.local/
+/.pytest_cache/
+/report/
+/state/
+/build/
+/dist/
+/*.egg-info/
+**/__pycache__/
+*.py[cod]

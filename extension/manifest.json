@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "TabAtlas Bridge",
+  "version": "0.1.0",
+  "description": "User-controlled local bridge for bounded TabAtlas capture and safe current-page save/close.",
+  "permissions": ["tabs", "tabGroups", "storage", "alarms"],
+  "host_permissions": ["http://127.0.0.1:8790/*"],
+  "background": {"service_worker": "background.js", "type": "module"},
+  "action": {"default_popup": "popup.html", "default_title": "TabAtlas Bridge"}
+}

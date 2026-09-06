@@ -1,3 +1,15 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {Store} from '../src/db/store.js';import {JobRunner} from '../src/app/jobs.js';
 
 test('job pauses, resumes completed work, and marks edited input stale',async()=>{const s=new Store();s.capture({runId:'j1',browsers:[{browser:'chrome',tabs:[1,2,3].map(i=>({id:i,url:`https://example.com/${i}`,title:`Tutorial ${i}`}))}]});const ids=s.listResources({limit:10}).items.map(x=>x.id);const jid=s.createJob({kind:'organize',resourceIds:ids,scope:{}});const runner=new JobRunner({store:s});let j=await runner.runOrganization(jid,{stopAfter:1});assert.equal(j.status,'paused');assert.equal(j.items.filter(x=>x.status==='complete').length,1);const pending=j.items.find(x=>x.status==='pending').resource_id;s.addNote(pending,'changed after checkpoint');j=await runner.runOrganization(jid);assert.equal(j.items.filter(x=>x.status==='complete').length,2);assert.equal(j.items.filter(x=>x.status==='stale').length,1);assert.equal(j.status,'partial');s.close();});
+
+test('agent organization is bounded into cohorts of 30',async()=>{
+  const s=new Store();const tabs=[];for(let i=0;i<61;i++)tabs.push({id:i,url:`https://batch.example/${i}`,title:`Guide ${i}`});s.capture({runId:'batch-agent',browsers:[{browser:'chrome',tabs}]});const ids=s.listResources({limit:100}).items.map(x=>x.id);let calls=0;
+  const runtime={runTask:async({text})=>{calls++;const marker='<RESOURCE_DATA>',start=text.indexOf(marker)+marker.length,end=text.indexOf('</RESOURCE_DATA>');const data=JSON.parse(text.slice(start,end));return {text:JSON.stringify({items:data.map(x=>({resourceId:x.id,proposedCollections:['Guides'],reason:'batch',contextQuality:'medium',needsContext:false}))})};}};
+  const runner=new JobRunner({store:s,runtime});const jid=s.createJob({kind:'reorganize',resourceIds:ids,scope:{}});const out=await runner.runOrganization(jid,{useAgent:true});assert.equal(out.status,'complete');assert.equal(out.completed_units,61);assert.equal(calls,3);s.close();
+});
+
+test('running durable job becomes resumable after store restart without losing completed work',async()=>{
+  const {mkdtempSync,rmSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');const dir=mkdtempSync(join(tmpdir(),'tabatlas-job-')),db=join(dir,'test.db');
+  let s=new Store(db);s.capture({runId:'restart',browsers:[{browser:'chrome',tabs:[1,2].map(i=>({id:i,url:`https://restart.example/${i}`,title:`Item ${i}`}))}]});const ids=s.listResources({limit:10}).items.map(x=>x.id),jid=s.createJob({kind:'organize',resourceIds:ids,scope:{}}),runner=new JobRunner({store:s});await runner.runOrganization(jid,{stopAfter:1});s.updateJob(jid,{status:'running'});s.close();
+  s=new Store(db);assert.equal(s.recoverInterruptedJobs(),1);let job=s.getJob(jid);assert.equal(job.status,'paused');assert.equal(job.items.filter(i=>i.status==='complete').length,1);job=await new JobRunner({store:s}).runOrganization(jid);assert.equal(job.status,'complete');assert.equal(job.completed_units,2);s.close();rmSync(dir,{recursive:true,force:true});
+});

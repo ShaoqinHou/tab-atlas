@@ -1,6 +1,7 @@
 node_modules/
 state/
 state-v2/
+state-v2-demo/
 *.db
 *.db-*
 *.sqlite

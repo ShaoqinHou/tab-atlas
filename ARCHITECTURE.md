@@ -10,7 +10,7 @@
 | `src/browser/` | Pairing, bounded command queue, current-page save, exact-target close protocol, observed browser outcomes. |
 | `src/evidence/` | Replaceable public evidence adapter with SSRF/private-address rejection, byte/time bounds, honest limitations. |
 | `src/organization/` | Deterministic fallback and bounded agent prompt/result contracts. User notes and pinned decisions are higher-priority evidence. |
-| `src/app/` | Durable job orchestration, resume/cancel/stale validation, proposal publication. |
+| `src/app/` | Durable job orchestration, resume/cancel/stale validation, proposal publication/application, reversible delegation, and temporary intent working sets. |
 | `src/runtime/` | Codex app-server process/JSONL protocol, account/model discovery, managed login, turn lifecycle/cancellation. |
 | `src/http/` | Composition-facing HTTP commands. UI and agent-triggered work use application/store invariants rather than direct SQL/browser access. |
 
@@ -39,20 +39,24 @@ Current-page `save + close` is a two-effect protocol:
 5. it closes only when all target fields still match;
 6. extension reports observed success/failure/refusal, which is persisted independently of the save.
 
-Duplicate command IDs replay the saved capture result rather than duplicating occurrences/notes.
+Duplicate command IDs replay the saved capture result rather than duplicating occurrences/notes. Resource identity may ignore URL fragments, but close authorization does not: the live tab id, window id, and exact browser URL string must all still match.
 
 ## Evidence safety
 
-Public enrichment does not receive cookies or browser profile access. Before network fetch, hostname resolution is rejected for loopback/private/link-local addresses. Responses are time/size bounded. YouTube currently uses public oEmbed metadata and explicitly reports that transcript/caption acquisition is not implemented by that adapter; transcript absence does not fail the library.
+Public enrichment does not receive cookies or browser profile access. Readable text/preview metadata are cached as evidence; direct image resources use their already-public URL as the preview. Preview URLs extracted from remote metadata are separately checked before the UI may load them. Before network fetch, hostname resolution is rejected for loopback/private/link-local addresses. Responses are time/size bounded. YouTube currently uses public oEmbed metadata and explicitly reports that transcript/caption acquisition is not implemented by that adapter; transcript absence does not fail the library.
 
 ## Agent boundary
 
 The app-server adapter implements the supported stdio JSONL connection and managed ChatGPT login path. Runtime availability is optional. The model list and effort choices are discovered from app-server rather than inferred from this development conversation.
 
-Organization tasks send bounded resource cohorts as delimited JSON data plus an output JSON Schema. The runtime cwd is the private `state-v2/agent-context` directory with read-only restricted access. No project repository, browser profile store, arbitrary MCP server, inherited AGENTS.md, or custom skill pack is intentionally provided to the user-facing organization assistant.
+Organization tasks send cohorts of at most 30 resources as delimited JSON data plus an output JSON Schema. Whole-library passes also receive only a compact global summary (counts/top hosts/current collection paths), not an ever-growing library prompt. Saved jobs retain a contract version and evidence/revision fingerprints so stale or incompatible work is not silently published. The runtime cwd is the private `state-v2/agent-context` directory with read-only restricted access. No project repository, browser profile store, arbitrary MCP server, inherited AGENTS.md, or custom skill pack is intentionally provided to the user-facing organization assistant.
 
 ## Known design limits
 
 - Node 22 labels built-in SQLite experimental. This keeps setup dependency-free; a future migration can swap the store implementation without changing domain/browser/runtime contracts.
 - Public evidence adapters are intentionally modest in this first complete release. Rich platform-specific transcript and article extraction can be added behind `PublicEvidenceService` without changing persistence ownership.
 - The UI exposes text notes. Browser speech recognition/local transcription is not shipped because claiming local voice privacy without a verified transcription runtime would be misleading. Voice remains a replaceable future adapter with text fallback.
+
+## Temporary working sets and lifecycle
+
+Intent search returns a transient projection and never writes memberships or resource state. Agent-backed search is bounded to an 80-item prefiltered shortlist and falls back to explicit lexical matching when no runtime is connected. Archive, delete, collection removal, proposal rejection, and browser-tab close are separate commands. Archive/delete/membership changes record reversible history; deleting from the library never implies closing a live browser tab.

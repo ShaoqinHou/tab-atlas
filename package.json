@@ -4,13 +4,16 @@
   "private": true,
   "type": "module",
   "description": "Local durable browser-tab library with bounded browser bridge and embedded Codex app-server integration",
-  "engines": {"node": ">=22.5.0"},
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "start": "node src/main.js",
     "dev": "node --watch src/main.js",
     "check": "node --check src/main.js && node scripts/check-files.js",
     "test": "node --test tests/*.test.js",
     "test:focused": "node --test tests/capture.test.js tests/organization.test.js tests/jobs.test.js tests/browser.test.js tests/runtime.test.js",
-    "demo": "node scripts/load-demo.js"
+    "demo": "node scripts/load-demo.js",
+    "demo:start": "node scripts/start-demo.js"
   }
 }

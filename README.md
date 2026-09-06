@@ -36,10 +36,10 @@ To use demo data without touching a real browser:
 
 ```powershell
 npm run demo
-npm start
+npm run demo:start
 ```
 
-Demo content is stored in the rebuild-only `state-v2/` database and is explicitly synthetic.
+Demo content is stored in a separate ignored `state-v2-demo/` database and is explicitly synthetic; it never shares the default real-library database in `state-v2/`.
 
 ## Pair Chrome or Edge
 
@@ -55,14 +55,18 @@ The bridge only talks to `127.0.0.1:8790`. Pairing credentials remain in the ign
 
 - **Sync paired browsers** requests a bounded capture. Known canonical URLs update provenance rather than becoming duplicate library resources.
 - Search/filter and browse all durable resources even when analysis is pending or evidence is limited.
-- Add guidance from a resource detail view.
-- **Organize visible** creates reviewable suggestions for the visible/selected scope. **Reconsider whole library** uses the same durable job boundary for a global pass.
-- Apply suggestions in bulk. A resource can belong to more than one collection.
+- Add typed guidance from a resource detail view, or optionally dictate into the draft using the browser speech service. Dictation is never auto-saved: review the text first; TabAtlas does not claim browser speech stays local.
+- Refresh bounded public evidence to obtain readable text and safe previews. Public metadata preview URLs are checked so private-network image targets are not loaded.
+- **Organize visible** creates reviewable suggestions for the loaded/selected scope; **Organize all filtered** is explicitly broader. Approve, reject, or add guidance and rethink individual proposals.
+- **Organize for me** is an explicit bounded delegation: it automatically applies only reversible collection changes in the visible/selected scope and records undo history.
+- **Reconsider whole library** uses bounded 30-resource agent cohorts plus a compact global library summary, rather than one ever-growing prompt.
+- **Find by intent** creates a temporary semantic working set when the agent is connected (lexical fallback otherwise); searching never mutates the library.
+- Apply suggestions in bulk. A resource can belong to more than one nested collection. Archive, delete, remove-membership, and live-tab close remain distinct actions with reversible history for library mutations.
 - Use the extension's **Save current page** action to avoid new backlog. Closing is opt-in and occurs only after the app has durably saved the page and the extension re-checks the exact live target.
 
 ## Agent connection
 
-The runtime adapter follows the official app-server lifecycle: `initialize` → `initialized`, then `account/read`, `model/list`, `thread/start`, `turn/start`, streamed notifications, and `turn/interrupt` for cancellation. Model and reasoning-effort choices are not hardcoded.
+The runtime adapter follows the official app-server lifecycle: `initialize` → `initialized`, then `account/read`, `model/list`, `thread/start`, `turn/start`, streamed notifications, and `turn/interrupt` for cancellation. The workspace populates model and reasoning-effort controls from `model/list`; this implementation chat's model is never hardcoded into the product.
 
 The agent runs from an isolated `state-v2/agent-context` working directory with read-only restricted sandbox settings. Page content and notes are serialized inside explicit data delimiters and are not treated as instructions. The agent only returns organization proposals; database and browser effects remain application-owned.
 
@@ -82,6 +86,6 @@ npm run check
 npm test
 ```
 
-Focused acceptance coverage includes multi-browser/partial capture, preserved query identity, replay idempotency, group provenance, 1,000-resource paging/filtering, note-driven multi-membership organization and undo, checkpoint resume plus stale result rejection, current-page duplicate save and exact-target close refusal, and a deterministic fake transport that exercises the real app-server adapter handshake/account/model/thread/turn event path.
+Focused acceptance coverage includes multi-browser/partial capture, preserved query identity, replay idempotency, group provenance, 1,000-resource paging/filtering, note-driven nested multi-membership organization and undo, delegated reversible changes, archive/delete recovery, temporary intent working sets, 30-item agent cohorting, checkpoint resume after process restart plus stale result rejection, malformed model output rejection, public-evidence SSRF/preview protection, current-page duplicate save and exact-target close refusal (including fragment changes), and a deterministic fake transport that exercises the real app-server adapter handshake/account/model/thread/turn event path.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) and [docs/HANDOFF.md](docs/HANDOFF.md).
+See [ARCHITECTURE.md](ARCHITECTURE.md), [TEST_RESULTS.md](TEST_RESULTS.md), and [docs/HANDOFF.md](docs/HANDOFF.md).

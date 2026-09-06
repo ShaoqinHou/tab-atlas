@@ -1,1 +1,1 @@
-import fs from 'node:fs';const required=['README.md','ARCHITECTURE.md','src/main.js','public/index.html','extension/manifest.json','extension/background.js'];for(const f of required)if(!fs.existsSync(f))throw new Error(`Missing ${f}`);console.log('required-files-ok');
+import fs from 'node:fs';const required=['README.md','ARCHITECTURE.md','TEST_RESULTS.md','src/main.js','public/index.html','extension/manifest.json','extension/background.js'];for(const f of required)if(!fs.existsSync(f))throw new Error(`Missing ${f}`);console.log('required-files-ok');
